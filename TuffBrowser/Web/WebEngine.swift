@@ -5,6 +5,12 @@ import WebKit
 final class TuffWebView: WKWebView {
     weak var tab: Tab?
 
+    override func mouseExited(with event: NSEvent) {
+        super.mouseExited(with: event)
+        // WebKit doesn't always report "no link" when the mouse leaves straight off a link.
+        if tab?.hoveredLink != nil { tab?.hoveredLink = nil }
+    }
+
     override func willOpenMenu(_ menu: NSMenu, with event: NSEvent) {
         super.willOpenMenu(menu, with: event)
         // "New Window" requests land in `createWebViewWith`, which opens a tab — so say so.
@@ -39,8 +45,34 @@ enum WebEngine {
         return "Version/\(version) Safari/605.1.15"
     }()
 
+    // MARK: Caches
+
+    /// Tells WebKit this app is the user's main browser, once, before the first web view.
+    ///
+    /// WebKit sizes its caches by "cache model", and a third-party app gets the one meant for
+    /// an app that shows the odd web page: a small disk cache, a small in-memory cache of
+    /// decoded resources, and a short back / forward cache. Safari asks for the primary
+    /// browser model instead (`WKContextSetCacheModel`, private but long-standing API), which
+    /// keeps far more of the sites you revisit on hand. The setting is process-wide and the
+    /// context argument is unused. Skipped if this version of WebKit doesn't have it.
+    ///
+    /// Two related switches were tried and deliberately left off: a spare web content process
+    /// kept warm for the next tab, and a cache of the processes of sites just left. WebKit
+    /// parks such processes suspended, and attaching a page to a suspended process blocks the
+    /// main thread while it issues sandbox extensions to it: 0.3–0.6 s in about half the
+    /// tries measured, and occasionally 5 s. A fresh process costs about 40 ms.
+    private static let cacheModel: Void = {
+        typealias SetCacheModel = @convention(c) (UnsafeRawPointer?, UInt32) -> Void
+        guard let symbol = dlsym(dlopen(nil, RTLD_NOW), "WKContextSetCacheModel") else { return }
+        let primaryWebBrowser: UInt32 = 2
+        unsafeBitCast(symbol, to: SetCacheModel.self)(nil, primaryWebBrowser)
+    }()
+
+    // MARK: Web views
+
     static func makeConfiguration(dataStore: WKWebsiteDataStore = DataStores.website) -> WKWebViewConfiguration {
         let settings = AppSettings.shared
+        _ = cacheModel
         let config = WKWebViewConfiguration()
         config.websiteDataStore = dataStore
         config.applicationNameForUserAgent = userAgentApplicationName
@@ -57,17 +89,18 @@ enum WebEngine {
         config.preferences.minimumFontSize = settings.advanced.minimumFontSize
         config.preferences.setValue(settings.advanced.webInspector, forKey: "developerExtrasEnabled")
         config.defaultWebpagePreferences.allowsContentJavaScript = settings.privacy.javaScript
-        #if DEBUG
-        if !DebugHooks.bench("noext") { config.webExtensionController = ExtensionManager.shared.controller }
-        if !DebugHooks.bench("noscripts") {
-            ExtensionStoreBridge.install(into: config.userContentController)
-            PictureInPicture.install(into: config.userContentController)
+        // Pages get the system's fonts, not ones the user installed themselves — as in Safari,
+        // where it also stops sites fingerprinting you by your font list. It is here for
+        // speed: giving each new web content process access to those font files blocks the
+        // main thread (46 ms per new tab and per cross-site navigation with three Adobe fonts
+        // installed, and seconds if the process had been parked). Private preference; skipped
+        // if this version of WebKit doesn't have it.
+        if config.preferences.responds(to: NSSelectorFromString("_setShouldAllowUserInstalledFonts:")) {
+            config.preferences.setValue(false, forKey: "shouldAllowUserInstalledFonts")
         }
-        #else
         config.webExtensionController = ExtensionManager.shared.controller
         ExtensionStoreBridge.install(into: config.userContentController)
         PictureInPicture.install(into: config.userContentController)
-        #endif
         #if DEBUG
         DebugHooks.installPageTracer(into: config.userContentController)
         #endif

@@ -1,6 +1,22 @@
 import AppKit
 import Observation
 
+/// One entry in a space's pinned section.
+enum PinnedItem: Identifiable {
+    case tab(Tab)
+    case folder(Folder)
+
+    var id: UUID {
+        switch self {
+        case .tab(let tab): tab.id
+        case .folder(let folder): folder.id
+        }
+    }
+
+    var tab: Tab? { if case .tab(let tab) = self { tab } else { nil } }
+    var folder: Folder? { if case .folder(let folder) = self { folder } else { nil } }
+}
+
 @Observable
 final class Space: Identifiable {
     let id: UUID
@@ -11,7 +27,8 @@ final class Space: Identifiable {
     var colorHex: String
     /// The profile this space belongs to (see `Profile`).
     var profileID: UUID
-    var pinned: [Tab] = []
+    /// The pinned section in sidebar order: pinned tabs and folders of pinned tabs, mixed.
+    var pinnedItems: [PinnedItem] = []
     var tabs: [Tab] = []
     var selectedTabID: UUID?
 
@@ -24,6 +41,37 @@ final class Space: Identifiable {
     }
 
     var color: NSColor { NSColor(hex: colorHex) }
+
+    /// Pinned tabs that are not in a folder.
+    var pinned: [Tab] { pinnedItems.compactMap(\.tab) }
+
+    var folders: [Folder] { pinnedItems.compactMap(\.folder) }
+
+    /// Every pinned tab, in folders or not, in sidebar order.
+    var allPinned: [Tab] {
+        pinnedItems.flatMap { item -> [Tab] in
+            switch item {
+            case .tab(let tab): [tab]
+            case .folder(let folder): folder.tabs
+            }
+        }
+    }
+
+    /// The folder holding a tab, if it is in one.
+    func folder(containing tab: Tab) -> Folder? {
+        folders.first { $0.tabs.contains { $0 === tab } }
+    }
+
+    /// Where a loose pinned tab or a folder sits in `pinnedItems`.
+    func pinnedIndex(of id: UUID) -> Int? {
+        pinnedItems.firstIndex { $0.id == id }
+    }
+
+    /// Takes a tab out of the pinned section, wherever it is in it.
+    func removePinned(_ tab: Tab) {
+        pinnedItems.removeAll { $0.tab === tab }
+        for folder in folders { folder.tabs.removeAll { $0 === tab } }
+    }
 
     static let icons: [String] = [
         "bookmark.fill", "flask.fill", "book.fill", "house.fill", "briefcase.fill", "gamecontroller.fill",

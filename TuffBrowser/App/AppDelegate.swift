@@ -68,6 +68,11 @@ final class AppDelegate: NSObject {
         state.addSpace()
     }
 
+    @objc func newFolder(_ sender: Any?) {
+        showMainWindow()
+        state.addFolder()
+    }
+
     @objc func closeTab(_ sender: Any?) {
         // ⌘W closes whichever auxiliary window is in front (Settings, inspector), else the tab.
         if let key = NSApp.keyWindow, key !== state.window {
@@ -97,9 +102,10 @@ final class AppDelegate: NSObject {
     @objc func findInPage(_ sender: Any?) {
         guard state.selectedTab != nil else { return }
         if state.findVisible {
-            // Toggle off and on so the field takes focus again.
-            state.findVisible = false
-            DispatchQueue.main.async { self.state.findVisible = true }
+            // Already open: back into the field, with what was typed selected. (Hiding and
+            // re-showing the bar to rebuild the field didn't always work: SwiftUI could merge
+            // the two changes, leaving nothing rebuilt and the keyboard in the page.)
+            state.focusFindField()
         } else {
             state.findVisible = true
         }
@@ -232,6 +238,7 @@ extension AppDelegate: NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         state.saveNow()
+        AppSettings.shared.saveNow()
         if AppSettings.shared.privacy.clearHistoryOnQuit {
             HistoryStore.shared.clear(synchronously: true)
         } else {

@@ -84,6 +84,7 @@ final class SettingsWindowController: NSObject {
     private let state: BrowserState
     private let settings = AppSettings.shared
     private var hostingView: NSHostingView<AnyView>!
+    private let surface = WindowSurface()
 
     init(state: BrowserState) {
         self.state = state
@@ -146,12 +147,12 @@ final class SettingsWindowController: NSObject {
 
     private func applyTheme() {
         let theme = settings.theme
-        WindowBlur.setRadius(theme.style == .glass ? theme.blurRadius : 0, for: window)
+        surface.apply(theme, tint: state.currentTint, to: window)
         let dark = settings.chromeScheme(for: state.currentTint) == .dark
         let appearance = NSAppearance(named: dark ? .darkAqua : .aqua)
         if hostingView.appearance?.name != appearance?.name { hostingView.appearance = appearance }
         window.appearance = appearance
-        window.invalidateShadow()
+        if !window.isOpaque { window.invalidateShadow() }
     }
 }
 
@@ -692,7 +693,7 @@ private struct SpaceSettingsRow: View {
 
             Spacer(minLength: 8)
 
-            Text("\(space.pinned.count + space.tabs.count) tabs")
+            Text("\(space.allPinned.count + space.tabs.count) tabs")
                 .font(.system(size: 11.5).monospacedDigit())
                 .foregroundStyle(.primary.opacity(0.42))
 

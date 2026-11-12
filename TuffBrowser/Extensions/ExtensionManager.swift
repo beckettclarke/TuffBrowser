@@ -289,6 +289,13 @@ final class ExtensionManager: NSObject {
             for permission in webExtension.requestedPermissions {
                 context.setPermissionStatus(.grantedExplicitly, for: permission)
             }
+            // WebKit only delivers webRequest events to an extension that also holds
+            // webRequestBlocking (it can't block either way). Chrome and Firefox deliver them with
+            // webRequest alone, which is all a request-watching extension asks for.
+            let blocking = WKWebExtension.Permission(rawValue: "webRequestBlocking")
+            if webExtension.requestedPermissions.contains(.webRequest), !webExtension.requestedPermissions.contains(blocking) {
+                context.setPermissionStatus(.grantedExplicitly, for: blocking)
+            }
             for pattern in webExtension.allRequestedMatchPatterns {
                 context.setPermissionStatus(.grantedExplicitly, for: pattern)
             }
@@ -870,7 +877,9 @@ final class ExtensionManager: NSObject {
     }
     func didChange(_ tab: Tab, properties: WKWebExtension.TabChangedProperties) {
         controller.didChangeTabProperties(properties, for: tab)
-        if properties.contains(.URL) || properties.contains(.loading) { revision += 1 }
+        // The toolbar shows the selected tab's actions; a background tab navigating changes
+        // nothing in it, and shouldn't make it rebuild every extension's button.
+        if tab === browser.selectedTab, properties.contains(.URL) || properties.contains(.loading) { revision += 1 }
     }
 }
 

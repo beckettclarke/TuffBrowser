@@ -98,6 +98,7 @@ extension Tab: WKNavigationDelegate {
 
     func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
         mediaFrame = nil
+        if hoveredLink != nil { hoveredLink = nil }
         if isInPictureInPicture {
             isInPictureInPicture = false
             enteredPictureInPictureAutomatically = false
@@ -115,6 +116,10 @@ extension Tab: WKNavigationDelegate {
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         guard let u = webView.url else { return }
+        if loadingHome {
+            loadingHome = false
+            if let homeURL, !Self.samePage(u, homeURL) { homeLandingURL = u }
+        }
         HistoryStore.shared.record(url: u, title: webView.title ?? "")
         FaviconStore.shared.fetchIcon(from: webView) { [weak self] image in
             guard let self, let image else { return }
@@ -124,6 +129,7 @@ extension Tab: WKNavigationDelegate {
     }
 
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        loadingHome = false
         handleLoadFailure(webView, error: error)
     }
 
@@ -186,6 +192,18 @@ extension Tab: WKNavigationDelegate {
 // MARK: - UI
 
 extension Tab: WKUIDelegate {
+    /// WebKit's (private) hover callback, the one Safari's status bar uses: it reports the link
+    /// under the mouse, in any frame, without running script in the page.
+    @objc(_webView:mouseDidMoveOverElement:withFlags:userInfo:)
+    func webView(_ webView: WKWebView, mouseDidMoveOverElement hitTestResult: NSObject?, withFlags flags: UInt, userInfo: Any?) {
+        var link: URL?
+        if let hitTestResult, hitTestResult.responds(to: NSSelectorFromString("absoluteLinkURL")) {
+            link = hitTestResult.value(forKey: "absoluteLinkURL") as? URL
+        }
+        // Called on every mouse move; only touch the observed property when the link changes.
+        if link != hoveredLink { hoveredLink = link }
+    }
+
     func webView(
         _ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration,
         for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures

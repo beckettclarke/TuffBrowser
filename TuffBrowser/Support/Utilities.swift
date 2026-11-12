@@ -267,6 +267,88 @@ struct VisualEffect: NSViewRepresentable {
     }
 }
 
+/// The drop shadow of a rounded rectangle, drawn from its outline.
+///
+/// SwiftUI's `.shadow` is derived from whatever the view contains. Around a card that holds a
+/// web view (or a blurred backdrop) that means the render server re-derives the shadow from
+/// live pixels on every frame the card redraws or moves. A solid card's shadow is simply the
+/// shadow of its outline, so this draws that, once, from a path — the same shadow for none of
+/// the per-frame work. Put it behind the card with `.background`; see `CardShadow`.
+struct OutlineShadow: NSViewRepresentable {
+    var cornerRadius: CGFloat
+    var opacity: Double
+    var radius: CGFloat
+    var x: CGFloat = 0
+    var y: CGFloat = 0
+
+    func makeNSView(context: Context) -> ShadowView { ShadowView() }
+
+    func updateNSView(_ view: ShadowView, context: Context) {
+        view.cornerRadius = cornerRadius
+        guard let layer = view.layer else { return }
+        layer.shadowColor = NSColor.black.withAlphaComponent(opacity).cgColor
+        layer.shadowOpacity = 1
+        layer.shadowRadius = radius
+        // SwiftUI's y grows downwards; a layer's grows upwards.
+        layer.shadowOffset = CGSize(width: x, height: -y)
+    }
+
+    final class ShadowView: NSView {
+        var cornerRadius: CGFloat = 0 { didSet { if cornerRadius != oldValue { updatePath() } } }
+
+        override init(frame frameRect: NSRect) {
+            super.init(frame: frameRect)
+            wantsLayer = true
+            layer?.masksToBounds = false
+        }
+
+        required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+        override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+        override func layout() {
+            super.layout()
+            updatePath()
+        }
+
+        override func setFrameSize(_ newSize: NSSize) {
+            super.setFrameSize(newSize)
+            updatePath()
+        }
+
+        /// Follows the view's size without animating on its own, so it stays in step with
+        /// whatever is animating the card.
+        private func updatePath() {
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            layer?.shadowPath = RoundedRectangle(cornerRadius: cornerRadius, style: .continuous).path(in: bounds).cgPath
+            CATransaction.commit()
+        }
+    }
+}
+
+/// The shadow under a card. While the card is `solid` (nothing shows through it) the shadow is
+/// drawn from its outline; while it is see-through its shadow depends on what is inside, and
+/// SwiftUI's own is used.
+struct CardShadow: ViewModifier {
+    var cornerRadius: CGFloat
+    var opacity: Double
+    var radius: CGFloat
+    var x: CGFloat = 0
+    var y: CGFloat = 0
+    var solid = true
+
+    func body(content: Content) -> some View {
+        // Two branches rather than one `.shadow` with its colour switched to clear: SwiftUI
+        // keeps a clear shadow on the layer, and the render server still has to derive it.
+        if solid {
+            content.background { OutlineShadow(cornerRadius: cornerRadius, opacity: opacity, radius: radius, x: x, y: y) }
+        } else {
+            content.shadow(color: .black.opacity(opacity), radius: radius, x: x, y: y)
+        }
+    }
+}
+
 /// Empty area that drags the window, and zooms on double-click, like a title bar.
 struct WindowDragArea: NSViewRepresentable {
     final class DragView: NSView {

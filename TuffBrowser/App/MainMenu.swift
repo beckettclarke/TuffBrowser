@@ -53,6 +53,7 @@ enum MainMenu {
         _ = submenu("File", [
             item("New Tab", #selector(AppDelegate.newTab(_:)), "t"),
             item("New Space", #selector(AppDelegate.newSpace(_:)), "n", [.command, .control]),
+            item("New Folder", #selector(AppDelegate.newFolder(_:)), "n", [.command, .option]),
             item("Open Location…", #selector(AppDelegate.openLocation(_:)), "l"),
             sep(),
             item("Close Tab", #selector(AppDelegate.closeTab(_:)), "w"),

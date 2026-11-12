@@ -52,7 +52,13 @@ final class BrowserState {
     /// The dialog card covering a window, if one is up (see `PromptPresenter`).
     var prompt: Prompt?
     var draggingTab: Tab?
+    /// A folder being dragged within its space's pinned section.
+    var draggingFolder: Folder?
     var editingSpaceID: UUID?
+    /// The folder whose name is being edited in the sidebar.
+    var renamingFolderID: UUID?
+    /// The tab whose name is being edited in the sidebar.
+    var renamingTabID: UUID?
     var downloadsVisible = false
 
     @ObservationIgnored weak var window: NSWindow?
@@ -109,22 +115,36 @@ final class BrowserState {
     }
 
     func tab(withID id: UUID, in space: Space) -> Tab? {
-        favorites(in: space).first { $0.id == id } ?? space.pinned.first { $0.id == id } ?? space.tabs.first { $0.id == id }
+        favorites(in: space).first { $0.id == id } ?? space.allPinned.first { $0.id == id } ?? space.tabs.first { $0.id == id }
     }
 
     /// Favourites, then the space's pinned tabs, then its regular tabs — the order shown in the sidebar.
-    func orderedTabs(in space: Space) -> [Tab] { favorites(in: space) + space.pinned + space.tabs }
+    /// Tabs in collapsed folders are left out, apart from the one showing.
+    func orderedTabs(in space: Space) -> [Tab] {
+        let pinned = space.pinnedItems.flatMap { item -> [Tab] in
+            switch item {
+            case .tab(let tab): [tab]
+            case .folder(let folder): folder.isOpen ? folder.tabs : folder.tabs.filter { $0.id == space.selectedTabID }
+            }
+        }
+        return favorites(in: space) + pinned + space.tabs
+    }
 
-    var allTabs: [Tab] { profiles.flatMap(\.favorites) + spaces.flatMap { $0.pinned + $0.tabs } }
+    var allTabs: [Tab] { profiles.flatMap(\.favorites) + spaces.flatMap { $0.allPinned + $0.tabs } }
 
     func space(containing tab: Tab) -> Space? {
-        spaces.first { $0.pinned.contains { $0 === tab } || $0.tabs.contains { $0 === tab } }
+        spaces.first { $0.allPinned.contains { $0 === tab } || $0.tabs.contains { $0 === tab } }
+    }
+
+    func folder(containing tab: Tab) -> Folder? {
+        for space in spaces { if let folder = space.folder(containing: tab) { return folder } }
+        return nil
     }
 
     func section(of tab: Tab) -> TabSection? {
         if profiles.contains(where: { $0.favorites.contains { $0 === tab } }) { return .favorites }
         guard let space = space(containing: tab) else { return nil }
-        return space.pinned.contains { $0 === tab } ? .pinned : .tabs
+        return space.allPinned.contains { $0 === tab } ? .pinned : .tabs
     }
 
     /// The tint currently showing, blended between neighbours while swiping spaces.
@@ -229,7 +249,7 @@ final class BrowserState {
 
     private func neighbour(of tab: Tab, in space: Space) -> Tab? {
         if settings.tabs.afterClose == .recent {
-            return (space.tabs + space.pinned + favorites(in: space))
+            return (space.tabs + space.allPinned + favorites(in: space))
                 .filter { $0 !== tab }
                 .max { $0.lastActive < $1.lastActive }
         }
@@ -239,7 +259,7 @@ final class BrowserState {
             return settings.tabs.afterClose == .above ? (above ?? below) : (below ?? above)
         }
         // A pinned / favourite tab was closed: fall back to the most recently used awake tab.
-        return (space.tabs + space.pinned + favorites(in: space))
+        return (space.tabs + space.allPinned + favorites(in: space))
             .filter { $0 !== tab && $0.isAwake }
             .max { $0.lastActive < $1.lastActive }
     }
@@ -273,6 +293,23 @@ final class BrowserState {
         scheduleSave()
     }
 
+    /// Gives a tab its own name in the sidebar. An empty name, or the page's own title, goes
+    /// back to showing the page's title.
+    func rename(_ tab: Tab, to name: String) {
+        let trimmed = name.trimmed
+        tab.customTitle = trimmed.isEmpty || trimmed == tab.pageTitle ? nil : trimmed
+        if renamingTabID == tab.id { renamingTabID = nil }
+        if tab === selectedTab { updateWindowTitle() }
+        scheduleSave()
+    }
+
+    /// Shows a pinned tab and takes it back to the page it was pinned on.
+    func returnHome(_ tab: Tab) {
+        if selectedTab !== tab { select(tab) }
+        tab.returnHome()
+        focusWebView()
+    }
+
     func duplicate(_ tab: Tab) {
         guard let url = tab.url else { return }
         newTab(url: url, after: tab)
@@ -293,7 +330,9 @@ final class BrowserState {
     }
 
     /// Moves a tab between favourites / pinned / regular, or reorders within a section.
-    func move(_ tab: Tab, to section: TabSection, in space: Space? = nil, at index: Int? = nil) {
+    /// For `.pinned`, `index` is a place in the space's `pinnedItems` (among folders and pinned
+    /// tabs), or with `folder`, a place in that folder.
+    func move(_ tab: Tab, to section: TabSection, in space: Space? = nil, folder: Folder? = nil, at index: Int? = nil) {
         let destination = space ?? self.space(containing: tab) ?? currentSpace
         let origin = self.space(containing: tab)
         let wasSelectedInOrigin = origin?.selectedTabID == tab.id
@@ -301,15 +340,19 @@ final class BrowserState {
         animate {
             profiles.forEach { $0.favorites.removeAll { $0 === tab } }
             spaces.forEach { s in
-                s.pinned.removeAll { $0 === tab }
+                s.removePinned(tab)
                 s.tabs.removeAll { $0 === tab }
             }
             switch section {
             case .favorites:
                 let profile = profile(for: destination)
                 profile.favorites.insert(tab, at: min(index ?? profile.favorites.count, profile.favorites.count))
+            case .pinned where folder != nil && destination.folders.contains(where: { $0 === folder }):
+                let folder = folder!
+                folder.tabs.insert(tab, at: min(index ?? folder.tabs.count, folder.tabs.count))
             case .pinned:
-                destination.pinned.insert(tab, at: min(index ?? destination.pinned.count, destination.pinned.count))
+                let count = destination.pinnedItems.count
+                destination.pinnedItems.insert(.tab(tab), at: min(index ?? count, count))
             case .tabs:
                 destination.tabs.insert(tab, at: min(index ?? 0, destination.tabs.count))
             }
@@ -337,7 +380,13 @@ final class BrowserState {
 
     func openCommandBar(_ mode: CommandBarMode) {
         let resolved: CommandBarMode = (mode == .editCurrent && selectedTab == nil) ? .newTab : mode
+        let wasOpen = commandBar != nil
         animate(Motion.snappy) { commandBar = resolved }
+        // Take the keyboard from the page right away, so nothing typed before the bar's field
+        // is on screen lands in a text field on the page. The field takes it next.
+        if !wasOpen, let window, window.firstResponder is WKWebView {
+            window.makeFirstResponder(nil)
+        }
     }
 
     func closeCommandBar() {
@@ -470,7 +519,7 @@ final class BrowserState {
     /// through here.
     func confirmDelete(_ space: Space, from host: Prompt.Host = .browser) {
         guard spaces.count > 1 else { return }
-        let tabCount = space.pinned.count + space.tabs.count
+        let tabCount = space.allPinned.count + space.tabs.count
         let prompt = Prompt(
             host: host,
             symbol: space.icon,
@@ -490,7 +539,7 @@ final class BrowserState {
     func delete(_ space: Space) {
         guard spaces.count > 1, let index = spaces.firstIndex(where: { $0 === space }) else { return }
         let previous = selectedTab
-        for tab in space.pinned + space.tabs {
+        for tab in space.allPinned + space.tabs {
             ExtensionManager.shared.didClose(tab)
             tab.tearDown()
         }
@@ -503,6 +552,79 @@ final class BrowserState {
         }
         ExtensionManager.shared.forgetLinks(to: space.id)
         spaceDidChange(previous: previous)
+    }
+
+    // MARK: Folders
+
+    /// Adds a folder to a space's pinned section, optionally moving a tab into it, and starts
+    /// editing its name.
+    @discardableResult
+    func addFolder(in space: Space? = nil, with tab: Tab? = nil) -> Folder {
+        let space = space ?? currentSpace
+        let taken = Set(space.folders.map(\.name))
+        var name = "New Folder"
+        var n = 2
+        while taken.contains(name) { name = "New Folder \(n)"; n += 1 }
+        let folder = Folder(name: name)
+        // A folder made from a pinned tab takes that tab's place; otherwise it goes at the end.
+        let index = tab.flatMap { space.pinnedIndex(of: $0.id) }
+            ?? tab.flatMap { t in space.folder(containing: t).flatMap { space.pinnedIndex(of: $0.id) }.map { $0 + 1 } }
+            ?? space.pinnedItems.count
+        animate { space.pinnedItems.insert(.folder(folder), at: index) }
+        if let tab { move(tab, to: .pinned, in: space, folder: folder) }
+        if space !== currentSpace, let index = spaces.firstIndex(where: { $0 === space }) { switchSpace(to: index) }
+        if !sidebarVisible { toggleSidebar() }
+        renamingFolderID = folder.id
+        scheduleSave()
+        return folder
+    }
+
+    func toggle(_ folder: Folder) {
+        animate { folder.isOpen.toggle() }
+        scheduleSave()
+    }
+
+    func rename(_ folder: Folder, to name: String) {
+        let trimmed = name.trimmed
+        if !trimmed.isEmpty { folder.name = trimmed }
+        if renamingFolderID == folder.id { renamingFolderID = nil }
+        scheduleSave()
+    }
+
+    func space(containing folder: Folder) -> Space? {
+        spaces.first { $0.folders.contains { $0 === folder } }
+    }
+
+    /// Removes a folder. Its tabs stay pinned where the folder was, so nothing is lost.
+    func delete(_ folder: Folder) {
+        guard let space = space(containing: folder), let index = space.pinnedIndex(of: folder.id) else { return }
+        animate {
+            space.pinnedItems.remove(at: index)
+            space.pinnedItems.insert(contentsOf: folder.tabs.map(PinnedItem.tab), at: index)
+        }
+        if renamingFolderID == folder.id { renamingFolderID = nil }
+        scheduleSave()
+    }
+
+    /// Moves a folder up or down one place among its space's pinned tabs and folders.
+    func move(_ folder: Folder, by offset: Int) {
+        guard let space = space(containing: folder), let index = space.pinnedIndex(of: folder.id),
+              space.pinnedItems.indices.contains(index + offset) else { return }
+        animate { space.pinnedItems.swapAt(index, index + offset) }
+        scheduleSave()
+    }
+
+    /// Puts a folder at a place in its space's `pinnedItems`: the place of the item it was
+    /// dragged onto (which moves aside), or the end.
+    func move(_ folder: Folder, to index: Int) {
+        guard let space = space(containing: folder), let from = space.pinnedIndex(of: folder.id) else { return }
+        let target = min(max(0, index), space.pinnedItems.count - 1)
+        guard target != from else { return }
+        animate {
+            let item = space.pinnedItems.remove(at: from)
+            space.pinnedItems.insert(item, at: target)
+        }
+        scheduleSave()
     }
 
     // MARK: Profiles
@@ -525,10 +647,10 @@ final class BrowserState {
         let previous = wasCurrent ? selectedTab : nil
         animate { space.profileID = profile.id }
         if let id = space.selectedTabID, tab(withID: id, in: space) == nil {
-            space.selectedTabID = (space.tabs.first ?? space.pinned.first)?.id
+            space.selectedTabID = (space.tabs.first ?? space.allPinned.first)?.id
         }
         // The space's open pages now use the new profile's cookies.
-        for tab in space.pinned + space.tabs { tab.moveToDataStore(profile.dataStore) }
+        for tab in space.allPinned + space.tabs { tab.moveToDataStore(profile.dataStore) }
         if wasCurrent {
             spaceDidChange(previous: previous)
         } else {
@@ -548,7 +670,7 @@ final class BrowserState {
         }
         // Its spaces' open pages move to the other profile's cookies.
         for space in spaces where space.profileID == fallback.id {
-            for tab in space.pinned + space.tabs { tab.moveToDataStore(fallback.dataStore) }
+            for tab in space.allPinned + space.tabs { tab.moveToDataStore(fallback.dataStore) }
         }
         animate { profiles.removeAll { $0 === profile } }
         if !profile.usesSharedStore { DataStores.removeStore(forProfile: profile.id) }
@@ -604,10 +726,31 @@ final class BrowserState {
         animate(Motion.snappy) { sidebarPeeking = peeking }
     }
 
+    static let findFieldIdentifier = "find-field"
+
+    /// Puts the keyboard in the open find bar's field and selects what it holds.
+    func focusFindField() {
+        func field(in view: NSView) -> NSTextField? {
+            if let field = view as? NSTextField, field.identifier?.rawValue == Self.findFieldIdentifier { return field }
+            for sub in view.subviews { if let hit = field(in: sub) { return hit } }
+            return nil
+        }
+        guard let window, let root = window.contentView?.superview ?? window.contentView,
+              let field = field(in: root), window.makeFirstResponder(field) else { return }
+        field.currentEditor()?.selectAll(nil)
+    }
+
+    /// Gives the keyboard to the page, unless something of Tuff's has it on purpose: the command
+    /// bar, a card in this window (its Return / Esc must not reach the page), or the find bar
+    /// while it is being typed in. This runs whenever the page on show changes (a tab waking,
+    /// a tab moving to a new web view), which used to pull focus out of those.
     func focusWebView() {
         guard commandBar == nil else { return }
         DispatchQueue.main.async { [weak self] in
             guard let self, self.commandBar == nil, let window = self.window else { return }
+            if let prompt = self.prompt, prompt.host == .browser { return }
+            if self.findVisible, let editor = window.firstResponder as? NSTextView, editor.isFieldEditor,
+               (editor.delegate as? NSTextField)?.identifier?.rawValue == Self.findFieldIdentifier { return }
             if let view = self.selectedTab?.webView, view.window === window {
                 window.makeFirstResponder(view)
             }
@@ -732,6 +875,23 @@ final class BrowserState {
         var lastActive: Date?
         /// Back / forward history; missing in older sessions.
         var history: Data?
+        /// The user's name for the tab, if they gave it one.
+        var customTitle: String?
+        /// Where the pinned page redirected to (`Tab.homeLandingURL`).
+        var homeLanding: URL?
+    }
+
+    private struct FolderSnapshot: Codable {
+        var id: UUID
+        var name: String
+        var open: Bool
+        var tabs: [TabSnapshot]
+    }
+
+    /// One entry of a space's pinned section: a tab or a folder.
+    private struct PinnedItemSnapshot: Codable {
+        var tab: TabSnapshot?
+        var folder: FolderSnapshot?
     }
 
     private struct SpaceSnapshot: Codable {
@@ -740,7 +900,11 @@ final class BrowserState {
         var icon: String
         var colorHex: String
         var profile: UUID?
+        /// Every pinned tab, flat. Read only when `pinnedItems` is missing (older sessions);
+        /// still written so an older build keeps the tabs that are in folders.
         var pinned: [TabSnapshot]
+        /// The pinned section with its folders, in order.
+        var pinnedItems: [PinnedItemSnapshot]?
         var tabs: [TabSnapshot]
         var selected: UUID?
     }
@@ -777,14 +941,22 @@ final class BrowserState {
         func snap(_ t: Tab) -> TabSnapshot {
             TabSnapshot(
                 id: t.id, url: t.url, title: t.title, homeURL: t.homeURL, lastActive: t.lastActive,
-                history: keepHistory ? t.sessionState : nil
+                history: keepHistory ? t.sessionState : nil, customTitle: t.customTitle,
+                homeLanding: t.homeLandingURL
             )
         }
         let snapshot = SessionSnapshot(
             spaces: spaces.map { s in
                 SpaceSnapshot(
                     id: s.id, name: s.name, icon: s.icon, colorHex: s.colorHex, profile: s.profileID,
-                    pinned: s.pinned.map(snap), tabs: s.tabs.filter { $0.url != nil }.map(snap), selected: s.selectedTabID
+                    pinned: s.allPinned.map(snap),
+                    pinnedItems: s.pinnedItems.map { item in
+                        switch item {
+                        case .tab(let tab): PinnedItemSnapshot(tab: snap(tab))
+                        case .folder(let f): PinnedItemSnapshot(folder: FolderSnapshot(id: f.id, name: f.name, open: f.isOpen, tabs: f.tabs.map(snap)))
+                        }
+                    },
+                    tabs: s.tabs.filter { $0.url != nil }.map(snap), selected: s.selectedTabID
                 )
             },
             profiles: profiles.map {
@@ -804,6 +976,8 @@ final class BrowserState {
         func make(_ s: TabSnapshot) -> Tab {
             let tab = Tab(id: s.id, url: s.url, title: s.title, homeURL: s.homeURL, sessionState: s.history)
             if let date = s.lastActive { tab.lastActive = date }
+            tab.customTitle = s.customTitle
+            tab.homeLandingURL = s.homeLanding
             tab.browser = self
             return tab
         }
@@ -833,7 +1007,17 @@ final class BrowserState {
             spaces = snapshot.spaces.map { s in
                 let profileID = s.profile.flatMap { known.contains($0) ? $0 : nil } ?? profiles[0].id
                 let space = Space(id: s.id, name: s.name, icon: s.icon, colorHex: s.colorHex, profileID: profileID)
-                space.pinned = s.pinned.map(make)
+                if let items = s.pinnedItems {
+                    space.pinnedItems = items.compactMap { item in
+                        if let t = item.tab { return .tab(make(t)) }
+                        guard let f = item.folder else { return nil }
+                        let folder = Folder(id: f.id, name: f.name, isOpen: f.open)
+                        folder.tabs = f.tabs.map(make)
+                        return .folder(folder)
+                    }
+                } else {
+                    space.pinnedItems = s.pinned.map { .tab(make($0)) }
+                }
                 space.tabs = s.tabs.map(make)
                 space.selectedTabID = s.selected
                 if let id = s.selected, tab(withID: id, in: space) == nil { space.selectedTabID = nil }

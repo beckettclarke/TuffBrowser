@@ -448,6 +448,154 @@ enum ExtensionCompat {
         pins.push(tabs);
       }
 
+      // WebKit's webRequest reports every document load as `main_frame`, iframes included (an
+      // iframe's details carry a non-zero frameId but still say main_frame). uBlock Origin
+      // answers a blocked main_frame by sending the whole tab to its "page blocked" screen, so a
+      // blocked ad iframe took over the page. Give listeners Chrome's `sub_frame` for those, and
+      // apply `types` filters to the corrected type (WebKit would filter on its own).
+      //
+      // Two more gaps in the same details, filled from what the shim sees of each tab's frames:
+      // - A frame directly inside the page names the page by WebKit's internal frame id as its
+      //   parentFrameId, though the page itself is reported as frame 0 (here and in
+      //   webNavigation). Extensions that build a tree of frames could not attach those frames.
+      // - `initiator` (Chrome) is missing and `documentUrl` / `originUrl` (Firefox) are empty, so
+      //   an extension could not tell which page made a request, or whether it was third-party.
+      if (privileged) {
+        const isEvent = (event) => event && typeof event === 'object' && typeof event.addListener === 'function';
+        // tabId -> { page: WebKit's id for the page frame, urls: Map(frameId -> document URL) }
+        const frames = new Map();
+        const tabFrames = (tabId) => {
+          let entry = frames.get(tabId);
+          if (!entry) { entry = { page: undefined, urls: new Map() }; frames.set(tabId, entry); }
+          return entry;
+        };
+        const isDocument = (details) => details.type === 'main_frame' || details.type === 'sub_frame';
+        const parentOf = (entry, parent) => {
+          if (typeof parent !== 'number' || parent <= 0) return parent;
+          if (entry.page === parent) return 0;
+          // A parent the shim has never seen load is the page frame (its own load is reported as 0).
+          if (!entry.urls.has(parent) && entry.page === undefined) { entry.page = parent; return 0; }
+          return parent;
+        };
+        const observe = (details) => {
+          if (!details || typeof details.tabId !== 'number' || details.tabId < 0 || !isDocument(details)) return;
+          if (details.frameId === 0) {
+            frames.set(details.tabId, { page: undefined, urls: new Map([[0, details.url]]) });
+          } else if (typeof details.frameId === 'number') {
+            const entry = tabFrames(details.tabId);
+            parentOf(entry, details.parentFrameId);
+            entry.urls.set(details.frameId, details.url);
+          }
+        };
+        const originOf = (url) => { try { return new URL(url).origin; } catch (e) { return undefined; } };
+        const fixDetails = (details) => {
+          if (!details || typeof details !== 'object') return details;
+          const changes = {};
+          if (details.type === 'main_frame' && typeof details.frameId === 'number' && details.frameId !== 0) changes.type = 'sub_frame';
+          if (details.frameType === undefined && typeof details.frameId === 'number') {
+            changes.frameType = details.frameId === 0 ? 'outermost_frame' : 'sub_frame';
+          }
+          const entry = typeof details.tabId === 'number' && details.tabId >= 0 ? frames.get(details.tabId) : undefined;
+          if (entry) {
+            const parent = parentOf(entry, details.parentFrameId);
+            if (parent !== details.parentFrameId) changes.parentFrameId = parent;
+            // The document that made the request: the parent for a frame load, else the frame itself.
+            const from = isDocument(details) ? parent : details.frameId;
+            const documentURL = typeof from === 'number' && from >= 0 ? entry.urls.get(from) : undefined;
+            if (documentURL) {
+              if (!details.documentUrl) changes.documentUrl = documentURL;
+              if (!details.originUrl) changes.originUrl = documentURL;
+              if (details.initiator === undefined) {
+                const origin = originOf(documentURL);
+                if (origin) changes.initiator = origin;
+              }
+            }
+          }
+          const names = Object.keys(changes);
+          if (!names.length) return details;
+          try { for (const name of names) details[name] = changes[name]; } catch (e) {}
+          return names.every((name) => details[name] === changes[name]) ? details : Object.assign({}, details, changes);
+        };
+        // Keeps `frames` current for every frame load, whatever the extension itself listens to.
+        // Added with the extension's first webRequest listener, so extensions that never use
+        // webRequest don't get woken for every request.
+        let tracking = false;
+        const startTracking = (webRequest, root) => {
+          if (tracking) return;
+          tracking = true;
+          const watch = (name, listener, types) => {
+            const event = webRequest[name];
+            if (!isEvent(event)) return;
+            const original = event.addListener.__tuffOriginal || event.addListener;
+            try { original(listener, { urls: ['<all_urls>'], types }); }
+            catch (e) { try { original(listener, { urls: ['<all_urls>'] }); } catch (e2) {} }
+          };
+          watch('onBeforeRequest', (details) => { observe(details); }, ['main_frame', 'sub_frame']);
+          watch('onBeforeRedirect', (details) => {
+            if (!details || !isDocument(details) || typeof details.redirectUrl !== 'string') return;
+            const id = details.frameId;
+            if (typeof details.tabId === 'number' && typeof id === 'number' && frames.has(details.tabId)) {
+              frames.get(details.tabId).urls.set(id, details.redirectUrl);
+            }
+          }, ['main_frame', 'sub_frame']);
+          try { root.tabs.onRemoved.addListener((tabId) => { frames.delete(tabId); }); } catch (e) {}
+        };
+        for (const { root } of roots) {
+          let webRequest;
+          try { webRequest = root.webRequest; } catch (e) { continue; }
+          if (!webRequest || typeof webRequest !== 'object') continue;
+          for (const name of events.webRequest) {
+            let event;
+            try { event = webRequest[name]; } catch (e) { continue; }
+            if (!isEvent(event) || event.addListener.__tuff) continue;
+            const addListener = event.addListener;
+            const removeListener = typeof event.removeListener === 'function' ? event.removeListener : null;
+            const hasListener = typeof event.hasListener === 'function' ? event.hasListener : null;
+            const wrappers = new Map();
+            const tolerant = (listener, filter, ...rest) => {
+              if (typeof listener !== 'function') return addListener(listener, filter, ...rest);
+              startTracking(webRequest, root);
+              let wanted = null;
+              if (filter && typeof filter === 'object' && Array.isArray(filter.types)) {
+                wanted = new Set(filter.types);
+                if (wanted.has('main_frame') !== wanted.has('sub_frame')) {
+                  filter = Object.assign({}, filter, { types: [...new Set([...filter.types, 'main_frame', 'sub_frame'])] });
+                } else {
+                  wanted = null;
+                }
+              }
+              const wrapper = function (details, ...more) {
+                if (name === 'onBeforeRequest') observe(details);
+                details = fixDetails(details);
+                if (wanted && details && !wanted.has(details.type)) return undefined;
+                return listener.call(this, details, ...more);
+              };
+              const list = wrappers.get(listener) || [];
+              list.push(wrapper);
+              wrappers.set(listener, list);
+              return addListener(wrapper, filter, ...rest);
+            };
+            tolerant.__tuff = true;
+            tolerant.__tuffOriginal = addListener;
+            add(event, 'addListener', tolerant);
+            if (removeListener) {
+              add(event, 'removeListener', (listener, ...rest) => {
+                const list = wrappers.get(listener);
+                if (!list) return removeListener(listener, ...rest);
+                wrappers.delete(listener);
+                for (const wrapper of list) { try { removeListener(wrapper, ...rest); } catch (e) {} }
+                return undefined;
+              });
+            }
+            if (hasListener) {
+              add(event, 'hasListener', (listener, ...rest) => wrappers.has(listener) || hasListener(listener, ...rest));
+            }
+            pins.push(event);
+          }
+          pins.push(webRequest);
+        }
+      }
+
       // WebKit throws, synchronously, when permissions.contains / request / remove names a
       // permission it does not know (clipboardRead, say); Chrome and Firefox answer. Thrown at
       // the top of a module, that stops the whole page. A permission WebKit does not know is

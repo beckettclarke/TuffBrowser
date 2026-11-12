@@ -15,10 +15,6 @@ enum DebugHooks {
         ProcessInfo.processInfo.environment["TUFF_DEBUG_LOG"].map { URL(fileURLWithPath: $0) }
     }
 
-    /// TEMP(bench): TUFF_BENCH=flag,flag switches pieces off to find what costs benchmark score.
-    static let benchFlags: Set<String> = Set((ProcessInfo.processInfo.environment["TUFF_BENCH"] ?? "").split(separator: ",").map(String.init))
-    static func bench(_ flag: String) -> Bool { benchFlags.contains(flag) }
-
     static func runIfRequested() {
         guard let script = ProcessInfo.processInfo.environment["TUFF_DEBUG_SCRIPT"] else { return }
         // One command per line when the script has several lines (lets commands contain ";").
@@ -64,7 +60,8 @@ enum DebugHooks {
                 snapshot(window: window, to: "\(argument)-\(i).png")
             }
         case "cmdbar":
-            state.openCommandBar(argument == "edit" ? .editCurrent : .newTab)
+            // cmdbar [edit|close]
+            if argument == "close" { state.closeCommandBar() } else { state.openCommandBar(argument == "edit" ? .editCurrent : .newTab) }
         case "type":
             if let editor = (NSApp.keyWindow ?? state.window)?.firstResponder as? NSTextView {
                 editor.insertText(argument, replacementRange: editor.selectedRange())
@@ -101,6 +98,20 @@ enum DebugHooks {
             if let i = Int(argument), list.indices.contains(i) { state.select(list[i]) }
         case "pin":
             if let tab = state.selectedTab { state.move(tab, to: .pinned) }
+        case "folder":
+            // folder [name] — new folder holding the selected tab (if any), named at once.
+            let folder = state.addFolder(with: state.selectedTab)
+            if !argument.isEmpty { state.rename(folder, to: argument) }
+        case "foldertoggle":
+            // foldertoggle <index>
+            let folders = state.currentSpace.folders
+            if let i = Int(argument), folders.indices.contains(i) { state.toggle(folders[i]) }
+        case "tofolder":
+            // tofolder <index> — moves the selected tab into that folder of the current space.
+            let folders = state.currentSpace.folders
+            if let tab = state.selectedTab, let i = Int(argument), folders.indices.contains(i) {
+                state.move(tab, to: .pinned, in: state.currentSpace, folder: folders[i])
+            }
         case "fav":
             if let tab = state.selectedTab { state.move(tab, to: .favorites) }
         case "close":
@@ -116,7 +127,7 @@ enum DebugHooks {
         case "sleep":
             state.allTabs.filter { $0 !== state.selectedTab }.forEach { $0.sleep() }
         case "find":
-            state.findVisible = true
+            state.findVisible = argument != "off"
         case "settings":
             AppDelegate.shared?.showSettings(tab: SettingsTab(rawValue: argument) ?? .general)
         case "permreq":
@@ -228,6 +239,56 @@ enum DebugHooks {
                 run(rest2)
             }
             return
+        case "engine":
+            // engine — what WebKit's process pool is doing for the selected tab.
+            if let pool = state.selectedTab?.webView?.configuration.value(forKey: "processPool") as? NSObject {
+                func read(_ key: String) -> String { pool.responds(to: NSSelectorFromString(key)) ? "\(pool.value(forKey: key) ?? "nil")" : "n/a" }
+                log("engine custom=\(pool !== (WKWebViewConfiguration().value(forKey: "processPool") as? NSObject)) cacheCapacity=\(read("_processCacheCapacity")) cached=\(read("_processCacheSize")) prewarmed=\(read("_hasPrewarmedWebProcess")) processes=\(read("_webProcessCount"))")
+            } else {
+                log("engine: no web view")
+            }
+        case "timeopen":
+            // timeopen <url> — how long the main thread spends opening and closing a tab.
+            guard let url = URL(string: argument) else { break }
+            func ms(_ body: () -> Void) -> String {
+                let start = CACurrentMediaTime()
+                body()
+                return String(format: "%.1f", (CACurrentMediaTime() - start) * 1000)
+            }
+            var configuration: WKWebViewConfiguration!
+            let config = ms { configuration = WebEngine.makeConfiguration() }
+            var view: TuffWebView!
+            let create = ms { view = WebEngine.makeWebView(configuration: configuration) }
+            let load = ms { view.load(URLRequest(url: url)) }
+            let drop = ms { view.stopLoading(); view = nil; configuration = nil }
+            var tab: Tab!
+            let open = ms { tab = state.newTab(url: url) }
+            let close = ms { state.close(tab) }
+            log("timeopen config=\(config) webview=\(create) load=\(load) drop=\(drop) | newTab=\(open) close=\(close) ms")
+        case "timeload":
+            // timeload <url> — opens a tab and logs how long until the page has finished loading.
+            guard let url = URL(string: argument) else { break }
+            let rest2 = rest
+            let start = CACurrentMediaTime()
+            let tab = state.newTab(url: url)
+            var observation: NSKeyValueObservation?
+            var began = false
+            observation = tab.webView?.observe(\.isLoading, options: [.initial, .new]) { view, _ in
+                if view.isLoading { began = true; return }
+                guard began else { return }
+                observation?.invalidate()
+                observation = nil
+                log(String(format: "timeload %.0f ms  %@", (CACurrentMediaTime() - start) * 1000, url.host ?? url.lastPathComponent))
+                DispatchQueue.main.async { run(rest2) }
+            }
+            return
+        case "pattern":
+            // pattern — puts a high-contrast test pattern behind the window, to judge the glass.
+            PerfProbe.showPattern(behind: state.window)
+        case "snapscreen":
+            // snapscreen <path> — the window as composited on screen, with whatever shows
+            // through it (unlike `snap`, which captures the window alone).
+            log("snapscreen \(argument) " + PerfProbe.captureScreen(under: state.window, to: argument))
         case "hitch":
             // hitch start | hitch stop <label> — main-thread frame timing (see PerfProbe).
             let words = argument.split(separator: " ", maxSplits: 1).map(String.init)
@@ -266,7 +327,40 @@ enum DebugHooks {
                 frame.size = NSSize(width: v[0], height: v[1])
                 window.setFrame(frame, display: true, animate: true)
             }
-        case "waitjs":
+        case "press":
+            // press [cmd+][shift+][opt+]<letter> — a real key press through the event queue, so it
+            // takes the same path as the keyboard (the focused web view sees it first).
+            var flags: NSEvent.ModifierFlags = []
+            let words = argument.lowercased().split(separator: "+").map(String.init)
+            for word in words.dropLast() {
+                switch word {
+                case "cmd": flags.insert(.command)
+                case "shift": flags.insert(.shift)
+                case "opt", "alt": flags.insert(.option)
+                case "ctrl": flags.insert(.control)
+                default: break
+                }
+            }
+            let letters = "asdfhgzxcv bqweryt123465=97-80]ou[ip lj'k;\\,/nm.\t"
+            guard let key = words.last.map({ $0 == "tab" ? "\t" : $0 }), key.count == 1,
+                  let index = letters.firstIndex(of: Character(key)),
+                  let window = state.window else { log("press: bad key \(argument)"); break }
+            let code = UInt16(letters.distance(from: letters.startIndex, to: index))
+            for type in [NSEvent.EventType.keyDown, .keyUp] {
+                if let event = NSEvent.keyEvent(
+                    with: type, location: .zero, modifierFlags: flags, timestamp: ProcessInfo.processInfo.systemUptime,
+                    windowNumber: window.windowNumber, context: nil, characters: key, charactersIgnoringModifiers: key,
+                    isARepeat: false, keyCode: code
+                ) { NSApp.postEvent(event, atStart: false) }
+            }
+        case "responder":
+            let window = NSApp.keyWindow ?? state.window
+            let editor = window?.firstResponder as? NSTextView
+            let text = editor.map {
+                let owner = ($0.delegate as? NSView)?.identifier?.rawValue ?? String(describing: $0.delegate.map { type(of: $0) })
+                return " text=\"\($0.string)\" selected=\(NSStringFromRange($0.selectedRange())) field=\(owner)"
+            } ?? ""
+            log("responder tabs=\(state.allTabs.count) selected=\(state.selectedTab?.url?.absoluteString ?? "-") key=\(window?.isKeyWindow ?? false) active=\(NSApp.isActive) \(window?.firstResponder.map { String(describing: type(of: $0)) } ?? "nil")\(text)")        case "waitjs":
             // waitjs <timeout seconds> <expression> — polls the selected page until the
             // expression is truthy (benchmarks: wait for the score), then logs it.
             let words = argument.split(separator: " ", maxSplits: 1).map(String.init)

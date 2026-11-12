@@ -14,7 +14,7 @@ extension Tab: WKWebExtensionTab {
 
     func webView(for context: WKWebExtensionContext) -> WKWebView? { webView }
 
-    func title(for context: WKWebExtensionContext) -> String? { displayTitle }
+    func title(for context: WKWebExtensionContext) -> String? { pageTitle }
 
     func isPinned(for context: WKWebExtensionContext) -> Bool {
         guard let section = browser?.section(of: self) else { return false }
@@ -49,7 +49,7 @@ extension Tab: WKWebExtensionTab {
     func isLoadingComplete(for context: WKWebExtensionContext) -> Bool { !isLoading }
 
     func loadURL(_ url: URL, for context: WKWebExtensionContext, completionHandler: @escaping ((any Error)?) -> Void) {
-        load(url)
+        load(url, byExtension: true)
         completionHandler(nil)
     }
 

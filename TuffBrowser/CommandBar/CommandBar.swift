@@ -30,7 +30,10 @@ struct CommandBarOverlay: View {
                 .contentShape(Rectangle())
                 .onTapGesture { state.closeCommandBar() }
 
+            // A fresh bar when ⌘T / ⌘L switches the mode of an open one: it is filled (with the
+            // current address for ⌘L, empty for ⌘T) and focused only when it first appears.
             CommandBarView(mode: mode)
+                .id(mode)
                 .scaleEffect(appeared ? 1 : 0.96, anchor: .top)
                 .opacity(appeared ? 1 : 0)
                 .offset(y: appeared ? 0 : -8)

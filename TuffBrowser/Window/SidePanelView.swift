@@ -71,7 +71,7 @@ struct SidePanelCard: View {
         }
         .clipShape(shape)
         .overlay(shape.strokeBorder(.primary.opacity(0.08), lineWidth: 0.5).allowsHitTesting(false))
-        .shadow(color: .black.opacity(0.22), radius: 7, y: 2)
+        .modifier(CardShadow(cornerRadius: radius, opacity: 0.22, radius: 7, y: 2))
     }
 }
 

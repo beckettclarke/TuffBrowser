@@ -17,6 +17,7 @@ final class BrowserWindowController: NSObject {
     private var hostingView: NSHostingView<AnyView>!
     private var monitors: [Any] = []
     private var appearanceObservation: NSKeyValueObservation?
+    private let surface = WindowSurface()
 
     /// Height of the sidebar's top control row; the traffic lights are centred in it.
     static let topBarHeight: CGFloat = 40
@@ -122,21 +123,27 @@ final class BrowserWindowController: NSObject {
 
     private func applyTheme() {
         let theme = settings.theme
-        WindowBlur.setRadius(theme.style == .glass ? theme.blurRadius : 0, for: window)
-
         let tint = theme.useSpaceColors && !state.spaces.isEmpty ? state.currentSpace.color : NSColor(hex: theme.tintHex)
+        surface.apply(theme, tint: tint, to: window)
+
         let dark = settings.chromeScheme(for: tint) == .dark
         let appearance = NSAppearance(named: dark ? .darkAqua : .aqua)
         if hostingView.appearance?.name != appearance?.name { hostingView.appearance = appearance }
         applyWebAppearance()
-        window.invalidateShadow()
+        // An opaque window's shadow is its frame's; only a see-through one is shaped by its
+        // contents and has to be worked out again (which the window server does by reading
+        // the window back).
+        if !window.isOpaque { window.invalidateShadow() }
     }
 
     /// The chrome follows the tint, but web pages should follow the system's light / dark setting.
     private func applyWebAppearance() {
         let system = NSApp.effectiveAppearance
         for tab in state.allTabs {
-            tab.webView?.appearance = system
+            // This runs on every sidebar toggle and space switch; setting an appearance, even
+            // the same one, makes the web view re-resolve its colours.
+            guard let view = tab.webView, view.appearance?.name != system.name else { continue }
+            view.appearance = system
         }
     }
 
@@ -188,7 +195,14 @@ final class BrowserWindowController: NSObject {
     // MARK: Event monitors
 
     private func installMonitors() {
-        if let m = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel, handler: { [weak self] in self?.handleScroll($0) ?? $0 }) {
+        // The handlers return nil to swallow an event. Written as `self?.handle($0) ?? $0`, that
+        // nil was replaced by the event itself, so nothing was ever swallowed: a reserved
+        // shortcut ran twice (⌘W closed two tabs), Esc closing the find bar also reached the page,
+        // and a tab swipe's scrolling still went to the page.
+        if let m = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel, handler: { [weak self] event in
+            guard let self else { return event }
+            return self.handleScroll(event)
+        }) {
             monitors.append(m)
         }
         if let m = NSEvent.addLocalMonitorForEvents(matching: [.mouseMoved, .leftMouseDragged], handler: { [weak self] event in
@@ -197,7 +211,10 @@ final class BrowserWindowController: NSObject {
         }) {
             monitors.append(m)
         }
-        if let m = NSEvent.addLocalMonitorForEvents(matching: .keyDown, handler: { [weak self] in self?.handleKeyDown($0) ?? $0 }) {
+        if let m = NSEvent.addLocalMonitorForEvents(matching: .keyDown, handler: { [weak self] event in
+            guard let self else { return event }
+            return self.handleKeyDown(event)
+        }) {
             monitors.append(m)
         }
     }
@@ -280,10 +297,35 @@ final class BrowserWindowController: NSObject {
             return nil
         }
         let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        // Browser shortcuts a page must not take (Chrome reserves the same ones). Left to the
+        // menu, a key reaches it only after the focused page has seen it and handed it back,
+        // which is slow on a busy page and never happens if the page swallows it: ⌘T opened the
+        // command bar late (typing went into the page's text field meanwhile) or not at all, and
+        // a web terminal could keep ⌘W from closing its tab.
+        if window.firstResponder is WKWebView, Self.isReserved(event, flags: flags),
+           NSApp.mainMenu?.performKeyEquivalent(with: event) == true {
+            return nil
+        }
         if !flags.intersection([.command, .control, .option]).isEmpty, ExtensionManager.shared.handleKeyEvent(event) {
             return nil
         }
         return event
+    }
+
+    /// ⌘T, ⌘L, ⌘W, ⇧⌘T, ⌘Q, ⌃⌘N / ⌥⌘N (new space / folder), ⌃Tab and ⌃⇧Tab. Shortcuts web apps
+    /// commonly use for themselves (⌘S, ⌘F, ⌘[ / ⌘], ⌘1–9, ⌥⌘ arrows) still go to the page first.
+    private static func isReserved(_ event: NSEvent, flags: NSEvent.ModifierFlags) -> Bool {
+        let modifiers = flags.intersection([.command, .control, .option, .shift])
+        if event.keyCode == 48 { // Tab
+            return modifiers == [.control] || modifiers == [.control, .shift]
+        }
+        switch (event.charactersIgnoringModifiers?.lowercased() ?? "", modifiers) {
+        case ("t", [.command]), ("l", [.command]), ("w", [.command]), ("q", [.command]),
+             ("t", [.command, .shift]), ("n", [.command, .control]), ("n", [.command, .option]):
+            return true
+        default:
+            return false
+        }
     }
 }
 
@@ -302,6 +344,42 @@ extension BrowserWindowController: NSWindowDelegate {
     }
 
     func windowDidEndLiveResize(_ notification: Notification) { layoutTrafficLights() }
+}
+
+/// Decides whether a themed window is see-through, and applies the theme's background blur.
+///
+/// A transparent window is expensive: the window server has to blend the whole window over
+/// what is behind it on every frame any part of it redraws, which more than doubles the GPU
+/// time of a scrolling or animating page (measured on an M1: 25% of the GPU for an opaque
+/// window, 59% for a clear one, same page). Only the Glass style needs that, because its blur
+/// is the window server's own, applied behind a clear window. Vibrancy brings its backdrop
+/// with it (`NSVisualEffectView` works in an opaque window and looks the same there), and
+/// Solid shows nothing through — so those two get an opaque window.
+final class WindowSurface {
+    private var pending: DispatchWorkItem?
+    private var applied = false
+
+    func apply(_ theme: Theme, tint: NSColor, to window: NSWindow) {
+        let clear = theme.style == .glass
+        WindowBlur.setRadius(clear ? theme.blurRadius : 0, for: window)
+        // Only ever seen while the content is still coming up, or lagging behind a resize.
+        let background: NSColor = clear ? .clear : tint
+        if window.backgroundColor != background { window.backgroundColor = background }
+
+        pending?.cancel()
+        pending = nil
+        guard window.isOpaque == clear else { applied = true; return }
+        if clear || !applied {
+            window.isOpaque = !clear
+        } else {
+            // Leaving Glass: the new background fades in, and until it has, parts of the window
+            // are still see-through. Stay clear until it is fully there.
+            let item = DispatchWorkItem { [weak window] in window?.isOpaque = true }
+            pending = item
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.8, execute: item)
+        }
+        applied = true
+    }
 }
 
 /// Adjustable blur of whatever is behind the window.

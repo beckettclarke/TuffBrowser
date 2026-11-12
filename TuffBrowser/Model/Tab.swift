@@ -9,6 +9,8 @@ final class Tab: NSObject, Identifiable {
     let id: UUID
     var url: URL?
     var title: String = ""
+    /// A name the user gave the tab in the sidebar; shown instead of the page's title.
+    var customTitle: String?
     var favicon: NSImage?
     var isLoading = false
     var progress: Double = 0
@@ -24,14 +26,28 @@ final class Tab: NSObject, Identifiable {
     var isAwake = false
     /// A camera / microphone request waiting for an answer (shown as a card over the page).
     var permissionRequest: PermissionRequest?
+    /// The link under the mouse, shown at the bottom of the page (see `LinkPreview`).
+    var hoveredLink: URL?
 
-    /// Where a pinned / favourite tab returns to when it is "closed".
-    @ObservationIgnored var homeURL: URL?
+    /// The page a pinned / favourite tab was pinned on: where it returns to when it is
+    /// "closed", or when its icon is clicked after browsing away (see `isAwayFromHome`).
+    var homeURL: URL? {
+        didSet { if homeURL != oldValue { homeLandingURL = nil } }
+    }
+    /// Where loading `homeURL` last ended up, when the site redirected it (a sign-in hop, an
+    /// added `/edit`…). Counts as being home, so a redirect alone doesn't look like browsing away.
+    var homeLandingURL: URL?
+    /// The navigation in flight was started by loading `homeURL`.
+    @ObservationIgnored var loadingHome = false
     @ObservationIgnored private(set) var webView: TuffWebView?
     @ObservationIgnored var lastActive = Date()
     @ObservationIgnored weak var browser: BrowserState?
     @ObservationIgnored private var observations: [NSKeyValueObservation] = []
     @ObservationIgnored private var savedInteractionState: Any?
+    /// History of the web view the tab left when it crossed into or out of an extension page
+    /// (see `moveToNewWebView`). WebKit can't carry history across that boundary, so Back at the
+    /// start of the new view's history puts this back instead.
+    @ObservationIgnored private var historyBeforeMove: (state: Any, url: URL?, skipCurrent: Bool)?
     @ObservationIgnored private var observingAudio = false
     @ObservationIgnored var pageZoom = CGFloat(AppSettings.shared.advanced.defaultZoom)
     /// Showing an extension page whose extension was not loaded yet when the tab woke up.
@@ -82,7 +98,41 @@ final class Tab: NSObject, Identifiable {
         return savedInteractionState as? Data
     }
 
-    var displayTitle: String {
+    /// What the sidebar, command bar and window title show: the user's name for the tab, if
+    /// it has one, else the page's.
+    var displayTitle: String { customTitle ?? pageTitle }
+
+    /// A pinned tab that has been browsed away from the page it was pinned on.
+    var isAwayFromHome: Bool {
+        guard let homeURL, let url else { return false }
+        if Self.samePage(url, homeURL) { return false }
+        if let homeLandingURL, Self.samePage(url, homeLandingURL) { return false }
+        return true
+    }
+
+    /// Two addresses for the same page: ignores the #fragment, a trailing slash, "www." and
+    /// http vs https.
+    static func samePage(_ a: URL, _ b: URL) -> Bool {
+        func key(_ url: URL) -> String? {
+            guard var parts = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return nil }
+            parts.fragment = nil
+            if parts.scheme?.lowercased() == "http" { parts.scheme = "https" }
+            if let host = parts.host?.lowercased() { parts.host = host.hasPrefix("www.") ? String(host.dropFirst(4)) : host }
+            while parts.path.count > 1, parts.path.hasSuffix("/") { parts.path.removeLast() }
+            if parts.path == "/" { parts.path = "" }
+            return parts.string
+        }
+        return key(a) ?? a.absoluteString == key(b) ?? b.absoluteString
+    }
+
+    /// Takes a pinned tab back to the page it was pinned on.
+    func returnHome() {
+        guard let homeURL else { return }
+        load(homeURL)
+    }
+
+    /// The page's own title (falling back to its host); what extensions see.
+    var pageTitle: String {
         if !title.isEmpty { return title }
         if let url { return url.displayHost }
         return "New Tab"
@@ -125,6 +175,7 @@ final class Tab: NSObject, Identifiable {
                 // the view empty; fall back to the page itself.
                 if view.backForwardList.currentItem == nil, let url { view.load(URLRequest(url: url)) }
             } else if let url {
+                loadingHome = homeURL.map { Self.samePage(url, $0) } ?? false
                 view.load(URLRequest(url: url))
             }
         }
@@ -158,10 +209,31 @@ final class Tab: NSObject, Identifiable {
         return ["http", "https", "file"].contains(scheme)
     }
 
-    /// Continues a navigation in a new web view of the right kind (back/forward history does
-    /// not carry over).
-    func moveToNewWebView(loading request: URLRequest) {
+    /// Continues a navigation in a new web view of the right kind. The old view's history can't
+    /// come along, so it is kept aside for Back (`goBack`). `byExtension`: an extension sent the
+    /// tab here (tabs.update).
+    func moveToNewWebView(loading request: URLRequest, byExtension: Bool = false) {
         guard let url = request.url else { return }
+        if let old = webView, !awaitingExtension, old.backForwardList.currentItem != nil {
+            // An extension that sends a loading tab elsewhere is replacing that load. Stop it
+            // first: saved history includes a load still in progress, and putting it back would
+            // start the load again (and uBlock Origin would block it again).
+            let wasLoading = old.isLoading
+            let committed = old.url == old.backForwardList.currentItem?.url
+            if byExtension, wasLoading { old.stopLoading() }
+            // Leaving a one-page extension view (uBlock Origin's "page blocked" screen after
+            // "Proceed") keeps what was there before it, so Back skips the screen.
+            let throwaway = hostExtension != nil && !old.canGoBack && historyBeforeMove != nil
+            if !throwaway, let state = old.interactionState {
+                // If the replaced load had already reached the history (WebKit can't block it, so
+                // uBlock Origin's "page blocked" often comes after the page committed), Back skips
+                // it, as if it had never happened.
+                let superseded = byExtension && wasLoading && old.canGoBack && committed
+                // The history's current page, not `old.url`: that can be an address still
+                // being navigated to (the page that got blocked, say).
+                historyBeforeMove = (state, old.backForwardList.currentItem?.url ?? self.url, superseded)
+            }
+        }
         self.url = url
         title = ""
         awaitingExtension = false
@@ -172,6 +244,7 @@ final class Tab: NSObject, Identifiable {
         if request.httpMethod.map({ $0.uppercased() != "GET" }) ?? false || request.httpBody != nil {
             view.load(request)
         }
+        canGoBack = view.canGoBack || historyBeforeMove != nil
         browser?.tabDidChange(self, properties: .URL)
     }
 
@@ -180,6 +253,7 @@ final class Tab: NSObject, Identifiable {
     func moveToDataStore(_ store: WKWebsiteDataStore) {
         guard let view = webView, hostExtension == nil, view.configuration.websiteDataStore !== store else { return }
         savedInteractionState = nil
+        historyBeforeMove = nil
         tearDownWebView()
         wake()
     }
@@ -192,6 +266,7 @@ final class Tab: NSObject, Identifiable {
         }
         if resetToHome {
             savedInteractionState = nil
+            historyBeforeMove = nil
             if let homeURL {
                 url = homeURL
                 title = ""
@@ -205,6 +280,7 @@ final class Tab: NSObject, Identifiable {
     /// Called when the tab is closed for good.
     func tearDown() {
         savedInteractionState = nil
+        historyBeforeMove = nil
         tearDownWebView()
     }
 
@@ -237,6 +313,7 @@ final class Tab: NSObject, Identifiable {
         enteredPictureInPictureAutomatically = false
         pictureInPictureFrame = nil
         mediaFrame = nil
+        hoveredLink = nil
         canGoBack = false
         canGoForward = false
     }
@@ -259,9 +336,6 @@ final class Tab: NSObject, Identifiable {
                 }
             },
             view.observe(\.estimatedProgress, options: [.new]) { [weak self] view, _ in
-                #if DEBUG
-                if DebugHooks.bench("nokvo") { return }
-                #endif
                 self?.progress = view.estimatedProgress
             },
             view.observe(\.isLoading, options: [.new]) { [weak self] view, _ in
@@ -272,7 +346,8 @@ final class Tab: NSObject, Identifiable {
                 }
             },
             view.observe(\.canGoBack, options: [.new]) { [weak self] view, _ in
-                self?.canGoBack = view.canGoBack
+                guard let self else { return }
+                self.canGoBack = view.canGoBack || self.historyBeforeMove != nil
             },
             view.observe(\.canGoForward, options: [.new]) { [weak self] view, _ in
                 self?.canGoForward = view.canGoForward
@@ -301,13 +376,14 @@ final class Tab: NSObject, Identifiable {
 
     // MARK: Navigation
 
-    func load(_ url: URL) {
+    func load(_ url: URL, byExtension: Bool = false) {
         if needsNewWebView(for: url) {
-            moveToNewWebView(loading: URLRequest(url: url))
+            moveToNewWebView(loading: URLRequest(url: url), byExtension: byExtension)
             return
         }
         self.url = url
         savedInteractionState = nil
+        loadingHome = homeURL.map { Self.samePage(url, $0) } ?? false
         if let webView {
             webView.load(URLRequest(url: url))
         } else {
@@ -327,7 +403,24 @@ final class Tab: NSObject, Identifiable {
     }
 
     func stop() { webView?.stopLoading() }
-    func goBack() { webView?.goBack() }
+    func goBack() {
+        if let webView, webView.canGoBack {
+            webView.goBack()
+            return
+        }
+        // At the start of this web view's history: back to the one the tab came from.
+        guard let previous = historyBeforeMove else { return }
+        historyBeforeMove = nil
+        if let url = previous.url { self.url = url }
+        title = ""
+        awaitingExtension = false
+        savedInteractionState = previous.state
+        tearDownWebView()
+        let view = wake()
+        if previous.skipCurrent, view.canGoBack { view.goBack() }
+        browser?.tabDidChange(self, properties: .URL)
+    }
+
     func goForward() { webView?.goForward() }
 
     func setZoom(_ zoom: CGFloat) {

@@ -306,14 +306,19 @@ struct ThemePreset: Identifiable {
 final class AppSettings {
     static let shared = AppSettings()
 
-    var theme: Theme { didSet { if theme != oldValue { persist() } } }
-    var general: GeneralSettings { didSet { if general != oldValue { persist() } } }
-    var behavior: BehaviorSettings { didSet { if behavior != oldValue { persist() } } }
-    var tabs: TabSettings { didSet { if tabs != oldValue { persist() } } }
-    var search: SearchSettings { didSet { if search != oldValue { persist() } } }
-    var privacy: PrivacySettings { didSet { if privacy != oldValue { persist(); webSettingsChanged() } } }
-    var downloads: DownloadSettings { didSet { if downloads != oldValue { persist() } } }
-    var advanced: AdvancedSettings { didSet { if advanced != oldValue { persist(); webSettingsChanged() } } }
+    var theme: Theme { didSet { if theme != oldValue { persist(Self.themeKey) } } }
+    var general: GeneralSettings { didSet { if general != oldValue { persist(Self.generalKey) } } }
+    var behavior: BehaviorSettings { didSet { if behavior != oldValue { persist(Self.behaviorKey) } } }
+    var tabs: TabSettings { didSet { if tabs != oldValue { persist(Self.tabsKey) } } }
+    var search: SearchSettings { didSet { if search != oldValue { persist(Self.searchKey) } } }
+    var privacy: PrivacySettings { didSet { if privacy != oldValue { persist(Self.privacyKey); webSettingsChanged() } } }
+    var downloads: DownloadSettings { didSet { if downloads != oldValue { persist(Self.downloadsKey) } } }
+    var advanced: AdvancedSettings { didSet { if advanced != oldValue { persist(Self.advancedKey); webSettingsChanged() } } }
+
+    /// Groups changed since the last write. Dragging a slider or the sidebar's edge changes a
+    /// setting on every mouse event; they are written once, when the changes stop coming.
+    @ObservationIgnored private var unsaved: Set<String> = []
+    @ObservationIgnored private let saver = Debouncer(delay: 0.3)
 
     private static let themeKey = "tuff.theme"
     private static let generalKey = "tuff.general"
@@ -368,14 +373,23 @@ final class AppSettings {
         return (try? JSONDecoder().decode(T.self, from: merged)) ?? fallback
     }
 
-    private func persist() {
+    private func persist(_ key: String) {
         #if DEBUG
         // Automated test runs must not rewrite the real preferences.
         if ProcessInfo.processInfo.environment["TUFF_DATA_DIR"] != nil { return }
         #endif
+        unsaved.insert(key)
+        saver.schedule { [weak self] in self?.saveNow() }
+    }
+
+    /// Writes whatever changed since the last write. Also called when the app quits.
+    func saveNow() {
+        saver.cancel()
+        guard !unsaved.isEmpty else { return }
         let defaults = UserDefaults.standard
         func put<T: Encodable>(_ value: T, _ key: String) {
-            if let data = try? JSONEncoder().encode(value) { defaults.set(data, forKey: key) }
+            guard unsaved.contains(key), let data = try? JSONEncoder().encode(value) else { return }
+            defaults.set(data, forKey: key)
         }
         put(theme, Self.themeKey)
         put(general, Self.generalKey)
@@ -385,6 +399,7 @@ final class AppSettings {
         put(privacy, Self.privacyKey)
         put(downloads, Self.downloadsKey)
         put(advanced, Self.advancedKey)
+        unsaved.removeAll()
     }
 
     /// Pushes settings that live web views can pick up without being rebuilt.

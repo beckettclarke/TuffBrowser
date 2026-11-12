@@ -23,6 +23,25 @@
 - If an existing feature needs something the card can't do yet, extend `Prompt` / `PromptCard`
   rather than reaching for a native dialog.
 
+## Performance: things that were measured, don't undo them casually
+
+- **Keep the window opaque unless the Glass style is on** (`WindowSurface`). A see-through
+  window more than doubles the GPU time of every frame a page draws (25% → 59% of an M1's GPU
+  on a scrolling page). Vibrancy and Solid look identical in an opaque window.
+- **No `.shadow` on a view that contains a web view or a blurred backdrop.** SwiftUI derives
+  it from the live pixels every frame. Use `CardShadow` / `OutlineShadow` (a path shadow).
+- **Web pages don't get user-installed fonts** (`WebEngine.makeConfiguration`). Granting each
+  new web process access to them cost 46 ms of blocked main thread per tab / cross-site
+  navigation here, and once hung for 5 s.
+- **Don't turn on WebKit's process prewarming or web-process cache.** Both hand new pages a
+  suspended process, and attaching to one blocked the main thread for 0.3–0.6 s in about half
+  the tries measured.
+- Rows and tiles get `selected` from their list, not by asking `state.selectedTab`; views that
+  change many times a second (`LoadingBar`) read their own state so their parents don't re-run.
+- Measuring: `hitch start` / `hitch stop <label>`, `layers <path>`, `timeopen <url>`,
+  `timeload <url>`, `snapscreen <path>` in `TUFF_DEBUG_SCRIPT` (see `Support/PerfProbe.swift`).
+  Page benchmarks need the screen unlocked: a locked Mac reports every page as hidden.
+
 ## Build and test
 
 - `make build` regenerates the Xcode project from `project.yml` (XcodeGen) and builds Debug.

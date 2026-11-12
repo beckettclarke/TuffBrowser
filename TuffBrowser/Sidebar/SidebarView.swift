@@ -264,11 +264,14 @@ struct FavoritesGrid: View {
 
     var body: some View {
         let favorites = state.favorites
+        // Worked out once here and handed down: a tile that looked up the selected tab itself
+        // would be re-evaluated whenever any tab list or selection changed.
+        let selectedID = state.spaces.isEmpty ? nil : state.currentSpace.selectedTabID
         Group {
             if !favorites.isEmpty {
                 LazyVGrid(columns: columns, spacing: 8) {
                     ForEach(favorites) { tab in
-                        FavoriteTile(tab: tab)
+                        FavoriteTile(tab: tab, selected: tab.id == selectedID)
                             .onDrag {
                                 state.draggingTab = tab
                                 return NSItemProvider(object: tab.id.uuidString as NSString)
@@ -301,10 +304,10 @@ struct FavoriteTile: View {
     @Environment(BrowserState.self) private var state
     @Environment(\.accent) private var accent
     let tab: Tab
+    let selected: Bool
     @State private var hovering = false
 
     var body: some View {
-        let selected = state.selectedTab === tab
         let shape = RoundedRectangle(cornerRadius: 12, style: .continuous)
         Button {
             state.select(tab)
@@ -386,16 +389,25 @@ struct SpacePage: View {
     let space: Space
 
     var body: some View {
+        // The selected row is worked out here, once, and handed to the rows. A row is selected
+        // only while its space is the one showing.
+        let selectedID = !state.spaces.isEmpty && state.currentSpace === space ? space.selectedTabID : nil
         VStack(spacing: 0) {
             SpaceHeader(space: space)
 
             ScrollView(.vertical, showsIndicators: false) {
                 VStack(spacing: 2) {
-                    ForEach(space.pinned) { tab in
-                        row(tab, section: .pinned)
+                    ForEach(space.pinnedItems) { item in
+                        switch item {
+                        case .tab(let tab):
+                            SidebarTabRow(tab: tab, section: .pinned, selected: tab.id == selectedID, space: space)
+                        case .folder(let folder):
+                            FolderSection(folder: folder, space: space, selectedID: selectedID)
+                                .transition(.scale(scale: 0.92, anchor: .leading).combined(with: .opacity))
+                        }
                     }
-                    if !space.pinned.isEmpty || state.draggingTab != nil {
-                        PinDropZone(space: space, empty: space.pinned.isEmpty)
+                    if !space.pinnedItems.isEmpty || state.draggingTab != nil {
+                        PinDropZone(space: space, empty: space.pinnedItems.isEmpty)
                     }
 
                     Rectangle()
@@ -407,7 +419,7 @@ struct SpacePage: View {
                     NewTabRow()
 
                     ForEach(space.tabs) { tab in
-                        row(tab, section: .tabs)
+                        SidebarTabRow(tab: tab, section: .tabs, selected: tab.id == selectedID, space: space)
                     }
 
                     // Drop target for "move to the end of the list".
@@ -421,14 +433,24 @@ struct SpacePage: View {
             }
         }
     }
+}
 
-    private func row(_ tab: Tab, section: TabSection) -> some View {
-        TabRow(tab: tab, section: section)
+/// A tab row in a space's list that can be dragged and dropped onto.
+struct SidebarTabRow: View {
+    @Environment(BrowserState.self) private var state
+    let tab: Tab
+    let section: TabSection
+    let selected: Bool
+    let space: Space
+    var folder: Folder?
+
+    var body: some View {
+        TabRow(tab: tab, section: section, selected: selected)
             .onDrag {
                 state.draggingTab = tab
                 return NSItemProvider(object: tab.id.uuidString as NSString)
             }
-            .onDrop(of: [.text], delegate: TabDropDelegate(target: tab, section: section, space: space, state: state))
+            .onDrop(of: [.text], delegate: TabDropDelegate(target: tab, section: section, space: space, folder: folder, state: state))
             .transition(
                 .asymmetric(
                     insertion: .scale(scale: 0.92, anchor: .leading).combined(with: .opacity),
@@ -436,6 +458,180 @@ struct SpacePage: View {
                 )
             )
     }
+}
+
+// MARK: - Folders
+
+/// A folder of pinned tabs: its header row, then its tabs, indented. A collapsed folder still
+/// shows the tab that is open, as Arc does, so the page on screen never vanishes from the list.
+struct FolderSection: View {
+    @Environment(BrowserState.self) private var state
+    let folder: Folder
+    let space: Space
+    let selectedID: UUID?
+
+    var body: some View {
+        let visible = folder.isOpen ? folder.tabs : folder.tabs.filter { $0.id == selectedID }
+        VStack(spacing: 2) {
+            FolderRow(folder: folder, space: space)
+            ForEach(visible) { tab in
+                SidebarTabRow(tab: tab, section: .pinned, selected: tab.id == selectedID, space: space, folder: folder)
+                    .padding(.leading, 16)
+            }
+            if folder.isOpen, folder.tabs.isEmpty {
+                Text(state.draggingTab == nil ? "Empty folder" : "Drop here to add")
+                    .font(.system(size: 11.5, weight: .medium))
+                    .foregroundStyle(.primary.opacity(0.35))
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.leading, 42)
+                    .frame(height: 26)
+                    .contentShape(Rectangle())
+                    .onDrop(of: [.text], delegate: FolderDropDelegate(folder: folder, space: space, state: state))
+                    .transition(.opacity)
+            }
+        }
+    }
+}
+
+/// A text box that edits a name in place in the sidebar. Return or clicking away keeps what
+/// was typed; Esc cancels.
+struct InlineRenameField: View {
+    let initial: String
+    var placeholder = "Name"
+    var weight: Font.Weight = .medium
+    let commit: (String) -> Void
+    let cancel: () -> Void
+    @State private var draft = ""
+    @State private var finished = false
+    @FocusState private var focused: Bool
+
+    var body: some View {
+        TextField(placeholder, text: $draft)
+            .textFieldStyle(.plain)
+            .font(.system(size: 13.5, weight: weight))
+            .focused($focused)
+            .onSubmit { finish { commit(draft) } }
+            .onExitCommand { finish(cancel) }
+            .onAppear {
+                draft = initial
+                DispatchQueue.main.async { focused = true }
+            }
+            .onChange(of: focused) { _, isFocused in
+                if !isFocused { finish { commit(draft) } }
+            }
+    }
+
+    private func finish(_ action: () -> Void) {
+        guard !finished else { return }
+        finished = true
+        action()
+    }
+}
+
+struct FolderRow: View {
+    @Environment(BrowserState.self) private var state
+    let folder: Folder
+    let space: Space
+    @State private var hovering = false
+
+    var body: some View {
+        let renaming = state.renamingFolderID == folder.id
+        HStack(spacing: 10) {
+            Image(systemName: folder.isOpen ? "folder" : "folder.fill")
+                .font(.system(size: 13, weight: .semibold))
+                .frame(width: 16, height: 16)
+                .contentTransition(.symbolEffect(.replace))
+            if renaming {
+                InlineRenameField(
+                    initial: folder.name, placeholder: "Folder name", weight: .semibold,
+                    commit: { state.rename(folder, to: $0) },
+                    cancel: { state.renamingFolderID = nil }
+                )
+            } else {
+                Text(folder.name)
+                    .font(.system(size: 13.5, weight: .semibold))
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            }
+            Spacer(minLength: 0)
+            if !folder.isOpen, !folder.tabs.isEmpty, !renaming {
+                Text("\(folder.tabs.count)")
+                    .font(.system(size: 11, weight: .semibold, design: .rounded))
+                    .foregroundStyle(.primary.opacity(0.4))
+                    .transition(.opacity)
+            }
+        }
+        .foregroundStyle(.primary.opacity(0.82))
+        .padding(.leading, 10)
+        .padding(.trailing, 10)
+        .frame(height: AppSettings.shared.tabs.compactRows ? 30 : 36)
+        .background(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(.primary.opacity(hovering && !renaming ? 0.07 : 0))
+        )
+        .contentShape(Rectangle())
+        .onTapGesture { if !renaming { state.toggle(folder) } }
+        .onHover { hovering = $0 }
+        .animation(Motion.quick, value: hovering)
+        .animation(Motion.snappy, value: folder.isOpen)
+        .help(folder.isOpen ? "Collapse Folder" : "Expand Folder")
+        .onDrag {
+            state.draggingFolder = folder
+            return NSItemProvider(object: folder.id.uuidString as NSString)
+        }
+        .onDrop(of: [.text], delegate: FolderDropDelegate(folder: folder, space: space, state: state))
+        .contextMenu {
+            Button(folder.isOpen ? "Collapse" : "Expand") { state.toggle(folder) }
+            Button("Rename…") { state.renamingFolderID = folder.id }
+            Divider()
+            Button("Move Up") { state.move(folder, by: -1) }
+                .disabled(space.pinnedItems.first?.id == folder.id)
+            Button("Move Down") { state.move(folder, by: 1) }
+                .disabled(space.pinnedItems.last?.id == folder.id)
+            Divider()
+            Button("New Folder") { state.addFolder(in: space) }
+            Button("Delete Folder", role: .destructive) { state.delete(folder) }
+        }
+    }
+}
+
+/// Dragging over a folder's header: a tab from elsewhere goes into the folder (opening it); one
+/// of the folder's own tabs comes out, just above it; another folder takes its place.
+struct FolderDropDelegate: DropDelegate {
+    let folder: Folder
+    let space: Space
+    let state: BrowserState
+
+    func validateDrop(info: DropInfo) -> Bool { state.draggingTab != nil || state.draggingFolder != nil }
+
+    func dropEntered(info: DropInfo) {
+        if let dragged = state.draggingFolder {
+            guard dragged !== folder, let index = space.pinnedIndex(of: folder.id) else { return }
+            state.move(dragged, to: index)
+            return
+        }
+        guard let dragged = state.draggingTab else { return }
+        if folder.tabs.contains(where: { $0 === dragged }) {
+            state.move(dragged, to: .pinned, in: space, at: space.pinnedIndex(of: folder.id))
+        } else {
+            if !folder.isOpen { state.toggle(folder) }
+            state.move(dragged, to: .pinned, in: space, folder: folder)
+        }
+    }
+
+    func dropUpdated(info: DropInfo) -> DropProposal? { DropProposal(operation: .move) }
+
+    func performDrop(info: DropInfo) -> Bool { endSidebarDrag(state) }
+}
+
+/// Clears what is being dragged once it is dropped.
+@discardableResult
+func endSidebarDrag(_ state: BrowserState) -> Bool {
+    withAnimation(Motion.quick) {
+        state.draggingTab = nil
+        state.draggingFolder = nil
+    }
+    return true
 }
 
 struct PinDropZone: View {
@@ -512,6 +708,7 @@ struct SpaceHeader: View {
         .contextMenu {
             Button("Edit Space…") { state.editingSpaceID = space.id }
             Button("New Space") { state.addSpace() }
+            Button("New Folder") { state.addFolder(in: space) }
             Menu("Profile") {
                 ForEach(state.profiles) { profile in
                     Toggle(isOn: Binding(get: { space.profileID == profile.id }, set: { _ in state.setProfile(profile, for: space) })) {
@@ -625,19 +822,66 @@ struct TabRow: View {
     @Environment(BrowserState.self) private var state
     let tab: Tab
     let section: TabSection
+    let selected: Bool
     @State private var hovering = false
+    /// The mouse is over the "back to pinned page" icon.
+    @State private var hoveringHome = false
 
     var body: some View {
-        let selected = state.selectedTab === tab
+        let renaming = state.renamingTabID == tab.id
+        let away = section != .tabs && tab.isAwayFromHome
         HStack(spacing: 10) {
-            TabIcon(tab: tab)
-                .opacity(tab.isAwake || selected ? 1 : 0.7)
+            if away {
+                // Browsed away from the pinned page: the icon takes it back, as in Arc.
+                HStack(spacing: 6) {
+                    Button {
+                        state.returnHome(tab)
+                    } label: {
+                        TabIcon(tab: tab)
+                            .frame(width: 24, height: 24)
+                            .background(
+                                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                    .fill(.primary.opacity(hoveringHome ? 0.12 : 0))
+                            )
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(SquishButtonStyle())
+                    .onHover { hoveringHome = $0 }
+                    .help("Back to Pinned Page")
+                    .padding(.horizontal, -4)
 
-            Text(tab.displayTitle)
-                .font(.system(size: 13.5, weight: .medium))
-                .foregroundStyle(.primary.opacity(selected ? 0.96 : (tab.isAwake ? 0.82 : 0.6)))
-                .lineLimit(1)
-                .truncationMode(.tail)
+                    Text("/")
+                        .font(.system(size: 14, weight: .regular))
+                        .foregroundStyle(.primary.opacity(0.3))
+                }
+                .transition(.opacity.combined(with: .scale(scale: 0.8, anchor: .leading)))
+            } else {
+                TabIcon(tab: tab)
+                    .opacity(tab.isAwake || selected ? 1 : 0.7)
+            }
+
+            if renaming {
+                InlineRenameField(
+                    initial: tab.displayTitle, placeholder: tab.pageTitle,
+                    commit: { state.rename(tab, to: $0) },
+                    cancel: { state.renamingTabID = nil }
+                )
+                .frame(maxWidth: .infinity, alignment: .leading)
+            } else {
+                VStack(alignment: .leading, spacing: 0) {
+                    Text(tab.displayTitle)
+                        .font(.system(size: 13.5, weight: .medium))
+                        .foregroundStyle(.primary.opacity(selected ? 0.96 : (tab.isAwake ? 0.82 : 0.6)))
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                    if away, hoveringHome {
+                        Text("Back to pinned URL")
+                            .font(.system(size: 10.5, weight: .medium))
+                            .foregroundStyle(.primary.opacity(0.5))
+                            .lineLimit(1)
+                            .transition(.opacity)
+                    }
+                }
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .mask(
                     LinearGradient(
@@ -645,6 +889,7 @@ struct TabRow: View {
                         startPoint: .leading, endPoint: .trailing
                     )
                 )
+            }
 
             if tab.isInPictureInPicture {
                 Button {
@@ -702,12 +947,23 @@ struct TabRow: View {
                 .shadow(color: .black.opacity(selected ? 0.12 : 0), radius: 3, y: 1)
         )
         .contentShape(Rectangle())
-        .onTapGesture { state.select(tab) }
+        .onTapGesture {
+            guard !renaming else { return }
+            // A single-click gesture fires on each click, so selecting stays instant; the second
+            // click of a double-click starts renaming.
+            if (NSApp.currentEvent?.clickCount ?? 1) >= 2 {
+                state.renamingTabID = tab.id
+            } else {
+                state.select(tab)
+            }
+        }
         .onHover { hovering = $0 }
         .animation(Motion.quick, value: hovering)
         .animation(Motion.quick, value: selected)
         .animation(Motion.snappy, value: tab.isPlayingAudio)
         .animation(Motion.snappy, value: tab.isInPictureInPicture)
+        .animation(Motion.quick, value: hoveringHome)
+        .animation(Motion.snappy, value: away)
         .contextMenu { TabContextMenu(tab: tab, section: section) }
     }
 }
@@ -727,13 +983,37 @@ struct TabContextMenu: View {
         } else {
             Button("Remove from Favourites") { state.move(tab, to: .tabs, in: state.currentSpace) }
         }
-        if section != .tabs, tab.url != tab.homeURL, tab.url != nil {
-            Button("Use Current Page as Home") {
+        if section != .favorites, let space = state.space(containing: tab) {
+            let current = space.folder(containing: tab)
+            Menu("Add to Folder") {
+                ForEach(space.folders) { folder in
+                    if folder !== current {
+                        Button {
+                            state.move(tab, to: .pinned, in: space, folder: folder)
+                        } label: {
+                            Label(folder.name, systemImage: "folder")
+                        }
+                    }
+                }
+                if space.folders.contains(where: { $0 !== current }) { Divider() }
+                Button("New Folder") { state.addFolder(in: space, with: tab) }
+            }
+            if current != nil {
+                Button("Remove from Folder") { state.move(tab, to: .pinned, in: space) }
+            }
+        }
+        if section != .tabs, tab.isAwayFromHome {
+            Button("Back to Pinned Page") { state.returnHome(tab) }
+            Button("Pin Current Page Instead") {
                 tab.homeURL = tab.url
                 state.scheduleSave()
             }
         }
         Divider()
+        Button("Rename…") { state.renamingTabID = tab.id }
+        if tab.customTitle != nil {
+            Button("Use Page Title") { state.rename(tab, to: "") }
+        }
         Button("Duplicate") { state.duplicate(tab) }
             .disabled(tab.url == nil)
         Button("Copy Link") {
@@ -784,30 +1064,40 @@ struct TabDropDelegate: DropDelegate {
     let target: Tab?
     let section: TabSection
     let space: Space
+    /// Set when the target row is inside a folder.
+    var folder: Folder? = nil
     let state: BrowserState
 
-    func validateDrop(info: DropInfo) -> Bool { state.draggingTab != nil }
+    /// Folders can only be dropped among the loose items of the pinned section.
+    private var takesFolders: Bool { section == .pinned && folder == nil }
+
+    func validateDrop(info: DropInfo) -> Bool {
+        state.draggingTab != nil || (state.draggingFolder != nil && takesFolders)
+    }
 
     func dropEntered(info: DropInfo) {
-        guard let dragged = state.draggingTab, dragged !== target else { return }
-        let list: [Tab]
-        switch section {
-        case .favorites: list = state.favorites
-        case .pinned: list = space.pinned
-        case .tabs: list = space.tabs
+        if let dragged = state.draggingFolder {
+            guard takesFolders else { return }
+            state.move(dragged, to: target.flatMap { space.pinnedIndex(of: $0.id) } ?? space.pinnedItems.count)
+            return
         }
-        let index = target.flatMap { t in list.firstIndex { $0 === t } } ?? list.count
+        guard let dragged = state.draggingTab, dragged !== target else { return }
+        // Loose pinned tabs are placed among the folders, so they count in `pinnedItems`.
+        let ids: [UUID]
+        switch section {
+        case .favorites: ids = state.favorites.map(\.id)
+        case .pinned: ids = folder?.tabs.map(\.id) ?? space.pinnedItems.map(\.id)
+        case .tabs: ids = space.tabs.map(\.id)
+        }
+        let index = target.flatMap { t in ids.firstIndex(of: t.id) } ?? ids.count
         // Dropping onto the end zone of the list the tab is already last in: nothing to do.
-        if target == nil, list.last === dragged { return }
-        state.move(dragged, to: section, in: space, at: index)
+        if target == nil, ids.last == dragged.id { return }
+        state.move(dragged, to: section, in: space, folder: folder, at: index)
     }
 
     func dropUpdated(info: DropInfo) -> DropProposal? { DropProposal(operation: .move) }
 
-    func performDrop(info: DropInfo) -> Bool {
-        withAnimation(Motion.quick) { state.draggingTab = nil }
-        return true
-    }
+    func performDrop(info: DropInfo) -> Bool { endSidebarDrag(state) }
 }
 
 // MARK: - Bottom bar
@@ -838,6 +1128,7 @@ struct BottomBar: View {
 
             Menu {
                 Button("New Space") { state.addSpace() }
+                Button("New Folder") { state.addFolder() }
                 Button("New Tab") { state.openCommandBar(.newTab) }
                 Divider()
                 Button("Extensions…") { AppDelegate.shared?.showSettings(tab: .extensions) }

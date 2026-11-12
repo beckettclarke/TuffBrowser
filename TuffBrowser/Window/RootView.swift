@@ -38,6 +38,9 @@ struct RootView: View {
                     if !docked { FloatingSidebarBackdrop(tint: Color(nsColor: state.currentTint)) }
                 }
                 .padding(docked ? 0 : BrowserWindowController.floatingSidebarMargin)
+                // The sidebar slides and fades as one piece. Without this, SwiftUI re-places
+                // every row, icon and label inside it on each frame of the peek / dock animation.
+                .geometryGroup()
                 .offset(x: shown ? 0 : -(width + 40))
                 .opacity(shown ? 1 : 0)
 
@@ -175,11 +178,6 @@ struct ToastView: View {
 struct WebCard: View {
     @Environment(BrowserState.self) private var state
     @Environment(AppSettings.self) private var settings
-    #if DEBUG
-    private var benchNoBar: Bool { DebugHooks.bench("nobar") }
-    #else
-    private var benchNoBar: Bool { false }
-    #endif
 
     var body: some View {
         let tab = state.selectedTab
@@ -199,8 +197,9 @@ struct WebCard: View {
             )
             .opacity(tab == nil ? 0 : 1)
 
-            if let tab, !benchNoBar {
-                LoadingBar(progress: tab.progress, loading: tab.isLoading)
+            if let tab {
+                LoadingBar(tab: tab)
+                LinkPreview(tab: tab)
             }
 
             if state.findVisible, tab != nil {
@@ -221,7 +220,8 @@ struct WebCard: View {
         }
         .clipShape(shape)
         .overlay(shape.strokeBorder(.primary.opacity(0.08), lineWidth: 0.5).allowsHitTesting(false))
-        .shadow(color: .black.opacity(0.22), radius: 7, y: 2)
+        // Solid once a page is showing: the empty state is see-through.
+        .modifier(CardShadow(cornerRadius: radius, opacity: 0.22, radius: 7, y: 2, solid: tab?.isAwake ?? false))
         .animation(Motion.snappy, value: state.findVisible)
         .animation(Motion.snappy, value: tab?.permissionRequest?.id)
     }
@@ -287,12 +287,15 @@ final class WebStackView: NSView {
     }
 }
 
+/// Reads the tab's progress itself, so a page that is loading re-renders this thin bar many
+/// times a second rather than the whole web card around it.
 struct LoadingBar: View {
     @Environment(\.accent) private var accent
-    let progress: Double
-    let loading: Bool
+    let tab: Tab
 
     var body: some View {
+        let progress = tab.progress
+        let loading = tab.isLoading
         GeometryReader { geo in
             Capsule()
                 .fill(
@@ -308,6 +311,61 @@ struct LoadingBar: View {
         }
         .frame(height: 2.5)
         .allowsHitTesting(false)
+    }
+}
+
+/// The address of the link under the mouse, in a small label at the bottom left of the page.
+/// Reads the tab's hovered link itself, so mouse moves over links re-render only this label.
+struct LinkPreview: View {
+    let tab: Tab
+    @State private var shown: URL?
+
+    var body: some View {
+        let link = tab.hoveredLink
+        VStack {
+            Spacer(minLength: 0)
+            if let shown {
+                Text(Self.display(shown))
+                    .font(.system(size: 11.5, weight: .medium))
+                    .foregroundStyle(.primary.opacity(0.85))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .padding(.horizontal, 9)
+                    .frame(height: 22)
+                    .background(
+                        RoundedRectangle(cornerRadius: 7, style: .continuous)
+                            .fill(Color(nsColor: .windowBackgroundColor).opacity(0.96))
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 7, style: .continuous)
+                            .strokeBorder(.primary.opacity(0.12), lineWidth: 0.5)
+                    )
+                    .frame(maxWidth: 520, alignment: .leading)
+                    .padding(6)
+                    .transition(.opacity)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
+        .allowsHitTesting(false)
+        .onChange(of: link) { _, new in
+            if new != nil {
+                // Moving between links swaps the text without fading.
+                if shown == nil { withAnimation(.easeOut(duration: 0.12)) { shown = new } } else { shown = new }
+            } else {
+                // A short grace period, so sliding across the gap between two links doesn't flicker.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
+                    if tab.hoveredLink == nil { withAnimation(.easeOut(duration: 0.18)) { shown = nil } }
+                }
+            }
+        }
+        .onChange(of: tab.id) { _, _ in shown = tab.hoveredLink }
+    }
+
+    /// The URL as people read it: percent escapes decoded, no trailing slash on a bare host.
+    static func display(_ url: URL) -> String {
+        var text = url.absoluteString.removingPercentEncoding ?? url.absoluteString
+        if url.path == "/" || url.path.isEmpty, url.query == nil, url.fragment == nil, text.hasSuffix("/") { text.removeLast() }
+        return text
     }
 }
 
@@ -369,6 +427,7 @@ struct FindBar: View {
                 .foregroundStyle(.secondary)
             KeyTextField(
                 text: $query, placeholder: "Find in page", fontSize: 13,
+                identifier: BrowserState.findFieldIdentifier,
                 onSubmit: { find(forward: !NSEvent.modifierFlags.contains(.shift)) },
                 onCancel: { close() }
             )
@@ -451,17 +510,26 @@ struct KeyTextField: NSViewRepresentable {
         field.stringValue = text
         field.font = .systemFont(ofSize: fontSize, weight: fontWeight)
         setPlaceholder(on: field)
-        let selectAll = selectAllOnFocus
-        if autoFocus { DispatchQueue.main.async {
-            guard let window = field.window else { return }
-            window.makeFirstResponder(field)
+        if autoFocus { Self.focus(field, selectAll: selectAllOnFocus, triesLeft: 5) }
+        return field
+    }
+
+    /// Takes keyboard focus on the next turn of the run loop. The field may not be in its
+    /// window yet then (SwiftUI inserts it while animating), so it tries a few more turns
+    /// rather than giving up and leaving focus wherever it was.
+    private static func focus(_ field: NSTextField, selectAll: Bool, triesLeft: Int) {
+        DispatchQueue.main.async { [weak field] in
+            guard let field else { return }
+            guard let window = field.window, window.makeFirstResponder(field) else {
+                if triesLeft > 0 { focus(field, selectAll: selectAll, triesLeft: triesLeft - 1) }
+                return
+            }
             if let editor = field.currentEditor() {
                 editor.selectedRange = selectAll
                     ? NSRange(location: 0, length: field.stringValue.count)
                     : NSRange(location: field.stringValue.count, length: 0)
             }
-        } }
-        return field
+        }
     }
 
     func updateNSView(_ field: NSTextField, context: Context) {
