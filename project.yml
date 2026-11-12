@@ -1,0 +1,99 @@
+name: TuffBrowser
+options:
+  bundleIdPrefix: ca.beckettclarke
+  deploymentTarget:
+    macOS: "15.4"
+  createIntermediateGroups: true
+  generateEmptyDirectories: true
+
+packages:
+  Sparkle:
+    url: https://github.com/sparkle-project/Sparkle
+    from: 2.6.4
+
+settings:
+  base:
+    MARKETING_VERSION: 0.1.0
+    CURRENT_PROJECT_VERSION: 1
+    SWIFT_VERSION: "5.0"
+    SWIFT_STRICT_CONCURRENCY: minimal
+    DEAD_CODE_STRIPPING: YES
+
+targets:
+  TuffBrowser:
+    type: application
+    platform: macOS
+    sources:
+      - path: TuffBrowser
+    dependencies:
+      - package: Sparkle
+    info:
+      path: TuffBrowser/Resources/Info.plist
+      properties:
+        CFBundleName: Tuff
+        CFBundleDisplayName: Tuff
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        CFBundleIconName: AppIcon
+        LSMinimumSystemVersion: $(MACOSX_DEPLOYMENT_TARGET)
+        LSApplicationCategoryType: public.app-category.productivity
+        NSPrincipalClass: NSApplication
+        NSHighResolutionCapable: true
+        NSSupportsAutomaticTermination: false
+        NSHumanReadableCopyright: ""
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoads: true
+        NSCameraUsageDescription: A website you opened in Tuff wants to use your camera.
+        NSMicrophoneUsageDescription: A website you opened in Tuff wants to use your microphone.
+        NSLocationUsageDescription: A website you opened in Tuff wants to use your location.
+        # Sparkle. Set these two before shipping a release (see README).
+        SUFeedURL: $(TUFF_APPCAST_URL)
+        SUPublicEDKey: $(TUFF_SPARKLE_PUBLIC_KEY)
+        SUEnableAutomaticChecks: true
+        SUScheduledCheckInterval: 86400
+        CFBundleURLTypes:
+          - CFBundleURLName: Web site URL
+            CFBundleTypeRole: Viewer
+            CFBundleURLSchemes: [http, https]
+        CFBundleDocumentTypes:
+          - CFBundleTypeName: HTML document
+            CFBundleTypeRole: Viewer
+            LSItemContentTypes: [public.html, public.xhtml]
+    entitlements:
+      path: TuffBrowser/Resources/TuffBrowser.entitlements
+      properties:
+        com.apple.security.device.camera: true
+        com.apple.security.device.audio-input: true
+        com.apple.security.personal-information.location: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: ca.beckettclarke.TuffBrowser
+        PRODUCT_NAME: Tuff
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        GENERATE_INFOPLIST_FILE: NO
+        CODE_SIGN_STYLE: Manual
+        CODE_SIGN_IDENTITY: "-"
+        DEVELOPMENT_TEAM: ""
+        LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/../Frameworks"
+        COMBINE_HIDPI_IMAGES: YES
+        # Fill these in (or override on the xcodebuild command line) to enable auto-updates.
+        TUFF_APPCAST_URL: ""
+        TUFF_SPARKLE_PUBLIC_KEY: ""
+      configs:
+        Debug:
+          # Its own identity, so a Debug build never shares WebKit storage (including
+          # extension state such as a signed-in 1Password) with a Release build running beside it.
+          PRODUCT_BUNDLE_IDENTIFIER: ca.beckettclarke.TuffBrowser.debug
+          ENABLE_HARDENED_RUNTIME: NO
+          SWIFT_OPTIMIZATION_LEVEL: -Onone
+        Release:
+          # Ad-hoc signed builds cannot load Sparkle.framework under the hardened runtime
+          # (library validation needs a real Team ID). scripts/release.sh turns this on when
+          # you sign with a Developer ID, which notarization requires.
+          ENABLE_HARDENED_RUNTIME: NO
+          SWIFT_OPTIMIZATION_LEVEL: -O
+          SWIFT_COMPILATION_MODE: wholemodule
+          STRIP_INSTALLED_PRODUCT: YES
+          COPY_PHASE_STRIP: YES
+          DEPLOYMENT_POSTPROCESSING: YES
+          STRIP_STYLE: non-global
