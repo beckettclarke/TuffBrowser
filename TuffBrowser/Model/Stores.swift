@@ -40,6 +40,16 @@ final class HistoryStore {
             entries[key] = HistoryEntry(url: url, title: title, lastVisit: Date(), visits: 1)
         }
         saver.schedule { [weak self] in self?.saveNow() }
+        if let e = entries[key] {
+            ExtensionEventPush.shared.emit("history.onVisited", args: [[
+                "id": e.url.absoluteString,
+                "url": e.url.absoluteString,
+                "title": e.title,
+                "lastVisitTime": e.lastVisit.timeIntervalSince1970 * 1000,
+                "visitCount": e.visits,
+                "typedCount": 0,
+            ]])
+        }
     }
 
     func search(_ query: String, limit: Int = 4) -> [HistoryEntry] {
@@ -71,6 +81,7 @@ final class HistoryStore {
     func clear(synchronously: Bool = false) {
         entries.removeAll()
         saveNow(synchronously: synchronously)
+        ExtensionEventPush.shared.emit("history.onVisitRemoved", args: [["allHistory": true, "urls": [String]()]])
     }
 
     func saveNow(synchronously: Bool = false) {
@@ -84,6 +95,72 @@ final class HistoryStore {
         let write = { if let data = try? JSONEncoder().encode(list) { try? data.write(to: file, options: .atomic) } }
         // At quit the process may exit before a background write runs.
         if synchronously { write() } else { DispatchQueue.global(qos: .utility).async(execute: write) }
+    }
+
+    // MARK: WebExtension API shapes (chrome.history / chrome.topSites)
+
+    /// Most-visited pages, for `chrome.topSites.get`.
+    func topSites(limit: Int = 20) -> [[String: Any]] {
+        entries.values.sorted { $0.visits > $1.visits }
+            .prefix(limit)
+            .map { ["url": $0.url.absoluteString, "title": $0.title] }
+    }
+
+    /// `chrome.history.search`: text match over url / title within a time range, newest first.
+    func chromeSearch(text: String, startTime: Double?, endTime: Double?, maxResults: Int) -> [[String: Any]] {
+        let q = text.lowercased().trimmed
+        let start = startTime.map { Date(timeIntervalSince1970: $0 / 1000) } ?? .distantPast
+        let end = endTime.map { Date(timeIntervalSince1970: $0 / 1000) } ?? .distantFuture
+        return entries.values
+            .filter { e in
+                guard e.lastVisit >= start, e.lastVisit <= end else { return false }
+                if q.isEmpty { return true }
+                return e.url.absoluteString.lowercased().contains(q) || e.title.lowercased().contains(q)
+            }
+            .sorted { $0.lastVisit > $1.lastVisit }
+            .prefix(max(0, maxResults))
+            .map(chromeItem)
+    }
+
+    /// `chrome.history.getVisits`. The store keeps aggregates, not a per-visit log, so report the
+    /// last visit as a single entry.
+    func chromeVisits(for url: URL) -> [[String: Any]] {
+        guard let e = entries[url.absoluteString] else { return [] }
+        return [[
+            "id": e.url.absoluteString,
+            "visitId": "0",
+            "visitTime": e.lastVisit.timeIntervalSince1970 * 1000,
+            "referringVisitId": "0",
+            "transition": "link",
+        ]]
+    }
+
+    private func chromeItem(_ e: HistoryEntry) -> [String: Any] {
+        [
+            "id": e.url.absoluteString,
+            "url": e.url.absoluteString,
+            "title": e.title,
+            "lastVisitTime": e.lastVisit.timeIntervalSince1970 * 1000,
+            "visitCount": e.visits,
+            "typedCount": 0,
+        ]
+    }
+
+    func deleteUrl(_ url: URL) {
+        entries.removeValue(forKey: url.absoluteString)
+        saver.schedule { [weak self] in self?.saveNow() }
+        ExtensionEventPush.shared.emit("history.onVisitRemoved", args: [["allHistory": false, "urls": [url.absoluteString]]])
+    }
+
+    func deleteRange(startTime: Double, endTime: Double) {
+        let start = Date(timeIntervalSince1970: startTime / 1000)
+        let end = Date(timeIntervalSince1970: endTime / 1000)
+        let removed = entries.filter { $0.value.lastVisit >= start && $0.value.lastVisit <= end }.map { $0.key }
+        entries = entries.filter { !($0.value.lastVisit >= start && $0.value.lastVisit <= end) }
+        saver.schedule { [weak self] in self?.saveNow() }
+        if !removed.isEmpty {
+            ExtensionEventPush.shared.emit("history.onVisitRemoved", args: [["allHistory": false, "urls": removed]])
+        }
     }
 }
 
@@ -207,6 +284,18 @@ final class DownloadItem: Identifiable {
     var destination: URL?
     var fraction: Double = 0
     var state: State = .running
+    /// `chrome.downloads` integer id, when an extension started this download.
+    var chromeID: Int?
+    var url: URL?
+    var bytesReceived: Int64 = 0
+    var totalBytes: Int64 = -1
+    /// Smoothed transfer rate, sampled once a second while running. `nil` until the first sample.
+    var bytesPerSecond: Double?
+    /// When bytes started flowing (reset once the destination is chosen), and when it finished.
+    var startedAt = Date()
+    var finishedAt: Date?
+    @ObservationIgnored var lastSampleBytes: Int64 = 0
+    @ObservationIgnored var lastSampleTime: Date?
     @ObservationIgnored var download: WKDownload?
     @ObservationIgnored var observation: NSKeyValueObservation?
 
@@ -220,6 +309,9 @@ final class DownloadManager: NSObject {
     var items: [DownloadItem] = []
     /// Bumped whenever a download starts, so the sidebar button can pulse.
     var pulse = 0
+    /// chrome.downloads ids — every download gets one, page- or extension-initiated.
+    private var nextChromeID = 1
+    func reserveChromeID() -> Int { let id = nextChromeID; nextChromeID += 1; return id }
 
     var activeCount: Int { items.filter { $0.state == .running }.count }
 
@@ -229,16 +321,74 @@ final class DownloadManager: NSObject {
         return running.map(\.fraction).reduce(0, +) / Double(running.count)
     }
 
-    func track(_ download: WKDownload) {
+    /// Combined speed of everything in flight, for the popover header.
+    var totalBytesPerSecond: Double? {
+        let speeds = items.filter { $0.state == .running }.compactMap(\.bytesPerSecond)
+        return speeds.isEmpty ? nil : speeds.reduce(0, +)
+    }
+
+    /// Samples every running download once a second. Runs only while something is downloading.
+    @ObservationIgnored private var speedTimer: Timer?
+
+    private func startSpeedSampling() {
+        guard speedTimer == nil else { return }
+        let timer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in self?.sampleSpeeds() }
+        RunLoop.main.add(timer, forMode: .common)
+        speedTimer = timer
+    }
+
+    private func sampleSpeeds() {
+        let running = items.filter { $0.state == .running }
+        guard !running.isEmpty else {
+            speedTimer?.invalidate()
+            speedTimer = nil
+            return
+        }
+        let now = Date()
+        for item in running {
+            defer {
+                item.lastSampleTime = now
+                item.lastSampleBytes = item.bytesReceived
+            }
+            guard let last = item.lastSampleTime else { continue }
+            let elapsed = now.timeIntervalSince(last)
+            guard elapsed > 0 else { continue }
+            let instant = Double(max(0, item.bytesReceived - item.lastSampleBytes)) / elapsed
+            // Exponential smoothing so the number doesn't jump around every second.
+            item.bytesPerSecond = item.bytesPerSecond.map { $0 * 0.6 + instant * 0.4 } ?? instant
+        }
+    }
+
+    func track(_ download: WKDownload, chromeID: Int? = nil, url: URL? = nil) {
         download.delegate = self
         let item = DownloadItem(filename: download.originalRequest?.url?.lastPathComponent ?? "Download")
         item.download = download
-        item.observation = download.progress.observe(\.fractionCompleted, options: [.new]) { [weak item] progress, _ in
+        item.chromeID = chromeID ?? reserveChromeID()
+        item.url = url ?? download.originalRequest?.url
+        // Observe the byte count rather than the fraction: with no Content-Length the fraction
+        // never moves, but bytes still arrive.
+        item.observation = download.progress.observe(\.completedUnitCount, options: [.new]) { [weak item] progress, _ in
             let value = progress.fractionCompleted
-            DispatchQueue.main.async { item?.fraction = value }
+            let received = progress.completedUnitCount
+            let total = progress.totalUnitCount
+            DispatchQueue.main.async {
+                item?.fraction = value
+                item?.bytesReceived = received
+                item?.totalBytes = total
+            }
         }
         items.insert(item, at: 0)
+        ExtensionEventPush.shared.emit("downloads.onCreated", args: [[
+            "id": item.chromeID ?? 0,
+            "url": item.url?.absoluteString ?? "",
+            "filename": item.filename,
+            "state": "in_progress",
+            "bytesReceived": 0,
+            "totalBytes": -1,
+            "paused": false,
+        ]])
         pulse += 1
+        startSpeedSampling()
         let state = BrowserState.shared
         if AppSettings.shared.downloads.showPanelOnStart, state.sidebarVisible || state.sidebarPeeking {
             state.downloadsVisible = true
@@ -300,6 +450,8 @@ extension DownloadManager: WKDownloadDelegate {
         let accept: (URL) -> Void = { url in
             item?.filename = url.lastPathComponent
             item?.destination = url
+            // Time spent in the save panel isn't download time.
+            item?.startedAt = Date()
             completionHandler(url)
         }
         guard AppSettings.shared.downloads.askWhereToSave else {
@@ -332,9 +484,18 @@ extension DownloadManager: WKDownloadDelegate {
     func downloadDidFinish(_ download: WKDownload) {
         guard let item = item(for: download) else { return }
         item.fraction = 1
+        item.finishedAt = Date()
+        // The file on disk is the truth; fall back to what the progress counted.
+        let onDisk = (try? item.destination?.resourceValues(forKeys: [.fileSizeKey]).fileSize).flatMap { $0 }
+        let size = onDisk.map(Int64.init) ?? max(download.progress.completedUnitCount, item.bytesReceived)
+        item.bytesReceived = size
+        item.totalBytes = size
         item.state = .finished
         item.download = nil
         item.observation = nil
+        if let id = item.chromeID {
+            ExtensionEventPush.shared.emit("downloads.onChanged", args: [["id": id, "state": ["current": "complete", "previous": "in_progress"]]])
+        }
         if let path = item.destination?.path {
             // Makes the Downloads stack in the Dock bounce, like other browsers.
             DistributedNotificationCenter.default().post(
@@ -352,5 +513,8 @@ extension DownloadManager: WKDownloadDelegate {
         item.state = .failed(error.localizedDescription)
         item.download = nil
         item.observation = nil
+        if let id = item.chromeID {
+            ExtensionEventPush.shared.emit("downloads.onChanged", args: [["id": id, "state": ["current": "interrupted", "previous": "in_progress"]]])
+        }
     }
 }

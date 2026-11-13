@@ -1223,11 +1223,18 @@ struct DownloadsButton: View {
 
 struct DownloadsPopover: View {
     @Environment(DownloadManager.self) private var downloads
+    @State private var listHeight: CGFloat = 0
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack {
                 Text("Downloads").font(.system(size: 13, weight: .semibold))
+                if downloads.activeCount > 0, let speed = downloads.totalBytesPerSecond {
+                    Text(DownloadStats.speed(speed))
+                        .font(.system(size: 11).monospacedDigit())
+                        .foregroundStyle(.secondary)
+                        .contentTransition(.numericText())
+                }
                 Spacer()
                 if downloads.items.contains(where: { $0.state != .running }) {
                     Button("Clear") { withAnimation(Motion.snappy) { downloads.clearFinished() } }
@@ -1255,11 +1262,70 @@ struct DownloadsPopover: View {
                         }
                     }
                     .padding(6)
+                    .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { listHeight = $0 }
                 }
-                .frame(maxHeight: 280)
+                // An exact height, not just a max: with only `maxHeight` the popover keeps the size
+                // it opened at, so rows added while it's open get cut off.
+                .frame(height: min(max(listHeight, 1), 280))
             }
         }
-        .frame(width: 300)
+        .frame(width: 320)
+    }
+}
+
+/// Text for the sizes, speeds and times shown in the downloads list.
+enum DownloadStats {
+    private static let bytes: ByteCountFormatter = {
+        let f = ByteCountFormatter()
+        f.countStyle = .file
+        return f
+    }()
+
+    private static let duration: DateComponentsFormatter = {
+        let f = DateComponentsFormatter()
+        f.unitsStyle = .abbreviated
+        f.allowedUnits = [.hour, .minute, .second]
+        f.maximumUnitCount = 2
+        return f
+    }()
+
+    static func size(_ count: Int64) -> String { bytes.string(fromByteCount: max(0, count)) }
+
+    static func speed(_ bytesPerSecond: Double) -> String { "\(size(Int64(bytesPerSecond)))/s" }
+
+    static func time(_ seconds: TimeInterval) -> String {
+        duration.string(from: max(1, seconds.rounded())) ?? ""
+    }
+
+    /// "12.3 MB of 45.6 MB", or just what's arrived when the server didn't say how big it is.
+    static func progress(_ item: DownloadItem) -> String {
+        item.totalBytes > 0
+            ? "\(size(item.bytesReceived)) of \(size(item.totalBytes))"
+            : size(item.bytesReceived)
+    }
+
+    /// "2.1 MB/s · 15s left". Empty until the first speed sample is in.
+    static func rate(_ item: DownloadItem) -> String {
+        guard let speed = item.bytesPerSecond else { return "" }
+        guard speed >= 1 else { return "Stalled" }
+        var parts = [self.speed(speed)]
+        if item.totalBytes > 0 {
+            parts.append("\(time(Double(item.totalBytes - item.bytesReceived) / speed)) left")
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    /// "45.6 MB · 12s · 3.8 MB/s" for a finished download.
+    static func summary(_ item: DownloadItem) -> String {
+        var parts = [size(item.totalBytes)]
+        if let end = item.finishedAt {
+            let elapsed = end.timeIntervalSince(item.startedAt)
+            parts.append(time(elapsed))
+            if elapsed > 0.5, item.totalBytes > 0 {
+                parts.append(speed(Double(item.totalBytes) / elapsed))
+            }
+        }
+        return parts.joined(separator: " · ")
     }
 }
 
@@ -1280,11 +1346,28 @@ struct DownloadRow: View {
                     .truncationMode(.middle)
                 switch item.state {
                 case .running:
-                    ProgressView(value: item.fraction)
-                        .progressViewStyle(.linear)
-                        .controlSize(.small)
+                    Group {
+                        if item.totalBytes > 0 {
+                            ProgressView(value: item.fraction)
+                        } else {
+                            ProgressView()  // Unknown size: indeterminate bar.
+                        }
+                    }
+                    .progressViewStyle(.linear)
+                    .controlSize(.small)
+                    HStack(spacing: 6) {
+                        Text(DownloadStats.progress(item))
+                        Spacer(minLength: 0)
+                        Text(DownloadStats.rate(item))
+                    }
+                    .font(.system(size: 10.5).monospacedDigit())
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
                 case .finished:
-                    Text("Done").font(.system(size: 11)).foregroundStyle(.secondary)
+                    Text(DownloadStats.summary(item))
+                        .font(.system(size: 11).monospacedDigit())
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
                 case .failed(let reason):
                     Text(reason).font(.system(size: 11)).foregroundStyle(.red).lineLimit(1)
                 }

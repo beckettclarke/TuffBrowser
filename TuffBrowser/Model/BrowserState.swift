@@ -22,6 +22,10 @@ struct ClosedTab: Codable {
     var index: Int?
     /// Back / forward history (`Tab.sessionState`).
     var sessionState: Data?
+    /// Stable identifier for `chrome.sessions`; optional so older sessions still decode.
+    var id: UUID?
+    /// When the tab was closed, for `chrome.sessions` `lastModified`.
+    var closedAt: Date?
 }
 
 struct Toast: Identifiable, Equatable {
@@ -178,6 +182,7 @@ final class BrowserState {
         let space = targetSpace ?? opener.flatMap { self.space(containing: $0) } ?? currentSpace
         let tab = Tab(url: url)
         tab.browser = self
+        tab.openerTab = opener
         var index = settings.tabs.newTabPosition == .top ? 0 : space.tabs.count
         if let opener, let i = space.tabs.firstIndex(where: { $0 === opener }) { index = i + 1 }
         animate { space.tabs.insert(tab, at: index) }
@@ -225,9 +230,11 @@ final class BrowserState {
             if let url = tab.url, let space = space(containing: tab) {
                 closedTabs.append(ClosedTab(
                     url: url, title: tab.title, spaceID: space.id,
-                    index: space.tabs.firstIndex { $0 === tab }, sessionState: tab.sessionState
+                    index: space.tabs.firstIndex { $0 === tab }, sessionState: tab.sessionState,
+                    id: UUID(), closedAt: Date()
                 ))
                 if closedTabs.count > Self.closedTabLimit { closedTabs.removeFirst(closedTabs.count - Self.closedTabLimit) }
+                ExtensionEventPush.shared.emit("sessions.onChanged", args: [])
             }
             ExtensionManager.shared.didClose(tab)
             animate { spaces.forEach { $0.tabs.removeAll { $0 === tab } } }
@@ -275,6 +282,7 @@ final class BrowserState {
     /// Brings back the last closed tab in its old space and place, with its back / forward history.
     func reopenClosedTab() {
         guard restored, let last = closedTabs.popLast() else { return }
+        ExtensionEventPush.shared.emit("sessions.onChanged", args: [])
         let space = spaces.first { $0.id == last.spaceID } ?? currentSpace
         if space !== currentSpace, let index = spaces.firstIndex(where: { $0 === space }) { switchSpace(to: index) }
         let tab = Tab(url: last.url, title: last.title, sessionState: last.sessionState)
@@ -291,6 +299,64 @@ final class BrowserState {
     func forgetClosedTabs() {
         closedTabs.removeAll()
         scheduleSave()
+    }
+
+    // MARK: WebExtension sessions API (chrome.sessions)
+
+    /// Gives legacy closed tabs (saved before these fields existed) an id and close time.
+    private func ensureClosedTabIDs() {
+        var changed = false
+        for i in closedTabs.indices {
+            if closedTabs[i].id == nil { closedTabs[i].id = UUID(); changed = true }
+            if closedTabs[i].closedAt == nil { closedTabs[i].closedAt = Date(); changed = true }
+        }
+        if changed { scheduleSave() }
+    }
+
+    /// Recently closed tabs, newest first, in the shape `chrome.sessions.getRecentlyClosed` expects.
+    func recentlyClosedSessions(maxResults: Int) -> [[String: Any]] {
+        ensureClosedTabIDs()
+        return closedTabs.reversed().prefix(max(0, maxResults)).compactMap { closed in
+            guard let id = closed.id else { return nil }
+            return [
+                "lastModified": (closed.closedAt ?? Date()).timeIntervalSince1970 * 1000,
+                "tab": [
+                    "sessionId": id.uuidString,
+                    "url": closed.url.absoluteString,
+                    "title": closed.title,
+                    "windowId": "1",
+                    "index": closed.index ?? 0,
+                ],
+            ]
+        }
+    }
+
+    /// Reopens a closed tab by its session id (nil = the most recent), with its history. Returns the
+    /// restored session in Chrome's shape, or nil if there is nothing to restore.
+    func restoreSession(id: String?) -> [String: Any]? {
+        ensureClosedTabIDs()
+        let index: Int? = id.flatMap { id in closedTabs.firstIndex { $0.id?.uuidString == id } } ?? closedTabs.indices.last
+        guard let index else { return nil }
+        let closed = closedTabs.remove(at: index)
+        ExtensionEventPush.shared.emit("sessions.onChanged", args: [])
+        let space = spaces.first { $0.id == closed.spaceID } ?? currentSpace
+        if space !== currentSpace, let i = spaces.firstIndex(where: { $0 === space }) { switchSpace(to: i) }
+        let tab = Tab(url: closed.url, title: closed.title, sessionState: closed.sessionState)
+        tab.browser = self
+        let atIndex = min(closed.index ?? (settings.tabs.newTabPosition == .top ? 0 : space.tabs.count), space.tabs.count)
+        animate { space.tabs.insert(tab, at: atIndex) }
+        tab.wake()
+        ExtensionManager.shared.didOpen(tab)
+        select(tab)
+        scheduleSave()
+        return [
+            "tab": [
+                "sessionId": closed.id?.uuidString ?? "",
+                "url": closed.url.absoluteString,
+                "title": closed.title,
+                "windowId": "1",
+            ],
+        ]
     }
 
     /// Gives a tab its own name in the sidebar. An empty name, or the page's own title, goes
@@ -860,7 +926,7 @@ final class BrowserState {
         let visible = selectedTab
         let stale = spaces.flatMap(\.tabs).filter { tab in
             tab !== visible && tab.lastActive < cutoff && !tab.isPlayingAudio && !tab.isInPictureInPicture
-                && tab.permissionRequest == nil
+                && !tab.isLoading && tab.permissionRequest == nil
         }
         stale.forEach { close($0) }
     }

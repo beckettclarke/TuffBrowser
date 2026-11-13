@@ -105,7 +105,7 @@ enum PromptPresenter {
         let state = BrowserState.shared
         let host: NSWindow? = switch prompt.host {
         case .browser: state.window
-        case .settings: AppDelegate.shared?.visibleSettingsWindow
+        case .settings: AppDelegate.shared?.visibleSettingsWindow ?? state.window
         }
         guard let window = host else {
             continuation.resume(returning: PromptResult(

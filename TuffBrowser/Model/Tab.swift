@@ -62,6 +62,13 @@ final class Tab: NSObject, Identifiable {
     /// The frame holding the video in PiP, and the last subframe that played a video.
     @ObservationIgnored var pictureInPictureFrame: WKFrameInfo?
     @ObservationIgnored var mediaFrame: WKFrameInfo?
+    /// The tab that opened this one (a link opened in a new tab, `window.open`, or
+    /// `tabs.create({openerTabId})`). Surfaced to extensions as `openerTabId`. Weak, so it goes
+    /// nil on its own if the opener is closed.
+    @ObservationIgnored weak var openerTab: Tab?
+    /// The URL of a navigation that has started but not committed yet; what extensions read as
+    /// `pendingUrl` on a tab. Cleared when the load commits, fails, or the web view goes away.
+    @ObservationIgnored var pendingURL: URL?
 
     private static let audioKeyPath = "_isPlayingAudio"
 
@@ -235,6 +242,7 @@ final class Tab: NSObject, Identifiable {
             }
         }
         self.url = url
+        pendingURL = url
         title = ""
         awaitingExtension = false
         savedInteractionState = nil
@@ -314,6 +322,7 @@ final class Tab: NSObject, Identifiable {
         pictureInPictureFrame = nil
         mediaFrame = nil
         hoveredLink = nil
+        pendingURL = nil
         canGoBack = false
         canGoForward = false
     }
@@ -326,6 +335,9 @@ final class Tab: NSObject, Identifiable {
                 if !t.isEmpty, t != self.title {
                     self.title = t
                     self.browser?.tabDidChange(self, properties: .title)
+                    if let u = self.url, let scheme = u.scheme, scheme == "http" || scheme == "https" {
+                        ExtensionEventPush.shared.emit("history.onTitleChanged", args: [["url": u.absoluteString, "title": t]])
+                    }
                 }
             },
             view.observe(\.url, options: [.new]) { [weak self] view, _ in
@@ -382,6 +394,7 @@ final class Tab: NSObject, Identifiable {
             return
         }
         self.url = url
+        pendingURL = url
         savedInteractionState = nil
         loadingHome = homeURL.map { Self.samePage(url, $0) } ?? false
         if let webView {

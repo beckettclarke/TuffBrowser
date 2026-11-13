@@ -1,4 +1,5 @@
 import AppKit
+import NaturalLanguage
 import WebKit
 
 // MARK: - Tabs as seen by extensions (browser.tabs.*)
@@ -75,6 +76,45 @@ extension Tab: WKWebExtensionTab {
 
     func isSelected(for context: WKWebExtensionContext) -> Bool { browser?.selectedTab === self }
 
+    func setSelected(_ selected: Bool, for context: WKWebExtensionContext, completionHandler: @escaping ((any Error)?) -> Void) {
+        // There is always one active tab; deselecting isn't meaningful, so only honour selection.
+        if selected { browser?.select(self) }
+        completionHandler(nil)
+    }
+
+    func pendingURL(for context: WKWebExtensionContext) -> URL? { pendingURL }
+
+    func parentTab(for context: WKWebExtensionContext) -> (any WKWebExtensionTab)? { openerTab }
+
+    func setParentTab(_ parentTab: (any WKWebExtensionTab)?, for context: WKWebExtensionContext, completionHandler: @escaping ((any Error)?) -> Void) {
+        openerTab = parentTab as? Tab
+        completionHandler(nil)
+    }
+
+    func detectWebpageLocale(for context: WKWebExtensionContext, completionHandler: @escaping (Locale?, (any Error)?) -> Void) {
+        guard let webView else { completionHandler(nil, nil); return }
+        // WebKit has no public page-language detector: read a slice of the page's text and detect
+        // its dominant language, falling back to the page's declared `lang`.
+        let script = "(function(){var t=document.body?document.body.innerText:'';return{lang:document.documentElement.lang||'',text:t.slice(0,4000)};})()"
+        webView.evaluateJavaScript(script) { result, _ in
+            var identifier: String?
+            if let info = result as? [String: Any] {
+                let recognizer = NLLanguageRecognizer()
+                recognizer.processString(info["text"] as? String ?? "")
+                identifier = recognizer.dominantLanguage?.rawValue
+                if identifier == nil, let lang = info["lang"] as? String, !lang.isEmpty { identifier = lang }
+            }
+            completionHandler(identifier.map { Locale(identifier: $0) }, nil)
+        }
+    }
+
+    func takeSnapshot(using configuration: WKSnapshotConfiguration, for context: WKWebExtensionContext, completionHandler: @escaping (NSImage?, (any Error)?) -> Void) {
+        guard let webView else { completionHandler(nil, nil); return }
+        webView.takeSnapshot(with: configuration) { image, error in
+            completionHandler(image, error)
+        }
+    }
+
     func duplicate(
         using configuration: WKWebExtension.TabConfiguration, for context: WKWebExtensionContext,
         completionHandler: @escaping ((any WKWebExtensionTab)?, (any Error)?) -> Void
@@ -122,6 +162,43 @@ extension BrowserWindowAdapter: WKWebExtensionWindow {
     func focus(for context: WKWebExtensionContext, completionHandler: @escaping ((any Error)?) -> Void) {
         browser.window?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+        completionHandler(nil)
+    }
+
+    func setWindowState(_ state: WKWebExtension.WindowState, for context: WKWebExtensionContext, completionHandler: @escaping ((any Error)?) -> Void) {
+        guard let window = browser.window else { completionHandler(nil); return }
+        switch state {
+        case .minimized:
+            window.miniaturize(nil)
+        case .maximized:
+            if !window.isZoomed { window.zoom(nil) }
+        case .fullscreen:
+            if !window.styleMask.contains(.fullScreen) { window.toggleFullScreen(nil) }
+        case .normal:
+            if window.isMiniaturized { window.deminiaturize(nil) }
+            if window.styleMask.contains(.fullScreen) { window.toggleFullScreen(nil) }
+            else if window.isZoomed { window.zoom(nil) }
+        @unknown default:
+            break
+        }
+        completionHandler(nil)
+    }
+
+    func setFrame(_ frame: CGRect, for context: WKWebExtensionContext, completionHandler: @escaping ((any Error)?) -> Void) {
+        guard let window = browser.window, !frame.isNull, frame.width > 0, frame.height > 0 else {
+            completionHandler(nil)
+            return
+        }
+        // Same screen-coordinate convention as frame(for:) above, so a get/set round-trips.
+        window.setFrame(frame, display: true)
+        completionHandler(nil)
+    }
+
+    func close(for context: WKWebExtensionContext, completionHandler: @escaping ((any Error)?) -> Void) {
+        // Tuff has a single window: closing it closes the browser window. The session is kept and
+        // the window returns from the Dock (the app doesn't quit on last-window-close), so no tabs
+        // are destroyed.
+        browser.window?.performClose(nil)
         completionHandler(nil)
     }
 }

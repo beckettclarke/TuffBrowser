@@ -281,9 +281,14 @@ final class UpdateController {
             controller.checkForUpdates(nil)
             return
         }
-        let alert = NSAlert()
-        alert.messageText = "Updates aren’t set up for this build"
-        alert.informativeText = "Set TUFF_APPCAST_URL and TUFF_SPARKLE_PUBLIC_KEY in project.yml (see the README), then rebuild. Sparkle will handle the rest."
-        alert.runModal()
+        Task { @MainActor in
+            await PromptPresenter.present(Prompt(
+                symbol: "arrow.triangle.2.circlepath",
+                title: "Updates aren’t set up for this build",
+                message: "Set TUFF_APPCAST_URL and TUFF_SPARKLE_PUBLIC_KEY in project.yml (see the README), then rebuild. Sparkle will handle the rest.",
+                confirmTitle: "OK",
+                cancelTitle: nil
+            ))
+        }
     }
 }

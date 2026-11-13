@@ -87,7 +87,9 @@ enum WebEngine {
         PictureInPicture.enable(config.preferences)
         config.preferences.isFraudulentWebsiteWarningEnabled = settings.privacy.fraudWarnings
         config.preferences.minimumFontSize = settings.advanced.minimumFontSize
-        config.preferences.setValue(settings.advanced.webInspector, forKey: "developerExtrasEnabled")
+        if config.preferences.responds(to: NSSelectorFromString("setDeveloperExtrasEnabled:")) {
+            config.preferences.setValue(settings.advanced.webInspector, forKey: "developerExtrasEnabled")
+        }
         config.defaultWebpagePreferences.allowsContentJavaScript = settings.privacy.javaScript
         // Pages get the system's fonts, not ones the user installed themselves — as in Safari,
         // where it also stops sites fingerprinting you by your font list. It is here for
@@ -128,7 +130,9 @@ enum WebEngine {
         preferences.minimumFontSize = settings.advanced.minimumFontSize
         PictureInPicture.enable(preferences)
         preferences.isFraudulentWebsiteWarningEnabled = settings.privacy.fraudWarnings
-        preferences.setValue(settings.advanced.webInspector, forKey: "developerExtrasEnabled")
+        if preferences.responds(to: NSSelectorFromString("setDeveloperExtrasEnabled:")) {
+            preferences.setValue(settings.advanced.webInspector, forKey: "developerExtrasEnabled")
+        }
     }
 
     static func errorPage(for error: Error, url: URL?) -> String {

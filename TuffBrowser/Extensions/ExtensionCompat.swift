@@ -34,6 +34,8 @@ enum ExtensionCompat {
 
     /// The hidden page that opens WebSockets for an extension's service worker (see the shim).
     static let socketRelayPage = "__tuff_socket.html"
+    /// The hidden page Tuff scripts to push native-API events into an extension (see ExtensionEventPush).
+    static let eventRelayPage = "__tuff_events.html"
     private static let socketRelayScriptName = "__tuff_socket.js"
     private static let socketRelayHTML = "<!doctype html><meta charset=\"utf-8\"><title>Tuff socket relay</title><script src=\"/__tuff_socket.js\"></script>\n"
     private static let socketRelayScript = """
@@ -94,6 +96,15 @@ enum ExtensionCompat {
             if (try? String(contentsOf: url, encoding: .utf8)) != text {
                 try? text.write(to: url, atomically: true, encoding: .utf8)
             }
+        }
+    }
+
+    /// Writes the event relay page into an extension, if it isn't there or is out of date.
+    private static func writeEventRelay(into root: URL) {
+        let url = root.appendingPathComponent(eventRelayPage)
+        let text = "<!doctype html><meta charset=\"utf-8\"><title>Tuff event relay</title>\n"
+        if (try? String(contentsOf: url, encoding: .utf8)) != text {
+            try? text.write(to: url, atomically: true, encoding: .utf8)
         }
     }
 
@@ -180,6 +191,7 @@ enum ExtensionCompat {
         }
 
         writeSocketRelay(into: root)
+        writeEventRelay(into: root)
         guard (try? shim.write(to: root.appendingPathComponent(shimName), atomically: true, encoding: .utf8)) != nil else { return }
         if changed {
             guard let output = try? JSONSerialization.data(withJSONObject: manifest, options: [.prettyPrinted, .withoutEscapingSlashes]),
@@ -203,6 +215,7 @@ enum ExtensionCompat {
         }
 
         writeSocketRelay(into: root)
+        writeEventRelay(into: root)
 
         // Everything except module workers loads the shim from its own file.
         let shimURL = root.appendingPathComponent(shimName)
@@ -279,10 +292,10 @@ enum ExtensionCompat {
 
       // Chrome-only namespaces. Each is added only if WebKit has nothing under that name.
       const missing = [
-        'notifications', 'identity', 'offscreen', 'tabGroups', 'management', 'privacy', 'idle',
-        'system', 'power', 'gcm', 'instanceID', 'tts', 'ttsEngine', 'fontSettings', 'contentSettings',
-        'browsingData', 'pageCapture', 'proxy', 'sessions', 'topSites', 'omnibox', 'history', 'bookmarks',
-        'downloads', 'debugger', 'enterprise', 'readingList', 'search', 'webAuthenticationProxy', 'loginState',
+        'tabGroups', 'privacy',
+        'gcm', 'instanceID', 'ttsEngine', 'fontSettings', 'contentSettings',
+        'pageCapture', 'proxy', 'omnibox', 'bookmarks',
+        'debugger', 'enterprise', 'readingList', 'webAuthenticationProxy', 'loginState',
         'documentScan', 'printing', 'vpnProvider', 'wallpaper', 'certificateProvider', 'platformKeys', 'userScripts',
         // Firefox-only.
         'contentScripts', 'dns', 'browserSettings', 'theme', 'contextualIdentities', 'find',
@@ -758,6 +771,190 @@ enum ExtensionCompat {
               setIcon: api(() => undefined),
             }));
           }
+        }
+      }
+
+      // Native implementations for APIs WebKit lacks but Tuff can provide (topSites, history,
+      // browsingData, management). They reach Tuff through the same tabs.create bridge as the side
+      // panel, with a private tuff-api:// URL; the answer comes back in the call's error. The methods
+      // are real; their events are inert stand-ins for now (see TODOS.md).
+      if (privileged) {
+        for (const { root, label } of roots) {
+          let tabs;
+          try { tabs = root.tabs; } catch (e) { continue; }
+          if (!tabs || typeof tabs.create !== 'function') continue;
+          const create = tabs.create;
+          const marker = '__tuff_api__:';
+          const call = async (namespace, method, args) => {
+            const url = 'tuff-api://' + namespace + '/' + method + '/?d=' + encodeURIComponent(JSON.stringify(args || {}));
+            try {
+              await create({ url, active: false });
+            } catch (error) {
+              const text = String((error && error.message) || error);
+              const at = text.indexOf(marker);
+              if (at < 0) throw error;
+              let reply = {};
+              try { reply = JSON.parse(text.slice(at + marker.length, text.lastIndexOf('}') + 1)); } catch (e) {}
+              if (reply.error) throw new Error(reply.error);
+              return reply.value === null ? undefined : reply.value;
+            }
+            return undefined;
+          };
+          const api = (impl) => function (...args) {
+            const callback = args.length && typeof args[args.length - 1] === 'function' ? args.pop() : null;
+            const promise = Promise.resolve().then(() => impl(...args));
+            if (!callback) return promise;
+            promise.then((value) => { try { callback(value); } catch (e) {} }, () => { try { callback(); } catch (e) {} });
+            return undefined;
+          };
+          // Real events for the native APIs. Tuff pushes them through a relay page's
+          // runtime.sendMessage (a wake event for the worker); dispatch to listeners here. Adding the
+          // first listener subscribes with Tuff so it only wakes extensions that actually listen.
+          const nativeEvents = {};
+          const event = (name) => {
+            const listeners = new Set();
+            nativeEvents[name] = listeners;
+            return {
+              addListener: (fn) => {
+                if (typeof fn !== 'function') return;
+                const first = listeners.size === 0;
+                listeners.add(fn);
+                if (first) call('__events', 'subscribe', { event: name }).catch(() => {});
+              },
+              removeListener: (fn) => {
+                listeners.delete(fn);
+                if (listeners.size === 0) call('__events', 'unsubscribe', { event: name }).catch(() => {});
+              },
+              hasListener: (fn) => listeners.has(fn),
+              hasListeners: () => listeners.size > 0,
+            };
+          };
+          try {
+            root.runtime.onMessage.addListener((msg) => {
+              if (msg && typeof msg === 'object' && msg.__tuffEvent && nativeEvents[msg.__tuffEvent]) {
+                for (const fn of [...nativeEvents[msg.__tuffEvent]]) { try { fn(...(msg.args || [])); } catch (e) {} }
+              }
+            });
+          } catch (e) {}
+          const implement = (name, methods) => {
+            if (absent(root, name)) { add(root, name, methods); pins.push(methods); }
+          };
+
+          implement('topSites', {
+            get: api((options) => call('topSites', 'get', options)),
+          });
+          implement('history', {
+            search: api((query) => call('history', 'search', query)),
+            getVisits: api((details) => call('history', 'getVisits', details)),
+            addUrl: api((details) => call('history', 'addUrl', details)),
+            deleteUrl: api((details) => call('history', 'deleteUrl', details)),
+            deleteRange: api((range) => call('history', 'deleteRange', range)),
+            deleteAll: api(() => call('history', 'deleteAll', {})),
+            onVisited: event('history.onVisited'),
+            onVisitRemoved: event('history.onVisitRemoved'),
+            onTitleChanged: event('history.onTitleChanged'),
+          });
+          implement('browsingData', {
+            remove: api((options, dataToRemove) => call('browsingData', 'remove', Object.assign({}, options, { dataToRemove: dataToRemove }))),
+            removeCache: api((options) => call('browsingData', 'removeCache', options)),
+            removeCookies: api((options) => call('browsingData', 'removeCookies', options)),
+            removeLocalStorage: api((options) => call('browsingData', 'removeLocalStorage', options)),
+            removeHistory: api((options) => call('browsingData', 'removeHistory', options)),
+            settings: api(() => call('browsingData', 'settings', {})),
+          });
+          implement('management', {
+            getAll: api(() => call('management', 'getAll', {})),
+            get: api((id) => call('management', 'get', { id: id })),
+            getSelf: api(() => call('management', 'getSelf', {})),
+            getPermissionWarningsById: api((id) => call('management', 'getPermissionWarningsById', { id: id })),
+            setEnabled: api((id, enabled) => call('management', 'setEnabled', { id: id, enabled: enabled })),
+            onInstalled: event('management.onInstalled'),
+            onUninstalled: event('management.onUninstalled'),
+            onEnabled: event('management.onEnabled'),
+            onDisabled: event('management.onDisabled'),
+          });
+          implement('sessions', {
+            getRecentlyClosed: api((filter) => call('sessions', 'getRecentlyClosed', filter)),
+            restore: api((sessionId) => call('sessions', 'restore', { sessionId: sessionId })),
+            getDevices: api((filter) => call('sessions', 'getDevices', filter)),
+            onChanged: event('sessions.onChanged'),
+            MAX_SESSION_RESULTS: 25,
+          });
+          implement('notifications', {
+            create: api((notificationId, options) => {
+              if (notificationId && typeof notificationId === 'object') { options = notificationId; notificationId = undefined; }
+              return call('notifications', 'create', { notificationId: notificationId, options: options });
+            }),
+            clear: api((notificationId) => call('notifications', 'clear', { notificationId: notificationId })),
+            getAll: api(() => call('notifications', 'getAll', {})),
+            getPermissionLevel: api(() => call('notifications', 'getPermissionLevel', {})),
+            onClicked: event('notifications.onClicked'),
+            onClosed: event('notifications.onClosed'),
+            onButtonClicked: event('notifications.onButtonClicked'),
+            onPermissionLevelChanged: event('notifications.onPermissionLevelChanged'),
+          });
+          implement('offscreen', {
+            createDocument: api((parameters) => call('offscreen', 'createDocument', parameters)),
+            closeDocument: api(() => call('offscreen', 'closeDocument', {})),
+            hasDocument: api(() => call('offscreen', 'hasDocument', {})),
+            Reason: {
+              AUDIO_PLAYBACK: 'AUDIO_PLAYBACK', BLOBS: 'BLOBS', CLIPBOARD: 'CLIPBOARD',
+              DISPLAY_MEDIA: 'DISPLAY_MEDIA', DOM_PARSER: 'DOM_PARSER', DOM_SCRAPING: 'DOM_SCRAPING',
+              IFRAME_SCRIPTING: 'IFRAME_SCRIPTING', TESTING: 'TESTING', USER_MEDIA: 'USER_MEDIA',
+              WEB_RTC: 'WEB_RTC', WORKERS: 'WORKERS', BROADCAST_CHANNEL: 'BROADCAST_CHANNEL',
+              LOCAL_STORAGE: 'LOCAL_STORAGE', MATCH_MEDIA: 'MATCH_MEDIA', GEOLOCATION: 'GEOLOCATION',
+            },
+          });
+          implement('identity', {
+            getRedirectURL: (path) => {
+              let id = '';
+              try { id = root.runtime.id || ''; } catch (e) {}
+              let p = path || '';
+              while (p.charAt(0) === '/') p = p.slice(1);
+              return 'https://' + id + '.chromiumapp.org/' + p;
+            },
+            launchWebAuthFlow: api((details) => call('identity', 'launchWebAuthFlow', details)),
+            onSignInChanged: event('identity.onSignInChanged'),
+          });
+          implement('downloads', {
+            download: api((options) => call('downloads', 'download', options)),
+            search: api((query) => call('downloads', 'search', query)),
+            erase: api((query) => call('downloads', 'erase', query)),
+            cancel: api((id) => call('downloads', 'cancel', { id: id })),
+            open: api((id) => call('downloads', 'open', { id: id })),
+            show: api((id) => call('downloads', 'show', { id: id })),
+            pause: api((id) => call('downloads', 'pause', { id: id })),
+            resume: api((id) => call('downloads', 'resume', { id: id })),
+            onCreated: event('downloads.onCreated'),
+            onChanged: event('downloads.onChanged'),
+            onErased: event('downloads.onErased'),
+          });
+          implement('system', {
+            cpu: { getInfo: api(() => call('system.cpu', 'getInfo', {})) },
+            memory: { getInfo: api(() => call('system.memory', 'getInfo', {})) },
+            storage: { getInfo: api(() => call('system.storage', 'getInfo', {})) },
+          });
+          implement('power', {
+            requestKeepAwake: api((level) => call('power', 'requestKeepAwake', { level: level })),
+            releaseKeepAwake: api(() => call('power', 'releaseKeepAwake', {})),
+          });
+          implement('idle', {
+            queryState: api((interval) => call('idle', 'queryState', { detectionIntervalInSeconds: interval })),
+            setDetectionInterval: api((interval) => call('idle', 'setDetectionInterval', { intervalInSeconds: interval })),
+            onStateChanged: event('idle.onStateChanged'),
+          });
+          implement('tts', {
+            speak: api((utterance, options) => call('tts', 'speak', Object.assign({}, options, { utterance: utterance }))),
+            stop: api(() => call('tts', 'stop', {})),
+            pause: api(() => call('tts', 'pause', {})),
+            resume: api(() => call('tts', 'resume', {})),
+            isSpeaking: api(() => call('tts', 'isSpeaking', {})),
+            getVoices: api(() => call('tts', 'getVoices', {})),
+            onEvent: event('tts.onEvent'),
+          });
+          implement('search', {
+            query: api((query) => call('search', 'query', query)),
+          });
         }
       }
 

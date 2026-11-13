@@ -328,6 +328,8 @@ final class ExtensionManager: NSObject {
 
     private func unload(_ id: String) {
         socketRelays.removeValue(forKey: id)?.stop()
+        ExtensionOffscreen.shared.extensionUnloaded(id)
+        ExtensionEventPush.shared.extensionUnloaded(id)
         SidePanelManager.shared.extensionUnloaded(id)
         guard let context = contexts.removeValue(forKey: id) else { return }
         try? controller.unload(context)
@@ -337,6 +339,7 @@ final class ExtensionManager: NSObject {
     func setEnabled(_ enabled: Bool, id: String) {
         update(id) { $0.enabled = enabled }
         guard let record = records.first(where: { $0.id == id }) else { return }
+        ExtensionEventPush.shared.emit(enabled ? "management.onEnabled" : "management.onDisabled", args: [ExtensionAPIBridge.shared.managementInfo(record)])
         if enabled {
             guard shouldRun(record) else { return }
             Task { @MainActor in await self.load(record) }
@@ -347,6 +350,7 @@ final class ExtensionManager: NSObject {
 
     func uninstall(id: String) {
         guard let record = records.first(where: { $0.id == id }) else { return }
+        ExtensionEventPush.shared.emit("management.onUninstalled", args: [id])
         unload(id)
         if record.path == nil {
             try? FileManager.default.removeItem(at: directory(for: record))
@@ -594,7 +598,10 @@ final class ExtensionManager: NSObject {
             // background worker down before the new files are loaded under the same origin.
             if isUpdate { try? await Task.sleep(nanoseconds: 800_000_000) }
             await self.load(record)
-            if !isUpdate { SidePanelManager.shared.extensionInstalled(record.id) }
+            if !isUpdate {
+                SidePanelManager.shared.extensionInstalled(record.id)
+                ExtensionEventPush.shared.emit("management.onInstalled", args: [ExtensionAPIBridge.shared.managementInfo(record)])
+            }
             let name = self.records.first { $0.id == record.id }?.name ?? record.name
             self.browser.show(Toast(symbol: "puzzlepiece.extension.fill", text: isUpdate ? "Updated \(name)" : "Added \(name)"))
         }
@@ -944,6 +951,13 @@ extension ExtensionManager: WKWebExtensionControllerDelegate {
         // chrome.sidePanel / browser.sidebarAction calls from the compatibility shim.
         if let url = configuration.url, url.scheme == SidePanelManager.bridgeScheme {
             completionHandler(nil, SidePanelManager.shared.handleBridge(url, context: extensionContext))
+            return
+        }
+        // Native API calls from the compatibility shim (history, topSites, browsingData, management).
+        if let url = configuration.url, url.scheme == ExtensionAPIBridge.scheme {
+            ExtensionAPIBridge.shared.handle(url, context: extensionContext) { error in
+                completionHandler(nil, error)
+            }
             return
         }
         trace("openNewTab \(configuration.url?.absoluteString ?? "-")")

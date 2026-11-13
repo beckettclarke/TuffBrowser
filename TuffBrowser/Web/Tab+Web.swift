@@ -55,6 +55,8 @@ extension Tab: WKNavigationDelegate {
             return
         }
 
+        // A main-frame navigation is now in flight; extensions read it as `pendingUrl` until it commits.
+        if navigationAction.targetFrame?.isMainFrame ?? false { pendingURL = url }
         decisionHandler(.allow, preferences)
     }
 
@@ -97,6 +99,7 @@ extension Tab: WKNavigationDelegate {
     }
 
     func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
+        pendingURL = nil
         mediaFrame = nil
         if hoveredLink != nil { hoveredLink = nil }
         if isInPictureInPicture {
@@ -138,6 +141,7 @@ extension Tab: WKNavigationDelegate {
     }
 
     private func handleLoadFailure(_ webView: WKWebView, error: Error) {
+        pendingURL = nil
         let ns = error as NSError
         // Cancelled loads, and loads that turned into downloads / plug-in handled content.
         if ns.domain == NSURLErrorDomain, ns.code == NSURLErrorCancelled { return }
