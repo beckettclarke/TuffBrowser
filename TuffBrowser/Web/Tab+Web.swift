@@ -131,6 +131,8 @@ extension Tab: WKNavigationDelegate {
         pageDialogCount = 0
         pageDialogsBlocked = false
         if hoveredLink != nil { hoveredLink = nil }
+        // A new page: reader mode was for the one before.
+        closeReader()
         if isInPictureInPicture {
             isInPictureInPicture = false
             enteredPictureInPictureAutomatically = false
@@ -184,6 +186,8 @@ extension Tab: WKNavigationDelegate {
     @objc(_webView:navigation:didSameDocumentNavigation:)
     func webView(_ webView: WKWebView, navigation: WKNavigation?, didSameDocumentNavigation type: Int) {
         // _WKSameDocumentNavigationType: 0 anchor, 1 push, 2 replace, 3 pop.
+        // A single-page app moving to another page leaves the article reader mode showed.
+        if type != 0, let reader, let u = webView.url, !Self.samePage(u, reader.url) { closeReader() }
         guard type == 1 || type == 3, !(browser?.isPrivate ?? false), pdf == nil, let u = webView.url else { return }
         HistoryStore.shared.record(url: u, title: webView.title ?? "")
     }

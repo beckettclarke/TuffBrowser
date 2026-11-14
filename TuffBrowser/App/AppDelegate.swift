@@ -147,6 +147,7 @@ final class AppDelegate: NSObject {
 
     @objc func showImport(_ sender: Any?) { showSettings(tab: .importData) }
     @objc func copyLink(_ sender: Any?) { state.copyCurrentURL() }
+    @objc func toggleReader(_ sender: Any?) { state.selectedTab?.toggleReader() }
     @objc func nextTab(_ sender: Any?) { state.selectAdjacentTab(offset: 1) }
     @objc func previousTab(_ sender: Any?) { state.selectAdjacentTab(offset: -1) }
     @objc func nextSpace(_ sender: Any?) { state.switchSpace(by: 1) }
@@ -167,17 +168,20 @@ final class AppDelegate: NSObject {
 
     @objc func zoomIn(_ sender: Any?) {
         guard let tab = state.selectedTab else { return }
+        if tab.reader != nil { ReaderSettings.shared.grow(); return }
         if let pdf = tab.pdf, pdf.isReady { pdf.zoomIn(); return }
         tab.setZoom(tab.pageZoom * 1.1)
     }
 
     @objc func zoomOut(_ sender: Any?) {
         guard let tab = state.selectedTab else { return }
+        if tab.reader != nil { ReaderSettings.shared.shrink(); return }
         if let pdf = tab.pdf, pdf.isReady { pdf.zoomOut(); return }
         tab.setZoom(tab.pageZoom / 1.1)
     }
 
     @objc func zoomReset(_ sender: Any?) {
+        if state.selectedTab?.reader != nil { ReaderSettings.shared.resetSize(); return }
         if let pdf = state.selectedTab?.pdf, pdf.isReady { pdf.setZoom(.auto); return }
         state.selectedTab?.setZoom(CGFloat(AppSettings.shared.advanced.defaultZoom))
     }
@@ -202,7 +206,8 @@ final class AppDelegate: NSObject {
 
     @objc func printPage(_ sender: Any?) {
         if let pdf = state.selectedTab?.pdf, pdf.isReady { pdf.print(); return }
-        guard let webView = state.selectedTab?.webView, let window = state.window else { return }
+        // In reader mode, the article prints rather than the page.
+        guard let webView = state.selectedTab?.reader?.view ?? state.selectedTab?.webView, let window = state.window else { return }
         let operation = webView.printOperation(with: NSPrintInfo.shared)
         operation.view?.frame = webView.bounds
         operation.runModal(for: window, delegate: nil, didRun: nil, contextInfo: nil)
@@ -234,6 +239,9 @@ extension AppDelegate: NSMenuItemValidation {
             return tab != nil
         case #selector(copyLink(_:)), #selector(duplicateTab(_:)):
             return tab?.url != nil
+        case #selector(toggleReader(_:)):
+            menuItem.title = tab?.reader != nil ? "Exit Reader Mode" : "Enter Reader Mode"
+            return tab?.reader != nil || tab?.canUseReader == true
         case #selector(reopenClosedTab(_:)):
             return state.hasClosedTabs
         case #selector(togglePin(_:)):

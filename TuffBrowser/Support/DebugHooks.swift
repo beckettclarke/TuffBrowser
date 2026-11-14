@@ -648,6 +648,67 @@ enum DebugHooks {
             // pagemenu [off|screenshot] — opens / closes the page menu off the address bar.
             if argument == "screenshot" { PageMenu.openOn = .screenshot }
             state.pageMenuVisible = argument != "off"
+        case "readersnap":
+            // readersnap <path> — reader mode's article as WebKit draws it (works with the screen locked).
+            let rest2 = rest
+            guard let view = state.selectedTab?.reader?.view else { log("readersnap: not in reader mode"); run(rest2); return }
+            view.takeSnapshot(with: nil) { image, error in
+                if let image, let tiff = image.tiffRepresentation, let png = NSBitmapImageRep(data: tiff)?.representation(using: .png, properties: [:]) {
+                    try? png.write(to: URL(fileURLWithPath: argument))
+                    log("readersnap \(argument) \(Int(image.size.width))x\(Int(image.size.height))")
+                } else {
+                    log("readersnap failed \(error.map { "\($0)" } ?? "")")
+                }
+                run(rest2)
+            }
+            return
+        case "readerjs":
+            // readerjs <js> — evaluates in reader mode's own web view.
+            let rest2 = rest
+            if let view = state.selectedTab?.reader?.view {
+                view.evaluateJavaScript(argument) { result, error in
+                    log("readerjs \(argument.prefix(60)) => \(result.map { "\($0)" } ?? "nil") \(error.map { "ERR \($0)" } ?? "")")
+                    run(rest2)
+                }
+            } else {
+                log("readerjs: not in reader mode")
+                run(rest2)
+            }
+            return
+        case "readerprobe":
+            // readerprobe — runs reader mode's article extraction and logs what came back (or the error).
+            let rest2 = rest
+            let started = Date()
+            state.selectedTab?.webView?.callAsyncJavaScript(ReaderScript.extract, arguments: ["debug": true], in: nil, in: .defaultClient) { result in
+                switch result {
+                case .success(let value):
+                    let dict = value as? [String: Any]
+                    log("readerprobe \(Int(Date().timeIntervalSince(started) * 1000))ms title=\(dict?["title"] ?? "-") html=\((dict?["html"] as? String)?.count ?? 0) failed=\(dict?["failed"] ?? "-") \(dict.map { d in d.filter { $0.key != "html" } }.map { "\($0)" } ?? "nil")")
+                case .failure(let error):
+                    log("readerprobe ERR \(error)")
+                }
+                run(rest2)
+            }
+            return
+        case "reader":
+            // reader [on|off|toggle|theme …|font …] — reader mode on the selected tab, then logs what it found.
+            let tab = state.selectedTab
+            switch argument {
+            case "on": tab?.openReader()
+            case "off": tab?.closeReader()
+            case "toggle": tab?.toggleReader()
+            default:
+                // reader theme <auto|light|sepia|dark> / reader font <serif|sans>
+                let words = argument.split(separator: " ").map(String.init)
+                if words.count == 2, words[0] == "theme", let theme = ReaderTheme(rawValue: words[1]) { ReaderSettings.shared.prefs.theme = theme }
+                if words.count == 2, words[0] == "font", let font = ReaderFont(rawValue: words[1]) { ReaderSettings.shared.prefs.font = font }
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+                let a = tab?.reader?.article
+                log("reader active=\(tab?.reader != nil) available=\(tab?.canUseReader ?? false) title=\(a?.title ?? "-") byline=\(a?.byline ?? "-") site=\(a?.siteName ?? "-") date=\(a?.published ?? "-") minutes=\(a?.minutes ?? 0) html=\(a?.html.count ?? 0)")
+                run(rest)
+            }
+            return
         case "extpin":
             // extpin <action index> on|off — pins an extension to the sidebar or the page menu.
             let words = argument.split(separator: " ").map(String.init)

@@ -473,6 +473,13 @@ struct WebCard: View {
                     .transition(.opacity)
             }
 
+            // Reader mode: the article, over the page.
+            if let tab, let reader = tab.reader {
+                ReaderOverlay(reader: reader)
+                    .id(ObjectIdentifier(reader))
+                    .transition(.opacity)
+            }
+
             if let tab {
                 LinkPreview(tab: tab)
             }
@@ -526,6 +533,7 @@ struct WebCard: View {
         // Switching tabs mid-selection would capture the wrong page.
         .onChange(of: tab?.id) { _, _ in if focused { state.screenshotSelecting = false } }
         .animation(settings.animationsEnabled ? Motion.quick : nil, value: tab?.pdf.map(ObjectIdentifier.init))
+        .animation(settings.animationsEnabled ? Motion.quick : nil, value: tab?.reader.map(ObjectIdentifier.init))
     }
 }
 

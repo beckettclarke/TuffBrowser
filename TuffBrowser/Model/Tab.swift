@@ -33,6 +33,8 @@ final class Tab: NSObject, Identifiable {
     var headerColor: NSColor?
     /// Set while the tab shows a PDF: Tuff's own viewer (`PDFViewer`) covers the page.
     var pdf: PDFViewer?
+    /// Set while the tab is in reader mode: the article, shown over the page (see `Reader`).
+    var reader: Reader?
 
     /// The page a pinned / favourite tab was pinned on: where it returns to when it is
     /// "closed", or when its icon is clicked after browsing away (see `isAwayFromHome`).
@@ -411,6 +413,7 @@ final class Tab: NSObject, Identifiable {
         pageDialogsBlocked = false
         crashedWhileHidden = false
         closePDF()
+        closeReader(focus: false)
         guard let view = webView else { return }
         observations.removeAll()
         if observingAudio {

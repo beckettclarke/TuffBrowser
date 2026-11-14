@@ -1237,9 +1237,11 @@ final class BrowserState {
             if let prompt = self.prompt, prompt.host == .browser { return }
             if self.findVisible, let editor = window.firstResponder as? NSTextView, editor.isFieldEditor,
                (editor.delegate as? NSTextField)?.identifier?.rawValue == Self.findFieldIdentifier { return }
-            // A PDF in Tuff's viewer takes the keys (arrows, ⌘C, Page Down) rather than the
-            // placeholder page behind it.
-            if let pdf = self.selectedTab?.pdf, pdf.isReady {
+            // Reader mode's article, or a PDF in Tuff's viewer, takes the keys (arrows, ⌘C,
+            // Page Down) rather than the page behind it.
+            if let reader = self.selectedTab?.reader {
+                if reader.view.window === window { window.makeFirstResponder(reader.view) }
+            } else if let pdf = self.selectedTab?.pdf, pdf.isReady {
                 // Not in the window yet: it takes the keyboard as it arrives (`TuffPDFView`).
                 if pdf.view.window === window { window.makeFirstResponder(pdf.view) }
             } else if let view = self.selectedTab?.webView, view.window === window {

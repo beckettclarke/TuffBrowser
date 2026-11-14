@@ -105,6 +105,16 @@ struct URLPill: View {
             Spacer(minLength: 4)
             let showButtons = hovering || state.pageMenuVisible
             HStack(spacing: 2) {
+                // Stays in the bar while reader mode is on, so it's plain how to leave it.
+                if let tab, tab.reader != nil {
+                    PillButton(
+                        symbol: "doc.plaintext.fill", size: 11, side: height > 32 ? 24 : 22,
+                        help: "Exit Reader Mode  ⌥⌘R", active: true
+                    ) {
+                        tab.closeReader()
+                    }
+                    .transition(.opacity.combined(with: .scale(scale: 0.8)))
+                }
                 if showButtons, url != nil {
                     PillButton(symbol: "link", size: 11, side: height > 32 ? 24 : 22, help: "Copy Link  ⇧⌘C") {
                         state.copyCurrentURL()
@@ -141,6 +151,7 @@ struct URLPill: View {
         .animation(Motion.quick, value: url)
         .animation(Motion.quick, value: tab?.isNotSecure)
         .animation(Motion.quick, value: state.pageMenuVisible)
+        .animation(Motion.quick, value: tab?.reader != nil)
         .help("Search or enter address  ⌘L")
     }
 }

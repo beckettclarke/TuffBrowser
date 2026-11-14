@@ -2,7 +2,7 @@ import AppKit
 import SwiftUI
 
 /// The page menu that hangs off the address bar, as in Arc and Zen: quick actions for the page
-/// (screenshot, share, copy link, picture in picture), the extensions that aren't pinned to the
+/// (screenshot, share, reader mode, picture in picture), the extensions that aren't pinned to the
 /// sidebar, and the site's zoom and connection.
 struct PageMenu: View {
     @Environment(BrowserState.self) private var state
@@ -52,8 +52,14 @@ struct PageMenu: View {
                 PageMenuTile(symbol: "square.and.arrow.up", help: "Share", disabled: !hasURL) {
                     closeThen { PageMenu.share(state) }
                 }
-                PageMenuTile(symbol: "link", help: "Copy Link  ⇧⌘C", disabled: !hasURL) {
-                    closeThen { state.copyCurrentURL() }
+                let reading = tab?.reader != nil
+                PageMenuTile(
+                    symbol: reading ? "doc.plaintext.fill" : "doc.plaintext",
+                    help: reading ? "Exit Reader Mode  ⌥⌘R" : "Reader Mode  ⌥⌘R",
+                    disabled: !reading && tab?.canUseReader != true,
+                    active: reading
+                ) {
+                    closeThen { tab?.toggleReader() }
                 }
                 PageMenuTile(symbol: "slider.horizontal.3", help: "Site Settings", disabled: SiteSettings.key(for: tab?.url) == nil) {
                     withAnimation(Motion.snappy) { page = .site }
@@ -125,9 +131,12 @@ struct PageMenu: View {
 /// A square button in the menu's top row. The row shares its width between however many tiles
 /// it has, and each tile stays square at that width.
 private struct PageMenuTile: View {
+    @Environment(\.accent) private var accent
     let symbol: String
     let help: String
     var disabled = false
+    /// What it turns on is on (reader mode): lit in the accent colour.
+    var active = false
     let action: () -> Void
     @State private var hovering = false
 
@@ -139,7 +148,11 @@ private struct PageMenuTile: View {
                 .foregroundStyle(.primary.opacity(disabled ? 0.28 : 0.88))
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .aspectRatio(1, contentMode: .fit)
-                .background(shape.fill(.primary.opacity(hovering && !disabled ? 0.15 : 0.08)))
+                .background(
+                    shape.fill(active
+                        ? AnyShapeStyle(accent.opacity(hovering ? 0.34 : 0.26))
+                        : AnyShapeStyle(.primary.opacity(hovering && !disabled ? 0.15 : 0.08)))
+                )
                 .overlay(shape.strokeBorder(.primary.opacity(0.06), lineWidth: 0.5))
                 .contentShape(shape)
         }

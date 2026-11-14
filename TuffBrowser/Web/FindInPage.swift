@@ -16,7 +16,8 @@ extension Tab {
     /// Safari uses, which can say which match is current; the public `find(_:configuration:)`
     /// only says whether there was one. Falls back to that if the private call is missing.
     func find(_ query: String, forward: Bool) {
-        guard let webView else { return }
+        // In reader mode it searches the article.
+        guard let webView = reader?.view ?? webView else { return }
         guard !query.isEmpty else {
             clearFind()
             return
@@ -47,7 +48,7 @@ extension Tab {
 
     /// Takes away the match highlights (the find bar closed, or its field was emptied).
     func clearFind() {
-        guard let webView else { return }
+        guard let webView = reader?.view ?? webView else { return }
         let hide = NSSelectorFromString("_hideFindUI")
         if webView.responds(to: hide) { _ = webView.perform(hide) }
         webView.evaluateJavaScript("window.getSelection().removeAllRanges()", completionHandler: nil)

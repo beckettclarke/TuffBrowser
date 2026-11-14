@@ -144,6 +144,7 @@ enum MainMenu {
             item("Zoom In", #selector(AppDelegate.zoomIn(_:)), "="),
             item("Zoom Out", #selector(AppDelegate.zoomOut(_:)), "-"),
             sep(),
+            item("Enter Reader Mode", #selector(AppDelegate.toggleReader(_:)), "r", [.command, .option]),
             item("Enter Full Screen", #selector(NSWindow.toggleFullScreen(_:)), "f", [.command, .control], own: false),
             item("Picture in Picture", #selector(AppDelegate.togglePictureInPicture(_:)), "p", [.command, .control]),
             sep(),
