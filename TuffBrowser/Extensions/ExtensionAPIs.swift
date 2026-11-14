@@ -240,6 +240,32 @@ final class ExtensionAPIBridge {
             }
             finish(nil)
 
+        // Firefox contentScripts / userScripts (MV2) and Chrome userScripts (MV3), with inline code.
+        case ("contentScripts", "register"), ("userScripts", "registerLegacy"):
+            let id = try ExtensionContentScripts.shared.register(
+                args, extensionID: context.uniqueIdentifier,
+                resources: extensions.resourcesDirectory(forID: context.uniqueIdentifier),
+                defaultWorld: namespace == "userScripts" ? "USER_SCRIPT" : "ISOLATED")
+            finish(id)
+        case ("contentScripts", "unregister"):
+            ExtensionContentScripts.shared.unregister(handle: args["id"] as? String ?? "")
+            finish(nil)
+        case ("userScripts", "register"):
+            try ExtensionContentScripts.shared.registerUserScripts(
+                args["scripts"] as? [[String: Any]] ?? [], extensionID: context.uniqueIdentifier,
+                resources: extensions.resourcesDirectory(forID: context.uniqueIdentifier))
+            finish(nil)
+        case ("userScripts", "update"):
+            try ExtensionContentScripts.shared.updateUserScripts(
+                args["scripts"] as? [[String: Any]] ?? [], extensionID: context.uniqueIdentifier,
+                resources: extensions.resourcesDirectory(forID: context.uniqueIdentifier))
+            finish(nil)
+        case ("userScripts", "unregister"):
+            ExtensionContentScripts.shared.unregisterUserScripts(ids: args["ids"] as? [String], extensionID: context.uniqueIdentifier)
+            finish(nil)
+        case ("userScripts", "getScripts"):
+            finish(ExtensionContentScripts.shared.userScripts(ids: args["ids"] as? [String], extensionID: context.uniqueIdentifier))
+
         // Event subscriptions from the shim (see ExtensionEventPush).
         case ("__events", "subscribe"):
             if let event = args["event"] as? String {

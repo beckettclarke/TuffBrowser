@@ -16,17 +16,32 @@ final class Profile: Identifiable {
     /// Uses the browser's original website data (the profile that existed before profiles
     /// had their own cookies). Every other profile has a store of its own.
     let usesSharedStore: Bool
+    /// An Incognito profile's in-memory store, dropped with the window.
+    private let privateStore: WKWebsiteDataStore?
 
     init(id: UUID = UUID(), name: String, icon: String, usesSharedStore: Bool = false) {
         self.id = id
         self.name = name
         self.icon = icon
         self.usesSharedStore = usesSharedStore
+        self.privateStore = nil
     }
+
+    /// An Incognito profile: nothing it stores reaches the disk.
+    init(name: String, icon: String, privateStore: WKWebsiteDataStore) {
+        self.id = UUID()
+        self.name = name
+        self.icon = icon
+        self.usesSharedStore = false
+        self.privateStore = privateStore
+    }
+
+    var isPrivate: Bool { privateStore != nil }
 
     /// Where this profile's cookies, logins and site storage live.
     var dataStore: WKWebsiteDataStore {
-        usesSharedStore ? DataStores.website : DataStores.store(forProfile: id)
+        if let privateStore { return privateStore }
+        return usesSharedStore ? DataStores.website : DataStores.store(forProfile: id)
     }
 
     static let icons: [String] = [

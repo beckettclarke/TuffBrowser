@@ -48,10 +48,11 @@ final class ExtensionNotifications: NSObject {
             let notificationID = (id?.isEmpty == false ? id! : UUID().uuidString)
             self.owners[notificationID] = extensionID
             let request = UNNotificationRequest(identifier: notificationID, content: content, trigger: nil)
-            self.center.add(request) { error in
-                Task { @MainActor in
-                    if let error { fail(error) } else { finish(notificationID) }
-                }
+            do {
+                try await self.center.add(request)
+                finish(notificationID)
+            } catch {
+                fail(error)
             }
         }
     }
@@ -94,6 +95,11 @@ extension ExtensionNotifications: UNUserNotificationCenterDelegate {
         withCompletionHandler completionHandler: @escaping () -> Void
     ) {
         let id = response.notification.request.identifier
+        if WebNotifications.isWebNotification(id) {
+            MainActor.assumeIsolated { WebNotifications.shared.handle(response) }
+            completionHandler()
+            return
+        }
         if let owner = owners[id] {
             if response.actionIdentifier == UNNotificationDismissActionIdentifier {
                 ExtensionEventPush.shared.emit("notifications.onClosed", args: [id, true], to: owner)

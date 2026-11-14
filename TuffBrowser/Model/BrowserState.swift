@@ -10,6 +10,8 @@ enum CommandBarMode: Equatable {
     case newTab
     /// ⌘L — the result replaces the current tab.
     case editCurrent
+    /// ⌘\ — the result opens in a new tab beside the current one (split view).
+    case splitTab
 }
 
 /// A regular tab that was closed, kept so ⇧⌘T can bring it back where it was, history and all.
@@ -51,11 +53,19 @@ final class BrowserState {
     var sidebarPeeking = false
     var isFullscreen = false
     var commandBar: CommandBarMode?
-    var findVisible = false
+    var findVisible = false {
+        didSet { if !findVisible, findStatus != .idle { findStatus = .idle } }
+    }
+    /// What the find bar is searching for, and how that's going. Kept here (not in the bar) so
+    /// ⌘G / ⇧⌘G can step through matches from the menu.
+    var findQuery = ""
+    var findStatus: FindStatus = .idle
     var toast: Toast?
     /// The dialog card covering a window, if one is up (see `PromptPresenter`).
     var prompt: Prompt?
     var draggingTab: Tab?
+    /// The tab a dragged tab would pair with in a split if dropped now (its row is outlined).
+    var splitDropTargetID: UUID?
     /// A folder being dragged within its space's pinned section.
     var draggingFolder: Folder?
     var editingSpaceID: UUID?
@@ -64,8 +74,21 @@ final class BrowserState {
     /// The tab whose name is being edited in the sidebar.
     var renamingTabID: UUID?
     var downloadsVisible = false
+    /// The page menu (screenshot, share, unpinned extensions…) off the address bar.
+    var pageMenuVisible = false
+    /// Dragging out an area of the page to capture (see `ScreenshotOverlay`).
+    var screenshotSelecting = false
+    /// How far a full-page capture has got, 0…1, while one runs.
+    var screenshotProgress: Double?
+    /// A captured screenshot open in the editor.
+    var screenshot: ScreenshotSession?
 
-    @ObservationIgnored weak var window: NSWindow?
+    @ObservationIgnored weak var window: NSWindow? {
+        didSet { watchFirstResponder() }
+    }
+    /// Watches which view has the keyboard, so clicking into the other side of a split moves
+    /// the selection there (`firstResponderDidChange`).
+    @ObservationIgnored private var responderObservation: NSKeyValueObservation?
     @ObservationIgnored private var closedTabs: [ClosedTab] = []
     private static let closedTabLimit = 30
     @ObservationIgnored private let saver = Debouncer(delay: 1)
@@ -80,7 +103,63 @@ final class BrowserState {
     private let sessionFile = Paths.appSupport.appendingPathComponent("session.json")
     private var settings: AppSettings { .shared }
 
-    private init() {}
+    /// An Incognito window's state: nothing it does is saved, its pages use website data that
+    /// lives only in memory, and extensions don't see it.
+    let isPrivate: Bool
+
+    /// Extensions are told about the main window's tabs only.
+    private var ext: ExtensionManager? { isPrivate ? nil : ExtensionManager.shared }
+
+    /// The window tint of every Incognito window.
+    static let incognitoTintHex = "#1C1B22"
+
+    private init() { isPrivate = false }
+
+    /// A fresh Incognito state with one space and empty, in-memory website data.
+    static func makeIncognito() -> BrowserState {
+        let state = BrowserState(incognito: ())
+        incognito.append(Weak(state))
+        return state
+    }
+
+    private struct Weak { weak var state: BrowserState?; init(_ s: BrowserState) { state = s } }
+    private static var incognito: [Weak] = []
+
+    /// The main window's state and every open Incognito window's.
+    static var all: [BrowserState] {
+        incognito.removeAll { $0.state == nil }
+        return [shared] + incognito.compactMap(\.state)
+    }
+
+    /// The state of the browser window in front: an Incognito one if that is key, else the main one.
+    static var active: BrowserState {
+        let front = NSApp.keyWindow ?? NSApp.mainWindow
+        return all.first { $0.window != nil && $0.window === front } ?? shared
+    }
+
+    private init(incognito: Void) {
+        isPrivate = true
+        let profile = Profile(name: "Incognito", icon: "eyeglasses", privateStore: .nonPersistent())
+        profiles = [profile]
+        spaces = [Space(name: "Incognito", icon: "eyeglasses", colorHex: Self.incognitoTintHex, profileID: profile.id)]
+        restored = true
+    }
+
+    /// The theme as this window shows it (Incognito can be Seamless on its own).
+    var theme: Theme { settings.theme.forWindow(incognito: isPrivate) }
+
+    /// How tabs are laid out in this window: down the sidebar, or across the top.
+    var tabLayout: TabLayout { isPrivate ? settings.tabs.incognitoLayout : settings.tabs.layout }
+
+    /// Whether the downloads button is on screen (the sidebar's, or the horizontal toolbar's).
+    var downloadsButtonShowing: Bool { tabLayout == .horizontal || sidebarVisible || sidebarPeeking }
+
+    /// Closes every tab's web view, for an Incognito window that is going away.
+    func tearDownAll() {
+        allTabs.forEach { $0.tearDown() }
+        spaces.forEach { $0.tabs.removeAll(); $0.selectedTabID = nil }
+        closedTabs.removeAll()
+    }
 
     // MARK: Lookups
 
@@ -153,6 +232,13 @@ final class BrowserState {
 
     /// The tint currently showing, blended between neighbours while swiping spaces.
     var currentTint: NSColor {
+        if theme.style == .seamless, let header = selectedTab?.headerColor { return header }
+        return baseTint
+    }
+
+    /// The tint from the space colours or the theme, before Seamless puts the page's colour in.
+    var baseTint: NSColor {
+        if isPrivate { return NSColor(hex: Self.incognitoTintHex) }
         guard settings.theme.useSpaceColors, !spaces.isEmpty else { return NSColor(hex: settings.theme.tintHex) }
         let p = max(0, min(Double(spaces.count - 1), pagerPosition))
         let lower = Int(p.rounded(.down))
@@ -173,7 +259,7 @@ final class BrowserState {
     @discardableResult
     func newTab(
         url: URL?, select: Bool = true, in targetSpace: Space? = nil,
-        configuration: WKWebViewConfiguration? = nil, after opener: Tab? = nil
+        configuration: WKWebViewConfiguration? = nil, after opener: Tab? = nil, beside: Tab? = nil
     ) -> Tab {
         guard restored else {
             if let url { pendingURLs.append(url) }
@@ -184,10 +270,10 @@ final class BrowserState {
         tab.browser = self
         tab.openerTab = opener
         var index = settings.tabs.newTabPosition == .top ? 0 : space.tabs.count
-        if let opener, let i = space.tabs.firstIndex(where: { $0 === opener }) { index = i + 1 }
+        if let anchor = opener ?? beside, let i = space.tabs.firstIndex(where: { $0 === anchor }) { index = i + 1 }
         animate { space.tabs.insert(tab, at: index) }
         if configuration != nil || url != nil { tab.wake(configuration: configuration, opener: opener) }
-        ExtensionManager.shared.didOpen(tab)
+        ext?.didOpen(tab)
         if select { self.select(tab) }
         scheduleSave()
         return tab
@@ -202,24 +288,51 @@ final class BrowserState {
         previous?.lastActive = Date()
         tab.lastActive = Date()
         tab.wake()
+        // The page may have changed its header since it was last looked at.
+        tab.refreshHeaderColor()
         if space.selectedTabID != tab.id {
             animate(Motion.quick) { space.selectedTabID = tab.id }
         }
+        // The other side of a split comes on screen with it.
+        if let partner = splitPartner {
+            partner.wake()
+            partner.didBecomeVisible()
+        }
         findVisible = false
-        if previous !== tab { ExtensionManager.shared.didActivate(tab, previous: previous) }
+        if previous !== tab { ext?.didActivate(tab, previous: previous) }
         selectionDidChange(from: previous)
         updateWindowTitle()
         focusWebView()
+        tab.didBecomeVisible()
         scheduleSave()
     }
 
-    func close(_ tab: Tab) {
+    /// Closes a tab (unloads a pinned one). The page gets to ask first if it has unsaved
+    /// changes (`beforeunload`); `force` skips that, for closes nobody is watching (idle tabs,
+    /// an extension's `tabs.remove`).
+    func close(_ tab: Tab, force: Bool = false) {
+        guard section(of: tab) != nil else { return }
+        if !force, tab.webView != nil {
+            tab.requestClose { [weak self, weak tab] in
+                guard let self, let tab else { return }
+                self.closeNow(tab)
+            }
+            return
+        }
+        closeNow(tab)
+    }
+
+    private func closeNow(_ tab: Tab) {
         guard let section = section(of: tab) else { return }
         let wasSelected = selectedTab === tab
 
-        // Pick what each affected space should show next, before the lists change.
+        // Pick what each affected space should show next, before the lists change. In a split,
+        // the other side takes the whole page.
         for space in spaces where space.selectedTabID == tab.id {
-            space.selectedTabID = neighbour(of: tab, in: space)?.id
+            space.selectedTabID = space.split?.partner(of: tab.id) ?? neighbour(of: tab, in: space)?.id
+        }
+        for space in spaces where space.split?.contains(tab.id) == true {
+            animate { space.split = nil }
         }
 
         switch section {
@@ -236,7 +349,7 @@ final class BrowserState {
                 if closedTabs.count > Self.closedTabLimit { closedTabs.removeFirst(closedTabs.count - Self.closedTabLimit) }
                 ExtensionEventPush.shared.emit("sessions.onChanged", args: [])
             }
-            ExtensionManager.shared.didClose(tab)
+            ext?.didClose(tab)
             animate { spaces.forEach { $0.tabs.removeAll { $0 === tab } } }
             tab.tearDown()
         }
@@ -245,13 +358,21 @@ final class BrowserState {
             if let next = selectedTab {
                 next.wake()
                 next.lastActive = Date()
-                ExtensionManager.shared.didActivate(next, previous: nil)
+                ext?.didActivate(next, previous: nil)
+                next.didBecomeVisible()
             }
             findVisible = false
             updateWindowTitle()
             focusWebView()
         }
         scheduleSave()
+    }
+
+    /// Closes every tab in the space's tab list (not pinned tabs or favourites) except the one the
+    /// space has selected. Each can be brought back with Reopen Closed Tab.
+    func clearTabs(in space: Space) {
+        let keep = space.selectedTabID
+        space.tabs.filter { $0.id != keep }.forEach { close($0) }
     }
 
     private func neighbour(of tab: Tab, in space: Space) -> Tab? {
@@ -290,14 +411,38 @@ final class BrowserState {
         let index = min(last.index ?? (settings.tabs.newTabPosition == .top ? 0 : space.tabs.count), space.tabs.count)
         animate { space.tabs.insert(tab, at: index) }
         tab.wake()
-        ExtensionManager.shared.didOpen(tab)
+        ext?.didOpen(tab)
         select(tab)
         scheduleSave()
     }
 
+    /// Whether Reopen Closed Tab has anything to bring back.
+    var hasClosedTabs: Bool { restored && !closedTabs.isEmpty }
+
     /// Forgets recently closed tabs (with their history), e.g. when history is cleared.
     func forgetClosedTabs() {
         closedTabs.removeAll()
+        scheduleSave()
+    }
+
+    /// Opens the History page in a new tab, or goes to the tab already showing it in this space.
+    func showHistory() {
+        let space = currentSpace
+        let showing = (space.tabs + space.allPinned + favorites).first { InternalPage(url: $0.url) == .history }
+        if let showing {
+            select(showing)
+        } else {
+            newTab(url: InternalPage.history.url)
+        }
+    }
+
+    /// Takes in tabs made outside the usual paths (an import from another browser): they need
+    /// to know their window, and extensions need to hear about them.
+    func adopt(_ tabs: [Tab]) {
+        for tab in tabs {
+            tab.browser = self
+            ext?.didOpen(tab)
+        }
         scheduleSave()
     }
 
@@ -346,7 +491,7 @@ final class BrowserState {
         let atIndex = min(closed.index ?? (settings.tabs.newTabPosition == .top ? 0 : space.tabs.count), space.tabs.count)
         animate { space.tabs.insert(tab, at: atIndex) }
         tab.wake()
-        ExtensionManager.shared.didOpen(tab)
+        ext?.didOpen(tab)
         select(tab)
         scheduleSave()
         return [
@@ -432,6 +577,7 @@ final class BrowserState {
         // Moved to a profile with other cookies.
         tab.moveToDataStore(dataStore(for: tab))
 
+        pruneSplits()
         if let origin, origin !== destination, section != .favorites, wasSelectedInOrigin {
             origin.selectedTabID = origin.tabs.first?.id
             if origin === currentSpace {
@@ -442,10 +588,191 @@ final class BrowserState {
         scheduleSave()
     }
 
+    // MARK: Split view
+
+    /// The split showing in the current space: its selected tab is one side, and both sides
+    /// are still in the space.
+    var visibleSplit: SplitPair? {
+        guard !spaces.isEmpty, let split = currentSpace.split, split.contains(currentSpace.selectedTabID),
+              tab(withID: split.leading, in: currentSpace) != nil, tab(withID: split.trailing, in: currentSpace) != nil
+        else { return nil }
+        return split
+    }
+
+    /// The tab beside the selected one in a split.
+    var splitPartner: Tab? {
+        guard let split = visibleSplit, let id = split.partner(of: currentSpace.selectedTabID) else { return nil }
+        return tab(withID: id, in: currentSpace)
+    }
+
+    /// The selected tab, or the other side of its split: its page is on screen.
+    func isOnScreen(_ tab: Tab) -> Bool { tab === selectedTab || tab === splitPartner }
+
+    /// Whether a space shows this tab when it is the current one (selected, or the other side of a split).
+    private func isShowing(_ tab: Tab, in space: Space) -> Bool {
+        space.selectedTabID == tab.id || (space.split.map { $0.contains(tab.id) && $0.contains(space.selectedTabID) } ?? false)
+    }
+
+    /// Whether this tab can go beside the selected one: another tab of the current space (or its favourites).
+    func canSplit(with other: Tab) -> Bool {
+        guard !spaces.isEmpty, let current = selectedTab, current !== other, other !== splitPartner else { return false }
+        return tab(withID: other.id, in: currentSpace) != nil
+    }
+
+    /// Shows `other` beside the selected tab and gives it the keyboard. In a split already, it
+    /// takes the place of the side that doesn't have the keyboard.
+    func split(with other: Tab) {
+        guard canSplit(with: other), let current = selectedTab else { return }
+        let space = currentSpace
+        animate {
+            if var split = visibleSplit {
+                if split.leading == current.id { split.trailing = other.id } else { split.leading = other.id }
+                space.split = split
+            } else {
+                space.split = SplitPair(leading: current.id, trailing: other.id)
+            }
+        }
+        select(other)
+    }
+
+    /// Whether `dragged` can be dropped onto `target` to show the two side by side: two tabs of
+    /// the current space (or its favourites).
+    func canPair(_ dragged: Tab, with target: Tab) -> Bool {
+        guard !spaces.isEmpty, dragged !== target else { return false }
+        return tab(withID: dragged.id, in: currentSpace) != nil && tab(withID: target.id, in: currentSpace) != nil
+    }
+
+    /// A tab dropped onto another: the two side by side, the dropped one on the right with the keyboard.
+    func pair(_ dragged: Tab, with target: Tab) {
+        guard canPair(dragged, with: target) else { return }
+        let space = currentSpace
+        animate { space.split = SplitPair(leading: target.id, trailing: dragged.id) }
+        select(dragged)
+        scheduleSave()
+    }
+
+    /// Whether a tab dragged over the page can go on one side of it.
+    func canPlace(_ tab: Tab) -> Bool {
+        guard !spaces.isEmpty, selectedTab != nil, self.tab(withID: tab.id, in: currentSpace) != nil else { return false }
+        return visibleSplit != nil || tab !== selectedTab
+    }
+
+    /// A tab dropped on one side of the page: beside the page showing, or in place of that side
+    /// of a split (the two swap if it was already the other side).
+    func place(_ tab: Tab, leading: Bool) {
+        guard canPlace(tab), let current = selectedTab else { return }
+        let space = currentSpace
+        var split: SplitPair
+        if let showing = visibleSplit {
+            split = showing
+            let side = leading ? split.leading : split.trailing
+            if tab.id == side {
+                select(tab)
+                return
+            }
+            if split.contains(tab.id) {
+                swap(&split.leading, &split.trailing)
+                split.fraction = 1 - split.fraction
+            } else if leading {
+                split.leading = tab.id
+            } else {
+                split.trailing = tab.id
+            }
+        } else {
+            split = leading ? SplitPair(leading: tab.id, trailing: current.id) : SplitPair(leading: current.id, trailing: tab.id)
+        }
+        animate { space.split = split }
+        select(tab)
+        scheduleSave()
+    }
+
+    /// Takes a tab out of its space's split (it was dragged somewhere else in the list).
+    func leaveSplit(_ tab: Tab) {
+        for space in spaces where space.split?.contains(tab.id) == true {
+            animate { space.split = nil }
+        }
+        scheduleSave()
+    }
+
+    /// ⌘\: a new tab beside this one (the command bar asks where to), or back to one page.
+    func toggleSplit() {
+        if visibleSplit != nil {
+            closeSplit()
+        } else if selectedTab != nil {
+            openCommandBar(.splitTab)
+        }
+    }
+
+    /// Back to one page: the side with the keyboard stays.
+    func closeSplit() {
+        guard visibleSplit != nil else { return }
+        let space = currentSpace
+        let partner = splitPartner
+        animate { space.split = nil }
+        partner?.lastActive = Date()
+        focusWebView()
+        scheduleSave()
+    }
+
+    func swapSplitSides() {
+        guard var split = visibleSplit else { return }
+        swap(&split.leading, &split.trailing)
+        split.fraction = 1 - split.fraction
+        let space = currentSpace
+        animate { space.split = split }
+        scheduleSave()
+    }
+
+    /// Gives the keyboard to the other side of the split.
+    func focusOtherSplitSide() {
+        if let partner = splitPartner { select(partner) }
+    }
+
+    /// Sets the leading side's share of the width (dragging the divider). Saved by the caller
+    /// when the drag ends.
+    func setSplitFraction(_ fraction: Double) {
+        guard var split = visibleSplit else { return }
+        split.fraction = min(max(fraction, SplitPair.fractionRange.lowerBound), SplitPair.fractionRange.upperBound)
+        currentSpace.split = split
+    }
+
+    /// A click in a page. In a split, the side clicked becomes the selected tab, so the toolbar,
+    /// find and menus act on it. (Taking the keyboard is caught too, by `firstResponderDidChange`,
+    /// but a click doesn't always move it: a window that isn't key keeps its first responder.)
+    func pageWasClicked(_ tab: Tab) {
+        if tab === splitPartner { select(tab) }
+    }
+
+    private func watchFirstResponder() {
+        responderObservation = window?.observe(\.firstResponder, options: [.new]) { [weak self] _, _ in
+            DispatchQueue.main.async { self?.firstResponderDidChange() }
+        }
+    }
+
+    /// The other side of the split took the keyboard (it was clicked, or tabbed into): it
+    /// becomes the selected tab, so the toolbar, find and menus act on it.
+    private func firstResponderDidChange() {
+        guard let partner = splitPartner, let responder = window?.firstResponder as? NSView else { return }
+        let views = [partner.webView, partner.pdf?.isReady == true ? partner.pdf?.view : nil].compactMap { $0 }
+        if views.contains(where: { responder === $0 || responder.isDescendant(of: $0) }) {
+            select(partner)
+        }
+    }
+
+    /// Forgets splits whose tabs have left their space (moved, or gone with a profile).
+    private func pruneSplits() {
+        for space in spaces {
+            guard let split = space.split else { continue }
+            if tab(withID: split.leading, in: space) == nil || tab(withID: split.trailing, in: space) == nil {
+                space.split = nil
+            }
+        }
+    }
+
     // MARK: Navigation
 
     func openCommandBar(_ mode: CommandBarMode) {
-        let resolved: CommandBarMode = (mode == .editCurrent && selectedTab == nil) ? .newTab : mode
+        let resolved: CommandBarMode = (mode != .newTab && selectedTab == nil) ? .newTab : mode
         let wasOpen = commandBar != nil
         animate(Motion.snappy) { commandBar = resolved }
         // Take the keyboard from the page right away, so nothing typed before the bar's field
@@ -471,28 +798,53 @@ final class BrowserState {
         if mode == .editCurrent, let tab = selectedTab {
             tab.load(url)
             focusWebView()
+        } else if mode == .splitTab, let current = selectedTab {
+            split(with: newTab(url: url, select: false, in: currentSpace, beside: current))
         } else {
             newTab(url: url)
         }
     }
 
     /// Turns whatever was typed into a URL: a real URL, a bare domain, or a search.
+    /// Endings of file names that aren't top-level domains, so typing "readme.html" searches
+    /// rather than trying to open https://readme.html. Real TLDs that are also file endings
+    /// (.md, .py, .zip, .mov, .sh, .rs, .ai…) are left out: those stay addresses, as in Chrome.
+    private static let fileExtensions: Set<String> = [
+        "html", "htm", "js", "mjs", "cjs", "jsx", "ts", "tsx", "json", "txt", "pdf", "png", "jpg",
+        "jpeg", "gif", "webp", "svg", "heic", "css", "scss", "csv", "tsv", "xml", "yml", "yaml",
+        "toml", "ini", "cfg", "conf", "log", "swift", "java", "kt", "cpp", "hpp", "mp3", "mp4",
+        "wav", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "dmg", "pkg", "exe", "tar", "gz", "rar",
+        "plist", "sql", "lock", "bak", "tmp", "ipynb", "psd",
+    ]
+
     static func resolve(_ input: String, engine: SearchEngine) -> URL {
         let text = input.trimmed
+        if let bang = BangStore.resolve(text) { return bang }
         let lower = text.lowercased()
         if !text.contains(" ") {
             if lower.contains("://") || lower.hasPrefix("about:") || lower.hasPrefix("data:") || lower.hasPrefix("file:"),
                let url = URL(string: text), url.scheme != nil {
                 return url
             }
+            // An IPv6 address in brackets, as in a URL: [::1]:8080, [2001:db8::1]/path.
+            if lower.hasPrefix("["), let close = lower.firstIndex(of: "]") {
+                let address = lower[lower.index(after: lower.startIndex)..<close]
+                if address.contains(":"), address.allSatisfy({ $0.isHexDigit || $0 == ":" || $0 == "." || $0 == "%" }),
+                   let url = URL(string: "http://" + text), url.host != nil {
+                    return url
+                }
+            }
             let hostPart = lower.split(separator: "/").first.map(String.init) ?? lower
             let bareHost = hostPart.split(separator: ":").first.map(String.init) ?? hostPart
             let isLocal = bareHost == "localhost" || bareHost.hasSuffix(".local") || bareHost.hasSuffix(".localhost")
-            let isIP = bareHost.split(separator: ".").count == 4 && bareHost.split(separator: ".").allSatisfy { Int($0) != nil }
+            let octets = bareHost.split(separator: ".", omittingEmptySubsequences: false)
+            let isIP = octets.count == 4 && octets.allSatisfy { Int($0).map { (0...255).contains($0) } ?? false }
             let hasPort = hostPart.contains(":") && Int(hostPart.split(separator: ":").last ?? "") != nil
             let looksLikeDomain = bareHost.contains(".") && !bareHost.hasSuffix(".") && !bareHost.hasPrefix(".")
                 && (bareHost.split(separator: ".").last?.count ?? 0) >= 2
                 && bareHost.allSatisfy { $0.isLetter || $0.isNumber || $0 == "." || $0 == "-" }
+                // "index.html", "node.js", "notes.txt": a file name, not a site.
+                && !Self.fileExtensions.contains(bareHost.split(separator: ".").last.map(String.init) ?? "")
             if isLocal || isIP || (hasPort && !bareHost.isEmpty && bareHost.allSatisfy { $0.isLetter || $0.isNumber || $0 == "." || $0 == "-" }) {
                 if let url = URL(string: "http://" + text) { return url }
             } else if looksLikeDomain, let url = URL(string: "https://" + text) {
@@ -531,11 +883,16 @@ final class BrowserState {
     }
 
     private func spaceDidChange(previous: Tab?) {
-        ExtensionManager.shared.spaceDidChange()
+        ext?.spaceDidChange()
         if let tab = selectedTab {
             tab.wake()
             tab.lastActive = Date()
-            if previous !== tab { ExtensionManager.shared.didActivate(tab, previous: previous) }
+            if previous !== tab { ext?.didActivate(tab, previous: previous) }
+            tab.didBecomeVisible()
+        }
+        if let partner = splitPartner {
+            partner.wake()
+            partner.didBecomeVisible()
         }
         selectionDidChange(from: previous)
         findVisible = false
@@ -586,7 +943,7 @@ final class BrowserState {
     func confirmDelete(_ space: Space, from host: Prompt.Host = .browser) {
         guard spaces.count > 1 else { return }
         let tabCount = space.allPinned.count + space.tabs.count
-        let prompt = Prompt(
+        var prompt = Prompt(
             host: host,
             symbol: space.icon,
             symbolColor: space.color,
@@ -596,6 +953,7 @@ final class BrowserState {
             confirmTitle: "Delete Space",
             destructive: true
         )
+        if host == .browser { prompt.browser = self }
         Task { @MainActor in
             guard await PromptPresenter.present(prompt), spaces.contains(where: { $0 === space }) else { return }
             delete(space)
@@ -606,7 +964,7 @@ final class BrowserState {
         guard spaces.count > 1, let index = spaces.firstIndex(where: { $0 === space }) else { return }
         let previous = selectedTab
         for tab in space.allPinned + space.tabs {
-            ExtensionManager.shared.didClose(tab)
+            ext?.didClose(tab)
             tab.tearDown()
         }
         let newIndex = currentSpaceIndex > index || currentSpaceIndex == spaces.count - 1
@@ -616,7 +974,7 @@ final class BrowserState {
             currentSpaceIndex = min(newIndex, spaces.count - 1)
             pagerPosition = Double(currentSpaceIndex)
         }
-        ExtensionManager.shared.forgetLinks(to: space.id)
+        ext?.forgetLinks(to: space.id)
         spaceDidChange(previous: previous)
     }
 
@@ -693,13 +1051,35 @@ final class BrowserState {
         scheduleSave()
     }
 
+    /// Moves a folder, with its tabs, to the end of another space's pinned section. Its tabs
+    /// switch to that space's profile's cookies if it has a different one.
+    func move(_ folder: Folder, toSpace destination: Space) {
+        guard let origin = space(containing: folder), origin !== destination,
+              let index = origin.pinnedIndex(of: folder.id) else { return }
+        let wasShowing = folder.tabs.contains { $0.id == origin.selectedTabID }
+        animate {
+            let item = origin.pinnedItems.remove(at: index)
+            destination.pinnedItems.append(item)
+        }
+        folder.tabs.forEach { $0.moveToDataStore(dataStore(for: $0)) }
+        if wasShowing {
+            origin.selectedTabID = (origin.tabs.first ?? origin.allPinned.first)?.id
+            if origin === currentSpace {
+                selectedTab?.wake()
+                updateWindowTitle()
+            }
+        }
+        if renamingFolderID == folder.id { renamingFolderID = nil }
+        scheduleSave()
+    }
+
     // MARK: Profiles
 
     @discardableResult
     func addProfile(name: String = "New Profile") -> Profile {
         let used = Set(profiles.map(\.icon))
         let icon = Profile.icons.first { !used.contains($0) } ?? "person.fill"
-        let profile = Profile(name: name, icon: icon)
+        let profile = isPrivate ? Profile(name: name, icon: icon, privateStore: .nonPersistent()) : Profile(name: name, icon: icon)
         animate { profiles.append(profile) }
         scheduleSave()
         return profile
@@ -731,7 +1111,7 @@ final class BrowserState {
         for space in spaces(in: profile) { space.profileID = fallback.id }
         for tab in profile.favorites {
             for space in spaces where space.selectedTabID == tab.id { space.selectedTabID = space.tabs.first?.id }
-            ExtensionManager.shared.didClose(tab)
+            ext?.didClose(tab)
             tab.tearDown()
         }
         // Its spaces' open pages move to the other profile's cookies.
@@ -739,8 +1119,8 @@ final class BrowserState {
             for tab in space.allPinned + space.tabs { tab.moveToDataStore(fallback.dataStore) }
         }
         animate { profiles.removeAll { $0 === profile } }
-        if !profile.usesSharedStore { DataStores.removeStore(forProfile: profile.id) }
-        ExtensionManager.shared.profileDeleted(profile.id)
+        if !profile.usesSharedStore, !profile.isPrivate { DataStores.removeStore(forProfile: profile.id) }
+        ext?.profileDeleted(profile.id)
         spaceDidChange(previous: previous)
     }
 
@@ -781,6 +1161,7 @@ final class BrowserState {
     // MARK: Chrome
 
     func toggleSidebar() {
+        guard tabLayout == .vertical else { return }
         animate(Motion.sidebar) {
             sidebarVisible.toggle()
             sidebarPeeking = false
@@ -789,10 +1170,49 @@ final class BrowserState {
 
     func setPeeking(_ peeking: Bool) {
         guard sidebarPeeking != peeking, !sidebarVisible || !peeking else { return }
+        guard tabLayout == .vertical || !peeking else { return }
         animate(Motion.snappy) { sidebarPeeking = peeking }
     }
 
     static let findFieldIdentifier = "find-field"
+
+    /// Moves to the next (or previous) match of `findQuery` in the page or PDF on show.
+    func find(forward: Bool) {
+        guard let tab = selectedTab else { return }
+        if let pdf = tab.pdf, pdf.isReady {
+            pdf.nextMatch(forward: forward)
+            return
+        }
+        if findQuery.isEmpty {
+            findStatus = .idle
+            tab.clearFind()
+        } else {
+            tab.find(findQuery, forward: forward)
+        }
+    }
+
+    /// ⌘G / ⇧⌘G: steps through matches, opening the find bar if it is closed.
+    func findAgain(forward: Bool) {
+        if !findVisible {
+            findVisible = true
+            if !findQuery.isEmpty { DispatchQueue.main.async { [weak self] in self?.find(forward: forward) } }
+            return
+        }
+        find(forward: forward)
+    }
+
+    /// A tab's find results; ignored unless they are for the tab on show and the current search.
+    func findDidReport(_ status: FindStatus, for query: String, in tab: Tab?) {
+        guard let tab, tab === selectedTab, query == findQuery else { return }
+        animate(Motion.quick) { findStatus = status }
+    }
+
+    /// Closes the find bar, taking the page's match highlights with it.
+    func closeFind() {
+        selectedTab?.clearFind()
+        findVisible = false
+        focusWebView()
+    }
 
     /// Puts the keyboard in the open find bar's field and selects what it holds.
     func focusFindField() {
@@ -817,7 +1237,12 @@ final class BrowserState {
             if let prompt = self.prompt, prompt.host == .browser { return }
             if self.findVisible, let editor = window.firstResponder as? NSTextView, editor.isFieldEditor,
                (editor.delegate as? NSTextField)?.identifier?.rawValue == Self.findFieldIdentifier { return }
-            if let view = self.selectedTab?.webView, view.window === window {
+            // A PDF in Tuff's viewer takes the keys (arrows, ⌘C, Page Down) rather than the
+            // placeholder page behind it.
+            if let pdf = self.selectedTab?.pdf, pdf.isReady {
+                // Not in the window yet: it takes the keyboard as it arrives (`TuffPDFView`).
+                if pdf.view.window === window { window.makeFirstResponder(pdf.view) }
+            } else if let view = self.selectedTab?.webView, view.window === window {
                 window.makeFirstResponder(view)
             }
         }
@@ -828,7 +1253,7 @@ final class BrowserState {
     }
 
     func tabDidChange(_ tab: Tab, properties: WKWebExtension.TabChangedProperties) {
-        ExtensionManager.shared.didChange(tab, properties: properties)
+        ext?.didChange(tab, properties: properties)
         if tab === selectedTab, properties.contains(.title) { updateWindowTitle() }
         if properties.contains(.title) || properties.contains(.URL) { scheduleSave() }
     }
@@ -875,7 +1300,8 @@ final class BrowserState {
         let to = selectedTab
         guard from !== to else { return }
         to?.leaveAutomaticPictureInPicture()
-        guard settings.tabs.autoPictureInPicture, let from else { return }
+        // The tab left behind may still be on screen, as the other side of a split.
+        guard settings.tabs.autoPictureInPicture, let from, !isOnScreen(from) else { return }
         enterPictureInPictureWhenHidden(from, attempts: 12)
     }
 
@@ -884,7 +1310,7 @@ final class BrowserState {
     /// page see-through.
     private func enterPictureInPictureWhenHidden(_ tab: Tab, attempts: Int) {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self, weak tab] in
-            guard let self, let tab, tab !== self.selectedTab, let view = tab.webView,
+            guard let self, let tab, !self.isOnScreen(tab), let view = tab.webView,
                   self.allTabs.contains(where: { $0 === tab }) else { return }
             if view.window == nil {
                 tab.enterPictureInPictureAutomatically()
@@ -911,10 +1337,9 @@ final class BrowserState {
         let minutes = settings.general.sleepAfterMinutes
         guard minutes > 0 else { return }
         let cutoff = Date().addingTimeInterval(-Double(minutes) * 60)
-        let visible = selectedTab
-        for tab in allTabs where tab.isAwake && tab !== visible {
+        for tab in allTabs where tab.isAwake && !isOnScreen(tab) {
             if tab.isPlayingAudio || tab.isLoading || tab.isInPictureInPicture { continue }
-            if spaces.contains(where: { $0.selectedTabID == tab.id }) && tab.lastActive > cutoff { continue }
+            if spaces.contains(where: { isShowing(tab, in: $0) }) && tab.lastActive > cutoff { continue }
             if tab.lastActive < cutoff { tab.sleep() }
         }
     }
@@ -923,12 +1348,11 @@ final class BrowserState {
         let hours = settings.tabs.closeIdleAfterHours
         guard hours > 0 else { return }
         let cutoff = Date().addingTimeInterval(-Double(hours) * 3600)
-        let visible = selectedTab
         let stale = spaces.flatMap(\.tabs).filter { tab in
-            tab !== visible && tab.lastActive < cutoff && !tab.isPlayingAudio && !tab.isInPictureInPicture
+            !isOnScreen(tab) && !spaces.contains(where: { $0.split?.contains(tab.id) == true }) && tab.lastActive < cutoff && !tab.isPlayingAudio && !tab.isInPictureInPicture
                 && !tab.isLoading && tab.permissionRequest == nil
         }
-        stale.forEach { close($0) }
+        stale.forEach { close($0, force: true) }
     }
 
     // MARK: Persistence
@@ -973,6 +1397,8 @@ final class BrowserState {
         var pinnedItems: [PinnedItemSnapshot]?
         var tabs: [TabSnapshot]
         var selected: UUID?
+        /// Two tabs side by side; missing in older sessions.
+        var split: SplitPair?
     }
 
     private struct ProfileSnapshot: Codable {
@@ -996,12 +1422,12 @@ final class BrowserState {
     }
 
     func scheduleSave() {
-        guard restored else { return }
+        guard restored, !isPrivate else { return }
         saver.schedule { [weak self] in self?.saveNow() }
     }
 
     func saveNow() {
-        guard restored else { return }
+        guard restored, !isPrivate else { return }
         // With "Clear history when Tuff quits" on, tabs' history and closed tabs stay off disk.
         let keepHistory = !settings.privacy.clearHistoryOnQuit
         func snap(_ t: Tab) -> TabSnapshot {
@@ -1022,7 +1448,12 @@ final class BrowserState {
                         case .folder(let f): PinnedItemSnapshot(folder: FolderSnapshot(id: f.id, name: f.name, open: f.isOpen, tabs: f.tabs.map(snap)))
                         }
                     },
-                    tabs: s.tabs.filter { $0.url != nil }.map(snap), selected: s.selectedTabID
+                    tabs: s.tabs.filter { $0.url != nil }.map(snap), selected: s.selectedTabID,
+                    split: s.split.flatMap { split in
+                        // Both sides must be tabs that are saved (a blank new tab isn't).
+                        let saved = Set((s.tabs.filter { $0.url != nil } + s.allPinned + favorites(in: s)).map(\.id))
+                        return saved.contains(split.leading) && saved.contains(split.trailing) ? split : nil
+                    }
                 )
             },
             profiles: profiles.map {
@@ -1038,9 +1469,18 @@ final class BrowserState {
     }
 
     func restore() {
-        guard !restored else { return }
+        guard !restored, !isPrivate else { return }
+        // With "Restore session" off, only the open tabs go: spaces, folders, pinned tabs,
+        // favourites and profiles (and their cookies) are part of the browser's setup, not the
+        // session. Pinned tabs and favourites start again on the page they were pinned on.
+        let keepOpenTabs = settings.general.restoreSession
         func make(_ s: TabSnapshot) -> Tab {
-            let tab = Tab(id: s.id, url: s.url, title: s.title, homeURL: s.homeURL, sessionState: s.history)
+            let reset = !keepOpenTabs && s.homeURL != nil
+            let url = reset ? s.homeURL : s.url
+            let tab = Tab(
+                id: s.id, url: url, title: reset && url != s.url ? "" : s.title, homeURL: s.homeURL,
+                sessionState: reset ? nil : s.history
+            )
             if let date = s.lastActive { tab.lastActive = date }
             tab.customTitle = s.customTitle
             tab.homeLandingURL = s.homeLanding
@@ -1054,7 +1494,7 @@ final class BrowserState {
             closedTabs = Array((saved?.closedTabs ?? []).suffix(Self.closedTabLimit))
         }
 
-        if settings.general.restoreSession, let snapshot = saved, !snapshot.spaces.isEmpty {
+        if let snapshot = saved, !snapshot.spaces.isEmpty {
             if let saved = snapshot.profiles, !saved.isEmpty {
                 // Before profiles had their own cookies they all used the shared store; the first
                 // keeps it (so you stay signed in), the rest start fresh.
@@ -1084,11 +1524,13 @@ final class BrowserState {
                 } else {
                     space.pinnedItems = s.pinned.map { .tab(make($0)) }
                 }
-                space.tabs = s.tabs.map(make)
+                space.tabs = keepOpenTabs ? s.tabs.map(make) : []
                 space.selectedTabID = s.selected
                 if let id = s.selected, tab(withID: id, in: space) == nil { space.selectedTabID = nil }
+                space.split = s.split
                 return space
             }
+            pruneSplits()
             currentSpaceIndex = max(0, min(snapshot.currentSpace, spaces.count - 1))
             sidebarVisible = snapshot.sidebarVisible
         } else {
@@ -1096,20 +1538,19 @@ final class BrowserState {
             profiles = [profile]
             spaces = [
                 Space(name: "Home", icon: "bookmark.fill", colorHex: Space.palette[0], profileID: profile.id),
-                Space(name: "Lab", icon: "flask.fill", colorHex: Space.palette[2], profileID: profile.id),
-                Space(name: "Reading", icon: "book.fill", colorHex: Space.palette[1], profileID: profile.id),
             ]
             currentSpaceIndex = 0
         }
         pagerPosition = Double(currentSpaceIndex)
         restored = true
 
-        allTabs.forEach { ExtensionManager.shared.didOpen($0) }
+        allTabs.forEach { ext?.didOpen($0) }
         selectedTab?.lastActive = Date()
         selectedTab?.wake()
+        splitPartner?.wake()
         pendingURLs.forEach { newTab(url: $0) }
         pendingURLs.removeAll()
         startSleepTimer()
-        ExtensionManager.shared.applyLinks()
+        ext?.applyLinks()
     }
 }

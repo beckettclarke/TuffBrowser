@@ -40,13 +40,14 @@ and open it in Xcode if you prefer.
 | Spaces | Two-finger horizontal swipe over the sidebar (tracks your fingers, tint blends between spaces), `⌥⌘←/→`, `⌃1…9`; each space has a name, icon and colour |
 | Profiles | Every space belongs to a profile (e.g. Home, School). Spaces on the same profile share cookies, sign-ins and site data, and the favourites grid; each profile has its own website data store, so Home and School can be signed in to different accounts. The first profile keeps the browser's original data. Moving a space or tab to another profile reloads its pages with that profile's cookies; deleting a profile deletes its data. Pick a space's profile in its editor (click the space name) or Settings → Spaces |
 | Command bar | `⌘T` (new tab) / `⌘L` (current tab): search suggestions, history, switch-to-tab |
+| Split view | `⌘\` opens a page beside the current one (type an address, or pick an open tab), right-click a tab → **Open in Split View**, drag a tab onto the middle of another tab's row, or drag it onto the left or right half of the page (VS Code style; over a split, it takes that side's place). The pair shares one sidebar row, two halves as in Arc; dragging a half elsewhere in the list takes it out. Each space keeps its pair: picking either tab shows both again, any other tab shows on its own. Click a side (or `⌥⌘\`) to give it the keyboard; it gets an outline, and the toolbar, find and menus act on it. Drag the divider to resize (double-click evens it up); View → Swap Split Sides; `⌘\` again, or closing either tab, goes back to one page. Saved with the session |
 | Appearance | Settings → Appearance: glass / vibrancy / solid, transparency, blur radius, grain, sheen, tint or per-space colours, page corner radius and gap, presets |
 | Extensions | Install from the Chrome Web Store or Firefox Add-ons (the store's own "Add to Chrome" / "Add to Firefox" button reads "Add to Tuff", or "Remove from Tuff" once installed), by link / ID, or load unpacked. Toolbar popups, badges, context-menu items, shortcuts, options pages, native messaging, side panels |
 | Extension linking | Extensions run in every space by default. **Use In** (Settings → Extensions, or right-click an extension's button) limits one to some profiles and/or spaces: it is loaded while one of those spaces is showing and unloaded otherwise, keeping its storage |
 | Side panels | Chrome `side_panel` / `chrome.sidePanel` and Firefox `sidebar_action` / `browser.sidebarAction` extensions open in a resizable panel to the right of the page: from the extension's button (or its right-click menu), or `⌥⌘S` for the last one used |
 | Media / DRM | Presents as Safari and uses WebKit's FairPlay, which is what Netflix, Spotify, Disney+ etc. use for Safari. (Widevine does not exist on WebKit.) |
 | Picture in picture | Sites' own PiP buttons and the video context menu work; `⌃⌘P` (or the tab's right-click menu) pops the page's video out or back in. A video playing with sound goes into PiP when you switch away from its tab and comes back when you return (Settings → Tabs → Video). Tabs in PiP are never unloaded |
-| Browser basics | Downloads, find in page, zoom, print, full-screen video, camera / mic prompts, HTTP auth, Web Inspector (`⌥⌘I`), session restore, default-browser registration |
+| Browser basics | Downloads, find in page, zoom, print, full-screen video, camera / mic / location prompts, website notifications (no push), HTTP auth, Web Inspector (`⌥⌘I`), session restore, default-browser registration |
 | Updates | Sparkle 2 — see below |
 
 ## Extension compatibility
@@ -60,8 +61,7 @@ worker or page, its HTML pages and its content scripts. It:
 - binds every API function to its namespace. WebKit returns `undefined` from a detached call
   such as `const getURL = browser.runtime.getURL; getURL('x')`; Chrome and Firefox do not, and
   many extensions rely on that;
-- fills *missing* Chrome- and Firefox-only namespaces and events (`chrome.notifications`,
-  `chrome.identity`, `storage.managed`, `browser.contentScripts`,
+- fills *missing* Chrome- and Firefox-only namespaces and events (`storage.managed`,
   `webNavigation.onCreatedNavigationTarget`, …) with inert stubs, so an extension that merely
   references them at startup still loads. Features that genuinely depend on those APIs will
   not work;
@@ -85,10 +85,23 @@ websites open as tabs).
 from a copy (`~/Library/Application Support/TuffBrowser/Unpacked/<id>`) that is synced from the
 folder, `.git` aside, each time the extension loads — at launch, when enabled, and on Reload.
 
-**Request blocking.** WebKit lets extensions watch network requests but not block or rewrite
-them from script (`webRequestBlocking`). Extensions built on that — uBlock Origin and most
-Firefox content blockers — install and open, but filter nothing; Tuff says so in the install
-prompt. Use the Manifest V3 edition instead: uBlock Origin Lite blocks properly.
+**Scripts registered at run time.** Firefox's `browser.contentScripts.register` and
+`userScripts.register`, and Chrome's MV3 `chrome.userScripts`, take inline code, which WebKit's
+own API can't. Tuff adds that code to every tab as a user script limited to the requested URLs,
+in the page's world or one of its own per extension (`Extensions/ExtensionContentScripts.swift`).
+Scripts in that separate world can reach the page's DOM but not the extension APIs, so
+`userScripts.configureWorld` messaging (used by Tampermonkey's `GM_*` calls) isn't there yet.
+Scripts they insert into the page run even under the page's Content Security Policy, as in Firefox.
+
+**Request blocking.** WebKit tells extensions about a request only after it has been sent, so
+blockers built on `webRequestBlocking` (full uBlock Origin, most Firefox blockers) can't stop
+anything; Tuff says so in the install prompt. Tuff blocks ads itself instead
+(`Web/ContentBlocker.swift`, Settings › Privacy): it downloads EasyList, EasyPrivacy, the uBlock
+filter lists and Peter Lowe's list, translates them into WebKit content rule lists
+(`Web/FilterListParser.swift`), compiles them (cached; refreshed every few days) and adds them to
+every tab, Incognito included. The page menu turns it off for one site. Filters that rewrite
+rather than block (`redirect=`, `removeparam`, `csp=`) and procedural cosmetic filters are
+skipped. YouTube's ads need uBO's scriptlets, which still work through the extension (see above).
 
 **Extension pages and websites.** WebKit only lets an extension's own pages load in a web view
 made for that extension. When such a page sends the tab to a website (the "Sign in" button on
@@ -152,5 +165,5 @@ TuffBrowser/
 - One browser window.
 - The adjustable blur uses the window server's per-window blur radius (the same call
   terminals use); if it is ever unavailable, pick the Vibrancy style.
-- No private browsing, bookmarks manager, or built-in content blocker yet (uBlock Origin Lite
+- No bookmarks manager or built-in content blocker yet (uBlock Origin Lite
   works as an extension; the full uBlock Origin cannot block on WebKit).

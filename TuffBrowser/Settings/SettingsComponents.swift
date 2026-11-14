@@ -5,11 +5,18 @@ import SwiftUI
 
 // MARK: - Page and groups
 
-/// A scrolling settings page with a large title.
+/// A scrolling settings page with a large title. When search picks a setting on this page, the
+/// page scrolls it into view (the setting lights itself up; see `settingsAnchor`).
 struct SettingsPage<Content: View>: View {
     let title: String
     var subtitle: String?
     @ViewBuilder var content: Content
+
+    @State private var position = ScrollPosition()
+    /// Content and visible heights, to keep a scroll to a setting inside the page.
+    @State private var heights: [CGFloat] = [0, 0]
+    /// The search pick last scrolled to, so it happens once per pick.
+    @State private var revealed: UUID?
 
     var body: some View {
         ScrollView {
@@ -31,8 +38,22 @@ struct SettingsPage<Content: View>: View {
             .padding(.bottom, 32)
             .frame(maxWidth: 620, alignment: .leading)
             .frame(maxWidth: .infinity)
+            .coordinateSpace(.named(SettingsTargetFrame.space))
         }
         .scrollIndicators(.automatic)
+        .scrollPosition($position)
+        .onScrollGeometryChange(for: [CGFloat].self, of: { [$0.contentSize.height, $0.containerSize.height] }) { _, new in
+            heights = new
+        }
+        .onPreferenceChange(SettingsTargetFrameKey.self) { frame in
+            guard let frame, frame.token != revealed else { return }
+            revealed = frame.token
+            // Put the setting a little below the top, where the eye lands, without scrolling
+            // past the end of the page.
+            let limit = heights[0] > 0 ? max(0, heights[0] - heights[1]) : .infinity
+            let y = min(limit, max(0, frame.y - 90))
+            withAnimation(Motion.smooth) { position.scrollTo(y: y) }
+        }
     }
 }
 
@@ -65,6 +86,7 @@ struct SettingsGroup<Content: View>: View {
             }
             .background(RoundedRectangle(cornerRadius: 13, style: .continuous).fill(.primary.opacity(0.055)))
             .overlay(RoundedRectangle(cornerRadius: 13, style: .continuous).strokeBorder(.primary.opacity(0.07), lineWidth: 0.5))
+            .settingsAnchor("group:" + (title ?? ""), radius: 13, inset: 0)
             if let footer {
                 Text(footer)
                     .font(.system(size: 11.5))
@@ -108,6 +130,7 @@ struct SettingsRow<Trailing: View>: View {
         .padding(.horizontal, 14)
         .padding(.vertical, 9)
         .frame(minHeight: 44)
+        .settingsAnchor(title)
     }
 }
 

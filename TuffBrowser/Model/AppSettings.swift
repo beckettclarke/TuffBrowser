@@ -3,15 +3,37 @@ import Observation
 import SwiftUI
 
 enum BackgroundStyle: String, Codable, CaseIterable, Identifiable {
-    case glass, vibrancy, solid
+    case glass, vibrancy, solid, seamless
     var id: String { rawValue }
     var label: String {
         switch self {
         case .glass: "Glass"
         case .vibrancy: "Vibrancy"
         case .solid: "Solid"
+        case .seamless: "Seamless"
         }
     }
+
+    /// What the style does, in a sentence (Settings shows it under the choices).
+    var summary: String {
+        switch self {
+        case .glass: "See-through: the desktop shows blurred behind the tint."
+        case .vibrancy: "The system’s frosted material, lightly tinted."
+        case .solid: "A flat, opaque colour. Nothing shows through."
+        case .seamless: "The window takes on the colour of the page’s header, so the tabs and the page run together, as in Safari."
+        }
+    }
+
+    /// The window is filled with one flat colour (no blur shows through).
+    var isOpaqueFill: Bool { self == .solid || self == .seamless }
+}
+
+/// Where a window's tabs go.
+enum TabLayout: String, Codable, CaseIterable, Identifiable {
+    case vertical, horizontal
+    var id: String { rawValue }
+    var label: String { self == .vertical ? "Vertical" : "Horizontal" }
+    var symbol: String { self == .vertical ? "sidebar.left" : "rectangle.topthird.inset.filled" }
 }
 
 enum AppearanceMode: String, Codable, CaseIterable, Identifiable {
@@ -147,6 +169,10 @@ struct BehaviorSettings: Codable, Equatable {
 }
 
 struct TabSettings: Codable, Equatable {
+    /// Tabs down a sidebar (Arc-style) or across the top of the window, for regular windows.
+    var layout: TabLayout = .vertical
+    /// The same choice for Incognito windows.
+    var incognitoLayout: TabLayout = .vertical
     var newTabPosition: NewTabPosition = .top
     var afterClose: AfterCloseSelection = .below
     /// ⌘-click opens links in the foreground (⇧ flips it either way).
@@ -165,14 +191,48 @@ struct SearchSettings: Codable, Equatable {
     var openTabSuggestions = true
 }
 
+/// Optional extras ("mods") that change how Tuff behaves. Settings → Mods.
+struct ModSettings: Codable, Equatable {
+    /// DuckDuckGo-style `!bangs` in the command bar: `!yt cats` searches YouTube.
+    var bangs = true
+}
+
 struct PrivacySettings: Codable, Equatable {
     var saveHistory = true
     var clearHistoryOnQuit = false
     var javaScript = true
+    /// Pages can open new tabs / windows only in response to a click or key press.
+    var blockPopups = true
+    /// WebKit's cross-site tracking prevention: third-party cookies are blocked unless a site
+    /// asks for them and you allow it (`SiteSettings`, Storage Access).
+    var blockCrossSiteCookies = true
     var upgradeToHTTPS = true
     var fraudWarnings = true
     var autoplay: AutoplayPolicy = .allow
     var rememberMediaPermissions = true
+    /// Tuff's built-in ad and tracker blocker (`ContentBlocker`).
+    var blockAds = true
+    /// Sites (and their subdomains) the blocker leaves alone.
+    var adBlockAllowlist: [String] = []
+}
+
+extension PrivacySettings {
+    // Settings saved before a field existed still load, with that field at its default.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let d = PrivacySettings()
+        saveHistory = try c.decodeIfPresent(Bool.self, forKey: .saveHistory) ?? d.saveHistory
+        clearHistoryOnQuit = try c.decodeIfPresent(Bool.self, forKey: .clearHistoryOnQuit) ?? d.clearHistoryOnQuit
+        javaScript = try c.decodeIfPresent(Bool.self, forKey: .javaScript) ?? d.javaScript
+        blockPopups = try c.decodeIfPresent(Bool.self, forKey: .blockPopups) ?? d.blockPopups
+        blockCrossSiteCookies = try c.decodeIfPresent(Bool.self, forKey: .blockCrossSiteCookies) ?? d.blockCrossSiteCookies
+        upgradeToHTTPS = try c.decodeIfPresent(Bool.self, forKey: .upgradeToHTTPS) ?? d.upgradeToHTTPS
+        fraudWarnings = try c.decodeIfPresent(Bool.self, forKey: .fraudWarnings) ?? d.fraudWarnings
+        autoplay = try c.decodeIfPresent(AutoplayPolicy.self, forKey: .autoplay) ?? d.autoplay
+        rememberMediaPermissions = try c.decodeIfPresent(Bool.self, forKey: .rememberMediaPermissions) ?? d.rememberMediaPermissions
+        blockAds = try c.decodeIfPresent(Bool.self, forKey: .blockAds) ?? d.blockAds
+        adBlockAllowlist = try c.decodeIfPresent([String].self, forKey: .adBlockAllowlist) ?? d.adBlockAllowlist
+    }
 }
 
 struct DownloadSettings: Codable, Equatable {
@@ -230,6 +290,8 @@ struct Theme: Codable, Equatable {
     var useSpaceColors: Bool = true
     /// A soft top-to-bottom sheen over the tint.
     var sheen: Double = 0.5
+    /// Incognito windows use the Seamless background whatever `style` the others have.
+    var incognitoSeamless: Bool = false
 
     init() {}
 
@@ -246,6 +308,15 @@ struct Theme: Codable, Equatable {
         appearance = try c.decodeIfPresent(AppearanceMode.self, forKey: .appearance) ?? d.appearance
         useSpaceColors = try c.decodeIfPresent(Bool.self, forKey: .useSpaceColors) ?? d.useSpaceColors
         sheen = try c.decodeIfPresent(Double.self, forKey: .sheen) ?? d.sheen
+        incognitoSeamless = try c.decodeIfPresent(Bool.self, forKey: .incognitoSeamless) ?? d.incognitoSeamless
+    }
+
+    /// The theme as a window of this kind shows it.
+    func forWindow(incognito: Bool) -> Theme {
+        guard incognito, incognitoSeamless else { return self }
+        var theme = self
+        theme.style = .seamless
+        return theme
     }
 }
 
@@ -275,33 +346,6 @@ struct GeneralSettings: Codable, Equatable {
     }
 }
 
-struct ThemePreset: Identifiable {
-    let id: String
-    let name: String
-    let apply: (inout Theme) -> Void
-
-    static let all: [ThemePreset] = [
-        ThemePreset(id: "arc", name: "Frosted") { t in
-            t.style = .glass; t.tintOpacity = 0.74; t.blurRadius = 36; t.grain = 0.22; t.sheen = 0.5
-        },
-        ThemePreset(id: "clear", name: "Clear Glass") { t in
-            t.style = .glass; t.tintOpacity = 0.38; t.blurRadius = 18; t.grain = 0.1; t.sheen = 0.7
-        },
-        ThemePreset(id: "deep", name: "Deep Blur") { t in
-            t.style = .glass; t.tintOpacity = 0.55; t.blurRadius = 70; t.grain = 0.3; t.sheen = 0.4
-        },
-        ThemePreset(id: "vibrancy", name: "Vibrancy") { t in
-            t.style = .vibrancy; t.tintOpacity = 0.45; t.grain = 0.12; t.sheen = 0.3
-        },
-        ThemePreset(id: "paper", name: "Grainy Solid") { t in
-            t.style = .solid; t.grain = 0.5; t.sheen = 0.6
-        },
-        ThemePreset(id: "flat", name: "Flat") { t in
-            t.style = .solid; t.grain = 0; t.sheen = 0
-        },
-    ]
-}
-
 @Observable
 final class AppSettings {
     static let shared = AppSettings()
@@ -314,6 +358,7 @@ final class AppSettings {
     var privacy: PrivacySettings { didSet { if privacy != oldValue { persist(Self.privacyKey); webSettingsChanged() } } }
     var downloads: DownloadSettings { didSet { if downloads != oldValue { persist(Self.downloadsKey) } } }
     var advanced: AdvancedSettings { didSet { if advanced != oldValue { persist(Self.advancedKey); webSettingsChanged() } } }
+    var mods: ModSettings { didSet { if mods != oldValue { persist(Self.modsKey) } } }
 
     /// Groups changed since the last write. Dragging a slider or the sidebar's edge changes a
     /// setting on every mouse event; they are written once, when the changes stop coming.
@@ -328,6 +373,7 @@ final class AppSettings {
     private static let privacyKey = "tuff.privacy"
     private static let downloadsKey = "tuff.downloads"
     private static let advancedKey = "tuff.advanced"
+    private static let modsKey = "tuff.mods"
 
     private init() {
         let defaults = UserDefaults.standard
@@ -347,6 +393,7 @@ final class AppSettings {
         privacy = Self.load(Self.privacyKey, PrivacySettings())
         downloads = Self.load(Self.downloadsKey, DownloadSettings())
         advanced = Self.load(Self.advancedKey, AdvancedSettings())
+        mods = Self.load(Self.modsKey, ModSettings())
     }
 
     /// Decodes a settings group, filling fields added since it was saved from `fallback`.
@@ -399,14 +446,16 @@ final class AppSettings {
         put(privacy, Self.privacyKey)
         put(downloads, Self.downloadsKey)
         put(advanced, Self.advancedKey)
+        put(mods, Self.modsKey)
         unsaved.removeAll()
     }
 
     /// Pushes settings that live web views can pick up without being rebuilt.
     private func webSettingsChanged() {
-        for tab in BrowserState.shared.allTabs {
+        for tab in BrowserState.all.flatMap(\.allTabs) {
             if let view = tab.webView { WebEngine.applyLiveSettings(to: view) }
         }
+        ContentBlocker.shared.settingsChanged()
     }
 
     func resetTheme() { theme = Theme() }
@@ -420,6 +469,7 @@ final class AppSettings {
         privacy = PrivacySettings()
         downloads = DownloadSettings()
         advanced = AdvancedSettings()
+        mods = ModSettings()
     }
 
     // MARK: Export / import
@@ -433,6 +483,7 @@ final class AppSettings {
         var privacy: PrivacySettings?
         var downloads: DownloadSettings?
         var advanced: AdvancedSettings?
+        var mods: ModSettings?
     }
 
     func exportData() -> Data? {
@@ -440,7 +491,7 @@ final class AppSettings {
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         return try? encoder.encode(Bundle(
             theme: theme, general: general, behavior: behavior, tabs: tabs, search: search,
-            privacy: privacy, downloads: downloads, advanced: advanced
+            privacy: privacy, downloads: downloads, advanced: advanced, mods: mods
         ))
     }
 
@@ -459,6 +510,7 @@ final class AppSettings {
         privacy = part("privacy", privacy)
         downloads = part("downloads", downloads)
         advanced = part("advanced", advanced)
+        mods = part("mods", mods)
         return true
     }
 

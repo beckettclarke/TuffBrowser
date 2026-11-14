@@ -124,7 +124,7 @@ extension Tab: WKWebExtensionTab {
     }
 
     func close(for context: WKWebExtensionContext, completionHandler: @escaping ((any Error)?) -> Void) {
-        browser?.close(self)
+        browser?.close(self, force: true)
         completionHandler(nil)
     }
 

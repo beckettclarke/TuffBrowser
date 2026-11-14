@@ -16,7 +16,7 @@ gen:
 
 ## Debug build
 build: gen
-	$(XCODEBUILD) -configuration Debug build | grep -E "error|warning: |BUILD" || true
+	$(XCODEBUILD) -configuration Debug build | grep -E "error:|warning: |BUILD" || true
 
 ## Build and launch
 run: build
@@ -24,7 +24,7 @@ run: build
 
 ## Optimised build
 release: gen
-	$(XCODEBUILD) -configuration Release build | grep -E "error|BUILD" || true
+	$(XCODEBUILD) -configuration Release build | grep -E "error:|BUILD" || true
 	@$(MAKE) size
 
 ## Optimised build, copied to /Applications (where helper apps such as 1Password look for browsers)

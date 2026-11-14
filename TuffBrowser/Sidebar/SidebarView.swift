@@ -66,9 +66,11 @@ struct TopControls: View {
 struct URLPill: View {
     @Environment(BrowserState.self) private var state
     @Environment(ExtensionManager.self) private var extensions
+    var height: CGFloat = 36
     @State private var hovering = false
 
     var body: some View {
+        @Bindable var state = state
         let tab = state.selectedTab
         let url = tab?.url
         HStack(spacing: 0) {
@@ -101,35 +103,76 @@ struct URLPill: View {
                     .lineLimit(1)
             }
             Spacer(minLength: 4)
-            if hovering, url != nil {
-                Button {
-                    state.copyCurrentURL()
-                } label: {
-                    Image(systemName: "link")
-                        .font(.system(size: 11, weight: .semibold))
-                        .foregroundStyle(.primary.opacity(0.6))
-                        .frame(width: 22, height: 22)
-                        .contentShape(Rectangle())
+            let showButtons = hovering || state.pageMenuVisible
+            HStack(spacing: 2) {
+                if showButtons, url != nil {
+                    PillButton(symbol: "link", size: 11, side: height > 32 ? 24 : 22, help: "Copy Link  ⇧⌘C") {
+                        state.copyCurrentURL()
+                    }
+                    .transition(.opacity.combined(with: .scale(scale: 0.8)))
                 }
-                .buttonStyle(SquishButtonStyle())
-                .help("Copy Link  ⇧⌘C")
-                .transition(.opacity.combined(with: .scale(scale: 0.8)))
+                if showButtons, tab != nil {
+                    PillButton(
+                        symbol: "slider.horizontal.3", size: 11.5, side: height > 32 ? 24 : 22,
+                        help: "Page Menu", active: state.pageMenuVisible
+                    ) {
+                        state.pageMenuVisible.toggle()
+                    }
+                    .popover(isPresented: $state.pageMenuVisible, arrowEdge: .bottom) {
+                        PageMenu()
+                    }
+                    .transition(.opacity.combined(with: .scale(scale: 0.8)))
+                }
             }
         }
         .padding(.leading, 12)
-        .padding(.trailing, 7)
-        .frame(height: 36)
+        .padding(.trailing, 6)
+        .frame(height: height)
+        // Popups opened from the page menu (share, extensions) hang off the address bar.
+        .background(AnchorView { PageMenu.anchor = $0 })
         .background(
-            RoundedRectangle(cornerRadius: 11, style: .continuous)
+            RoundedRectangle(cornerRadius: height * 0.3, style: .continuous)
                 .fill(.primary.opacity(hovering ? 0.13 : 0.09))
         )
-        .contentShape(RoundedRectangle(cornerRadius: 11, style: .continuous))
+        .contentShape(RoundedRectangle(cornerRadius: height * 0.3, style: .continuous))
         .onTapGesture { state.openCommandBar(.editCurrent) }
         .onHover { hovering = $0 }
         .animation(Motion.quick, value: hovering)
         .animation(Motion.quick, value: url)
         .animation(Motion.quick, value: tab?.isNotSecure)
+        .animation(Motion.quick, value: state.pageMenuVisible)
         .help("Search or enter address  ⌘L")
+    }
+}
+
+/// A small button inside the address bar, with a soft square behind it on hover (and while
+/// what it opens is showing).
+struct PillButton: View {
+    let symbol: String
+    var size: CGFloat = 11
+    var side: CGFloat = 22
+    var help = ""
+    var active = false
+    let action: () -> Void
+    @State private var hovering = false
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: symbol)
+                .font(.system(size: size, weight: .semibold))
+                .foregroundStyle(.primary.opacity(hovering || active ? 0.9 : 0.6))
+                .frame(width: side, height: side)
+                .background(
+                    RoundedRectangle(cornerRadius: 7, style: .continuous)
+                        .fill(.primary.opacity(active ? 0.16 : (hovering ? 0.11 : 0)))
+                )
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(SquishButtonStyle())
+        .onHover { hovering = $0 }
+        .animation(Motion.quick, value: hovering)
+        .animation(Motion.quick, value: active)
+        .help(help)
     }
 }
 
@@ -159,7 +202,9 @@ struct ExtensionBar: View {
         // Reading `revision` re-evaluates this view when icons / badges change.
         let _ = extensions.revision
         let _ = SidePanelManager.shared.revision
-        let actions = extensions.actions(for: state.selectedTab)
+        // Extensions don't run in Incognito windows.
+        // Unpinned ones live in the page menu instead.
+        let actions = state.isPrivate ? [] : extensions.actions(for: state.selectedTab).filter(\.pinned)
         if !actions.isEmpty {
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 4) {
@@ -233,6 +278,9 @@ struct ExtensionActionButton: View {
                 Button("Options…") { extensions.openOptions(id: action.id) }
             }
             Menu("Use In") { ExtensionLinkMenuItems(id: action.id) }
+            Button("Unpin") {
+                withAnimation(Motion.snappy) { extensions.setPinned(false, id: action.id) }
+            }
             Button("Manage Extensions…") { AppDelegate.shared?.showSettings(tab: .extensions) }
             Divider()
             Button("Remove “\(action.name)”", role: .destructive) { extensions.uninstall(id: action.id) }
@@ -260,10 +308,15 @@ struct AnchorView: NSViewRepresentable {
 struct FavoritesGrid: View {
     @Environment(BrowserState.self) private var state
 
-    private let columns = Array(repeating: GridItem(.flexible(), spacing: 8), count: 3)
+    /// Up to four favourites sit in one row. Past that they wrap into rows that stay as even
+    /// as possible: 5–6 in threes, 7–8 in fours, and four across from then on.
+    static func columnCount(for count: Int) -> Int {
+        count <= 4 ? max(count, 1) : min(4, (count + 1) / 2)
+    }
 
     var body: some View {
         let favorites = state.favorites
+        let columns = Array(repeating: GridItem(.flexible(), spacing: 8), count: Self.columnCount(for: favorites.count))
         // Worked out once here and handed down: a tile that looked up the selected tab itself
         // would be re-evaluated whenever any tab list or selection changed.
         let selectedID = state.spaces.isEmpty ? nil : state.currentSpace.selectedTabID
@@ -276,12 +329,13 @@ struct FavoritesGrid: View {
                                 state.draggingTab = tab
                                 return NSItemProvider(object: tab.id.uuidString as NSString)
                             }
-                            .onDrop(of: [.text], delegate: TabDropDelegate(target: tab, section: .favorites, space: state.currentSpace, state: state))
+                            .modifier(TabDropTarget(tab: tab, section: .favorites, space: state.currentSpace, axis: .horizontal, cornerRadius: 12))
                             .transition(.scale(scale: 0.6).combined(with: .opacity))
                     }
                 }
                 .padding(.horizontal, 10)
                 .padding(.top, 8)
+                .animation(Motion.snappy, value: columns.count)
             } else if state.draggingTab != nil {
                 RoundedRectangle(cornerRadius: 12, style: .continuous)
                     .strokeBorder(.primary.opacity(0.25), style: StrokeStyle(lineWidth: 1, dash: [4, 4]))
@@ -309,12 +363,23 @@ struct FavoriteTile: View {
 
     var body: some View {
         let shape = RoundedRectangle(cornerRadius: 12, style: .continuous)
+        // Selected, the tile takes on its favicon's colours, as in Arc and Zen.
+        let colors = selected ? FaviconColors.palette(for: tab.favicon) : nil
         Button {
             state.select(tab)
         } label: {
             ZStack {
-                shape.fill(selected ? AnyShapeStyle(accent.opacity(0.22)) : AnyShapeStyle(.primary.opacity(hovering ? 0.13 : 0.08)))
-                shape.strokeBorder(accent.opacity(selected ? 0.9 : 0), lineWidth: 1.5)
+                shape.fill(.primary.opacity(selected ? 0.14 : (hovering ? 0.13 : 0.08)))
+                if let colors {
+                    shape.fill(LinearGradient(colors: colors.map { Color(nsColor: $0).opacity(0.13) }, startPoint: .topLeading, endPoint: .bottomTrailing))
+                    shape.strokeBorder(
+                        LinearGradient(colors: colors.map { Color(nsColor: $0) }, startPoint: .topLeading, endPoint: .bottomTrailing),
+                        lineWidth: 2
+                    )
+                } else {
+                    // A favicon without colour (black, white, grey): a plain light outline.
+                    shape.strokeBorder(.primary.opacity(selected ? 0.55 : 0), lineWidth: 1.5)
+                }
                 TabIcon(tab: tab, size: 18)
                     .opacity(tab.isAwake || selected ? 1 : 0.75)
             }
@@ -325,28 +390,28 @@ struct FavoriteTile: View {
         .onHover { hovering = $0 }
         .animation(Motion.quick, value: hovering)
         .animation(Motion.snappy, value: selected)
+        .animation(Motion.quick, value: tab.favicon)
         .help(tab.displayTitle)
         .contextMenu { TabContextMenu(tab: tab, section: .favorites) }
     }
 }
 
-/// Favicon, with a spinner while loading and a letter fallback.
+/// Favicon, swapped for a spinning ring while the page loads, with a symbol fallback.
 struct TabIcon: View {
     let tab: Tab
     var size: CGFloat = 16
 
     var body: some View {
         ZStack {
-            if let icon = tab.favicon {
+            if tab.isLoading {
+                LoadingSpinner(size: size)
+                    .transition(.opacity.combined(with: .scale(scale: 0.6)))
+            } else if let icon = tab.favicon {
                 Image(nsImage: icon)
                     .resizable()
                     .interpolation(.high)
                     .clipShape(RoundedRectangle(cornerRadius: size * 0.22, style: .continuous))
                     .transition(.opacity.combined(with: .scale(scale: 0.7)))
-            } else if tab.isLoading {
-                ProgressView()
-                    .controlSize(.small)
-                    .scaleEffect(0.6)
             } else {
                 Image(systemName: tab.url == nil ? "plus.square.dashed" : "globe")
                     .font(.system(size: size * 0.86, weight: .medium))
@@ -355,6 +420,38 @@ struct TabIcon: View {
         }
         .frame(width: size, height: size)
         .animation(Motion.quick, value: tab.favicon != nil)
+        .animation(.easeOut(duration: 0.25), value: tab.isLoading)
+    }
+}
+
+/// A ring whose tail fades out as it spins. Driven by a timeline rather than a repeating
+/// animation, so it can't pick up (or leak into) the row's own layout animations, and it only
+/// exists while a tab is loading.
+struct LoadingSpinner: View {
+    @Environment(\.accent) private var accent
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    var size: CGFloat = 16
+
+    var body: some View {
+        let inset = size * 0.12
+        let line = max(1.6, size * 0.13)
+        TimelineView(.animation(paused: reduceMotion)) { context in
+            let turn = context.date.timeIntervalSinceReferenceDate.truncatingRemainder(dividingBy: 0.8) / 0.8
+            Circle()
+                .trim(from: 0, to: 0.8)
+                .stroke(
+                    AngularGradient(
+                        colors: [accent.opacity(0), accent.opacity(0.45), accent],
+                        center: .center,
+                        startAngle: .degrees(0), endAngle: .degrees(288)
+                    ),
+                    style: StrokeStyle(lineWidth: line, lineCap: .round)
+                )
+                .rotationEffect(.degrees(turn * 360))
+        }
+        .padding(inset)
+        .frame(width: size, height: size)
+        .allowsHitTesting(false)
     }
 }
 
@@ -392,17 +489,24 @@ struct SpacePage: View {
         // The selected row is worked out here, once, and handed to the rows. A row is selected
         // only while its space is the one showing.
         let selectedID = !state.spaces.isEmpty && state.currentSpace === space ? space.selectedTabID : nil
+        // The other side of a split showing with the selected tab.
+        let partnerID = space.split?.partner(of: selectedID)
         VStack(spacing: 0) {
             SpaceHeader(space: space)
 
             ScrollView(.vertical, showsIndicators: false) {
                 VStack(spacing: 2) {
+                    let pinnedPair = SplitTabRow.Pair(in: space.pinned, split: space.split)
                     ForEach(space.pinnedItems) { item in
                         switch item {
                         case .tab(let tab):
-                            SidebarTabRow(tab: tab, section: .pinned, selected: tab.id == selectedID, space: space)
+                            if let pair = pinnedPair, tab === pair.first {
+                                SplitTabRow(pair: pair, section: .pinned, space: space, selectedID: selectedID)
+                            } else if pinnedPair?.second !== tab {
+                                SidebarTabRow(tab: tab, section: .pinned, selected: tab.id == selectedID, space: space, split: split(tab))
+                            }
                         case .folder(let folder):
-                            FolderSection(folder: folder, space: space, selectedID: selectedID)
+                            FolderSection(folder: folder, space: space, selectedID: selectedID, partnerID: partnerID)
                                 .transition(.scale(scale: 0.92, anchor: .leading).combined(with: .opacity))
                         }
                     }
@@ -410,16 +514,18 @@ struct SpacePage: View {
                         PinDropZone(space: space, empty: space.pinnedItems.isEmpty)
                     }
 
-                    Rectangle()
-                        .fill(.primary.opacity(0.1))
-                        .frame(height: 1)
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 7)
+                    TabsDivider(space: space)
 
                     NewTabRow()
 
+                    let tabsPair = SplitTabRow.Pair(in: space.tabs, split: space.split)
                     ForEach(space.tabs) { tab in
-                        SidebarTabRow(tab: tab, section: .tabs, selected: tab.id == selectedID, space: space)
+                        // A split's two tabs share one row, where the first of them is.
+                        if let pair = tabsPair, tab === pair.first {
+                            SplitTabRow(pair: pair, section: .tabs, space: space, selectedID: selectedID)
+                        } else if tabsPair?.second !== tab {
+                            SidebarTabRow(tab: tab, section: .tabs, selected: tab.id == selectedID, space: space, split: split(tab))
+                        }
                     }
 
                     // Drop target for "move to the end of the list".
@@ -433,6 +539,13 @@ struct SpacePage: View {
             }
         }
     }
+
+    /// How a row shows its place in the space's split.
+    private func split(_ tab: Tab) -> TabRow.SplitRole {
+        guard space.split?.contains(tab.id) == true else { return .none }
+        let selectedID = !state.spaces.isEmpty && state.currentSpace === space ? space.selectedTabID : nil
+        return space.split?.partner(of: selectedID) == tab.id ? .showing : .paired
+    }
 }
 
 /// A tab row in a space's list that can be dragged and dropped onto.
@@ -443,20 +556,162 @@ struct SidebarTabRow: View {
     let selected: Bool
     let space: Space
     var folder: Folder?
+    var split: TabRow.SplitRole = .none
 
     var body: some View {
-        TabRow(tab: tab, section: section, selected: selected)
+        TabRow(tab: tab, section: section, selected: selected, split: split)
             .onDrag {
                 state.draggingTab = tab
                 return NSItemProvider(object: tab.id.uuidString as NSString)
             }
-            .onDrop(of: [.text], delegate: TabDropDelegate(target: tab, section: section, space: space, folder: folder, state: state))
+            .modifier(TabDropTarget(tab: tab, section: section, space: space, folder: folder, axis: .vertical))
             .transition(
                 .asymmetric(
                     insertion: .scale(scale: 0.92, anchor: .leading).combined(with: .opacity),
                     removal: .scale(scale: 0.9, anchor: .leading).combined(with: .opacity)
                 )
             )
+    }
+}
+
+/// A split's two tabs on one row, as Arc shows them: left and right halves in the order they
+/// sit on screen. Each half selects, closes, drags and right-clicks as its own tab; dragging one
+/// to another place in the list takes it out of the split.
+struct SplitTabRow: View {
+    /// The two tabs of a space's split when both are in the same list: `first` / `second` in
+    /// list order (the row stands where `first` is), `leading` / `trailing` on screen.
+    struct Pair {
+        let first: Tab
+        let second: Tab
+        let leading: Tab
+        let trailing: Tab
+
+        init?(in list: [Tab], split: SplitPair?) {
+            guard let split,
+                  let l = list.firstIndex(where: { $0.id == split.leading }),
+                  let t = list.firstIndex(where: { $0.id == split.trailing }) else { return nil }
+            leading = list[l]
+            trailing = list[t]
+            first = list[min(l, t)]
+            second = list[max(l, t)]
+        }
+    }
+
+    @Environment(BrowserState.self) private var state
+    let pair: Pair
+    let section: TabSection
+    let space: Space
+    var folder: Folder?
+    /// The space's selected tab while it is the space showing.
+    let selectedID: UUID?
+
+    var body: some View {
+        let showing = selectedID == pair.leading.id || selectedID == pair.trailing.id
+        let shape = RoundedRectangle(cornerRadius: 10, style: .continuous)
+        HStack(spacing: 0) {
+            SplitTabHalf(tab: pair.leading, section: section, focused: selectedID == pair.leading.id)
+            Rectangle()
+                .fill(.primary.opacity(0.14))
+                .frame(width: 1, height: 16)
+            SplitTabHalf(tab: pair.trailing, section: section, focused: selectedID == pair.trailing.id)
+        }
+        .frame(height: AppSettings.shared.tabs.compactRows ? 30 : 36)
+        .background(shape.fill(.primary.opacity(showing ? 0.08 : 0.04)))
+        .overlay(shape.strokeBorder(.primary.opacity(0.06), lineWidth: 0.5).allowsHitTesting(false))
+        .modifier(TabDropTarget(tab: pair.first, section: section, space: space, folder: folder, axis: .vertical, pairedWith: pair.second))
+        .animation(Motion.quick, value: showing)
+        .transition(
+            .asymmetric(
+                insertion: .scale(scale: 0.92, anchor: .leading).combined(with: .opacity),
+                removal: .scale(scale: 0.9, anchor: .leading).combined(with: .opacity)
+            )
+        )
+    }
+}
+
+/// One side of a `SplitTabRow`.
+private struct SplitTabHalf: View {
+    @Environment(BrowserState.self) private var state
+    let tab: Tab
+    let section: TabSection
+    /// The side with the keyboard.
+    let focused: Bool
+    @State private var hovering = false
+
+    var body: some View {
+        let renaming = state.renamingTabID == tab.id
+        HStack(spacing: 7) {
+            TabIcon(tab: tab)
+                .opacity(tab.isAwake || focused ? 1 : 0.7)
+            if renaming {
+                InlineRenameField(
+                    initial: tab.displayTitle, placeholder: tab.pageTitle,
+                    commit: { state.rename(tab, to: $0) },
+                    cancel: { state.renamingTabID = nil }
+                )
+                .frame(maxWidth: .infinity, alignment: .leading)
+            } else {
+                Text(tab.displayTitle)
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(.primary.opacity(focused ? 0.96 : (tab.isAwake ? 0.82 : 0.6)))
+                    .lineLimit(1)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .mask(
+                        LinearGradient(
+                            stops: [.init(color: .black, location: 0), .init(color: .black, location: 0.8), .init(color: .clear, location: 1)],
+                            startPoint: .leading, endPoint: .trailing
+                        )
+                    )
+            }
+            if tab.isMuted || tab.isPlayingAudio, !hovering {
+                Image(systemName: tab.isMuted ? "speaker.slash.fill" : "speaker.wave.2.fill")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundStyle(.primary.opacity(0.6))
+                    .transition(.opacity)
+            }
+            if hovering, !renaming {
+                Button {
+                    state.close(tab)
+                } label: {
+                    Image(systemName: section == .tabs ? "xmark" : "minus")
+                        .font(.system(size: 8.5, weight: .bold))
+                        .foregroundStyle(.primary.opacity(0.7))
+                        .frame(width: 18, height: 18)
+                        .background(RoundedRectangle(cornerRadius: 5, style: .continuous).fill(.primary.opacity(0.1)))
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(SquishButtonStyle())
+                .help(section == .tabs ? "Close Tab" : "Unload Tab")
+                .transition(.scale(scale: 0.6).combined(with: .opacity))
+            }
+        }
+        .padding(.leading, 9)
+        .padding(.trailing, 5)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(.primary.opacity(focused ? 0.14 : (hovering ? 0.07 : 0)))
+                .shadow(color: .black.opacity(focused ? 0.12 : 0), radius: 3, y: 1)
+                .padding(2)
+        )
+        .contentShape(Rectangle())
+        .onTapGesture {
+            guard !renaming else { return }
+            if (NSApp.currentEvent?.clickCount ?? 1) >= 2 {
+                state.renamingTabID = tab.id
+            } else {
+                state.select(tab)
+            }
+        }
+        .onHover { hovering = $0 }
+        .animation(Motion.quick, value: hovering)
+        .animation(Motion.quick, value: focused)
+        .help(tab.displayTitle)
+        .contextMenu { TabContextMenu(tab: tab, section: section) }
+        .onDrag {
+            state.draggingTab = tab
+            return NSItemProvider(object: tab.id.uuidString as NSString)
+        }
     }
 }
 
@@ -469,14 +724,25 @@ struct FolderSection: View {
     let folder: Folder
     let space: Space
     let selectedID: UUID?
+    /// The other side of a split showing with the selected tab.
+    var partnerID: UUID?
 
     var body: some View {
-        let visible = folder.isOpen ? folder.tabs : folder.tabs.filter { $0.id == selectedID }
+        let visible = folder.isOpen ? folder.tabs : folder.tabs.filter { $0.id == selectedID || $0.id == partnerID }
+        let pair = SplitTabRow.Pair(in: visible, split: space.split)
         VStack(spacing: 2) {
             FolderRow(folder: folder, space: space)
             ForEach(visible) { tab in
-                SidebarTabRow(tab: tab, section: .pinned, selected: tab.id == selectedID, space: space, folder: folder)
+                if let pair, tab === pair.first {
+                    SplitTabRow(pair: pair, section: .pinned, space: space, folder: folder, selectedID: selectedID)
+                        .padding(.leading, 16)
+                } else if pair?.second !== tab {
+                    SidebarTabRow(
+                        tab: tab, section: .pinned, selected: tab.id == selectedID, space: space, folder: folder,
+                        split: space.split?.contains(tab.id) == true ? (tab.id == partnerID ? .showing : .paired) : .none
+                    )
                     .padding(.leading, 16)
+                }
             }
             if folder.isOpen, folder.tabs.isEmpty {
                 Text(state.draggingTab == nil ? "Empty folder" : "Drop here to add")
@@ -588,6 +854,19 @@ struct FolderRow: View {
                 .disabled(space.pinnedItems.first?.id == folder.id)
             Button("Move Down") { state.move(folder, by: 1) }
                 .disabled(space.pinnedItems.last?.id == folder.id)
+            if state.spaces.count > 1 {
+                Menu("Move to Space") {
+                    ForEach(state.spaces) { other in
+                        if other !== space {
+                            Button {
+                                state.move(folder, toSpace: other)
+                            } label: {
+                                Label(other.name, systemImage: other.icon)
+                            }
+                        }
+                    }
+                }
+            }
             Divider()
             Button("New Folder") { state.addFolder(in: space) }
             Button("Delete Folder", role: .destructive) { state.delete(folder) }
@@ -630,6 +909,7 @@ func endSidebarDrag(_ state: BrowserState) -> Bool {
     withAnimation(Motion.quick) {
         state.draggingTab = nil
         state.draggingFolder = nil
+        state.splitDropTargetID = nil
     }
     return true
 }
@@ -790,6 +1070,49 @@ struct SpaceEditor: View {
 
 // MARK: - Rows
 
+/// The line between pinned tabs and the tab list. Hovering it shows "Clear", which closes the
+/// tab list except the selected tab.
+struct TabsDivider: View {
+    @Environment(BrowserState.self) private var state
+    let space: Space
+    @State private var hovering = false
+    @State private var hoveringButton = false
+
+    var body: some View {
+        let clearable = space.tabs.contains { $0.id != space.selectedTabID }
+        HStack(spacing: 8) {
+            Rectangle()
+                .fill(.primary.opacity(0.1))
+                .frame(height: 1)
+            if hovering, clearable {
+                Button {
+                    state.clearTabs(in: space)
+                } label: {
+                    HStack(spacing: 3) {
+                        Image(systemName: "arrow.down")
+                            .font(.system(size: 10, weight: .semibold))
+                        Text("Clear")
+                            .font(.system(size: 11.5, weight: .semibold))
+                    }
+                    .foregroundStyle(.primary.opacity(hoveringButton ? 0.85 : 0.45))
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(SquishButtonStyle(scale: 0.94))
+                .onHover { hoveringButton = $0 }
+                .help("Close all tabs below except the current one")
+                .transition(.opacity.combined(with: .move(edge: .trailing)))
+            }
+        }
+        .padding(.leading, 12)
+        .padding(.trailing, hovering && clearable ? 4 : 12)
+        .frame(height: 15)
+        .contentShape(Rectangle())
+        .onHover { hovering = $0 }
+        .animation(Motion.quick, value: hovering)
+        .animation(Motion.quick, value: hoveringButton)
+    }
+}
+
 struct NewTabRow: View {
     @Environment(BrowserState.self) private var state
     @State private var hovering = false
@@ -819,10 +1142,24 @@ struct NewTabRow: View {
 }
 
 struct TabRow: View {
+    /// The "back to pinned page" section: as wide as the row's padding, icon and gap, so the icon
+    /// stays where it was.
+    static let homeSectionWidth: CGFloat = 36
+
+    /// A row's part in its space's split view.
+    enum SplitRole {
+        case none
+        /// One side of the space's split.
+        case paired
+        /// The other side of the split on screen now, beside the selected tab.
+        case showing
+    }
+
     @Environment(BrowserState.self) private var state
     let tab: Tab
     let section: TabSection
     let selected: Bool
+    var split: SplitRole = .none
     @State private var hovering = false
     /// The mouse is over the "back to pinned page" icon.
     @State private var hoveringHome = false
@@ -832,29 +1169,44 @@ struct TabRow: View {
         let away = section != .tabs && tab.isAwayFromHome
         HStack(spacing: 10) {
             if away {
-                // Browsed away from the pinned page: the icon takes it back, as in Arc.
-                HStack(spacing: 6) {
-                    Button {
-                        state.returnHome(tab)
-                    } label: {
-                        TabIcon(tab: tab)
-                            .frame(width: 24, height: 24)
-                            .background(
-                                RoundedRectangle(cornerRadius: 6, style: .continuous)
-                                    .fill(.primary.opacity(hoveringHome ? 0.12 : 0))
-                            )
-                            .contentShape(Rectangle())
-                    }
-                    .buttonStyle(SquishButtonStyle())
-                    .onHover { hoveringHome = $0 }
-                    .help("Back to Pinned Page")
-                    .padding(.horizontal, -4)
-
-                    Text("/")
-                        .font(.system(size: 14, weight: .regular))
-                        .foregroundStyle(.primary.opacity(0.3))
+                // Browsed away from the pinned page: the icon takes it back, as in Arc. It sits
+                // in its own section of the row, cut off by a line, running to the row's edges.
+                Button {
+                    state.returnHome(tab)
+                } label: {
+                    TabIcon(tab: tab)
+                        .frame(width: Self.homeSectionWidth)
+                        .frame(maxHeight: .infinity)
+                        .background(
+                            UnevenRoundedRectangle(topLeadingRadius: 10, bottomLeadingRadius: 10, style: .continuous)
+                                .fill(.primary.opacity(hoveringHome ? 0.1 : 0))
+                        )
+                        .overlay(alignment: .trailing) {
+                            // A plain "/" between icon and title; hovered, it becomes the line
+                            // that cuts the section off.
+                            ZStack {
+                                Text("/")
+                                    .font(.system(size: 14, weight: .regular))
+                                    .foregroundStyle(.primary.opacity(0.3))
+                                    .fixedSize()
+                                    .opacity(hoveringHome ? 0 : 1)
+                                    .offset(x: 1)
+                                Rectangle()
+                                    .fill(.primary.opacity(0.2))
+                                    .frame(width: 1)
+                                    .frame(maxHeight: .infinity)
+                                    .opacity(hoveringHome ? 1 : 0)
+                            }
+                            .frame(width: 1)
+                        }
+                        .contentShape(Rectangle())
                 }
-                .transition(.opacity.combined(with: .scale(scale: 0.8, anchor: .leading)))
+                .buttonStyle(HomeSectionButtonStyle())
+                .onHover { hoveringHome = $0 }
+                .help("Back to Pinned Page")
+                // Cancel the row's leading padding so the section reaches its edge.
+                .padding(.leading, -10)
+                .transition(.opacity)
             } else {
                 TabIcon(tab: tab)
                     .opacity(tab.isAwake || selected ? 1 : 0.7)
@@ -889,6 +1241,15 @@ struct TabRow: View {
                         startPoint: .leading, endPoint: .trailing
                     )
                 )
+            }
+
+            if split != .none, !hovering {
+                Image(systemName: "rectangle.split.2x1")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(.primary.opacity(selected || split == .showing ? 0.65 : 0.4))
+                    .frame(width: 20, height: 20)
+                    .help("In Split View")
+                    .transition(.scale.combined(with: .opacity))
             }
 
             if tab.isInPictureInPicture {
@@ -943,7 +1304,7 @@ struct TabRow: View {
         .frame(height: AppSettings.shared.tabs.compactRows ? 30 : 36)
         .background(
             RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(.primary.opacity(selected ? 0.15 : (hovering ? 0.07 : 0)))
+                .fill(.primary.opacity(selected ? 0.15 : (split == .showing ? 0.09 : (hovering ? 0.07 : 0))))
                 .shadow(color: .black.opacity(selected ? 0.12 : 0), radius: 3, y: 1)
         )
         .contentShape(Rectangle())
@@ -960,11 +1321,26 @@ struct TabRow: View {
         .onHover { hovering = $0 }
         .animation(Motion.quick, value: hovering)
         .animation(Motion.quick, value: selected)
+        .animation(Motion.quick, value: split)
         .animation(Motion.snappy, value: tab.isPlayingAudio)
         .animation(Motion.snappy, value: tab.isInPictureInPicture)
         .animation(Motion.quick, value: hoveringHome)
         .animation(Motion.snappy, value: away)
         .contextMenu { TabContextMenu(tab: tab, section: section) }
+    }
+}
+
+/// Darkens the "back to pinned page" section while it's pressed. (A squish would pull it away
+/// from the row's edges.)
+private struct HomeSectionButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .overlay(
+                UnevenRoundedRectangle(topLeadingRadius: 10, bottomLeadingRadius: 10, style: .continuous)
+                    .fill(.primary.opacity(configuration.isPressed ? 0.08 : 0))
+                    .padding(.trailing, 1)
+            )
+            .animation(Motion.quick, value: configuration.isPressed)
     }
 }
 
@@ -1001,6 +1377,20 @@ struct TabContextMenu: View {
             if current != nil {
                 Button("Remove from Folder") { state.move(tab, to: .pinned, in: space) }
             }
+            if state.spaces.count > 1 {
+                Menu("Move to Space") {
+                    ForEach(state.spaces) { other in
+                        if other !== space {
+                            Button {
+                                // A tab in a folder lands loose in the other space's pinned section.
+                                state.move(tab, to: section, in: other)
+                            } label: {
+                                Label(other.name, systemImage: other.icon)
+                            }
+                        }
+                    }
+                }
+            }
         }
         if section != .tabs, tab.isAwayFromHome {
             Button("Back to Pinned Page") { state.returnHome(tab) }
@@ -1010,10 +1400,19 @@ struct TabContextMenu: View {
             }
         }
         Divider()
+        if state.visibleSplit?.contains(tab.id) == true {
+            Button("Close Split View") { state.closeSplit() }
+            Button("Swap Split Sides") { state.swapSplitSides() }
+        } else if state.canSplit(with: tab) {
+            Button("Open in Split View") { state.split(with: tab) }
+        }
+        Divider()
         Button("Rename…") { state.renamingTabID = tab.id }
         if tab.customTitle != nil {
             Button("Use Page Title") { state.rename(tab, to: "") }
         }
+        Button("Reload") { tab.reload() }
+            .disabled(tab.url == nil)
         Button("Duplicate") { state.duplicate(tab) }
             .disabled(tab.url == nil)
         Button("Copy Link") {
@@ -1033,21 +1432,8 @@ struct TabContextMenu: View {
                 }
             }
         }
-        if tab.isAwake, state.selectedTab !== tab {
+        if tab.isAwake, !state.isOnScreen(tab) {
             Button("Unload to Save Memory") { tab.sleep() }
-        }
-        if section != .favorites, state.spaces.count > 1 {
-            Menu("Move to Space") {
-                ForEach(state.spaces) { space in
-                    if space !== state.space(containing: tab) {
-                        Button {
-                            state.move(tab, to: section, in: space)
-                        } label: {
-                            Label(space.name, systemImage: space.icon)
-                        }
-                    }
-                }
-            }
         }
         Divider()
         Button(section == .tabs ? "Close Tab" : "Unload Tab") { state.close(tab) }
@@ -1056,6 +1442,13 @@ struct TabContextMenu: View {
                 guard let space = state.space(containing: tab), let index = space.tabs.firstIndex(where: { $0 === tab }) else { return }
                 space.tabs.suffix(from: index + 1).forEach { state.close($0) }
             }
+            Button("Close Other Tabs") {
+                // The space's other regular tabs; pinned tabs and favourites stay.
+                guard let space = state.space(containing: tab) else { return }
+                if space.selectedTabID != tab.id { state.select(tab) }
+                space.tabs.filter { $0 !== tab }.forEach { state.close($0) }
+            }
+            .disabled((state.space(containing: tab)?.tabs.count ?? 0) < 2)
         }
     }
 }
@@ -1067,6 +1460,17 @@ struct TabDropDelegate: DropDelegate {
     /// Set when the target row is inside a folder.
     var folder: Folder? = nil
     let state: BrowserState
+    /// The direction the row's list runs in. With it (and `size`), the row is cut in three: a
+    /// tab dropped on the middle shows beside the row's tab in a split, and the ends place it
+    /// before or after. Without it, a tab takes the row's place as soon as it is dragged over.
+    var axis: Axis? = nil
+    /// The row's size, for those zones.
+    var size: CGSize = .zero
+    /// The other tab of a split row (`SplitTabRow`, whose `target` is its first tab): dragging
+    /// either of its own tabs over it does nothing, and it isn't paired with.
+    var pairedWith: Tab? = nil
+
+    private enum Zone { case before, after, split }
 
     /// Folders can only be dropped among the loose items of the pinned section.
     private var takesFolders: Bool { section == .pinned && folder == nil }
@@ -1081,23 +1485,126 @@ struct TabDropDelegate: DropDelegate {
             state.move(dragged, to: target.flatMap { space.pinnedIndex(of: $0.id) } ?? space.pinnedItems.count)
             return
         }
-        guard let dragged = state.draggingTab, dragged !== target else { return }
-        // Loose pinned tabs are placed among the folders, so they count in `pinnedItems`.
-        let ids: [UUID]
-        switch section {
-        case .favorites: ids = state.favorites.map(\.id)
-        case .pinned: ids = folder?.tabs.map(\.id) ?? space.pinnedItems.map(\.id)
-        case .tabs: ids = space.tabs.map(\.id)
+        guard let dragged = state.draggingTab, dragged !== target, dragged !== pairedWith else { return }
+        if zone(info) != nil {
+            update(dragged, info)
+            return
         }
+        let ids = listIDs
         let index = target.flatMap { t in ids.firstIndex(of: t.id) } ?? ids.count
         // Dropping onto the end zone of the list the tab is already last in: nothing to do.
         if target == nil, ids.last == dragged.id { return }
-        state.move(dragged, to: section, in: space, folder: folder, at: index)
+        move(dragged, at: index)
     }
 
-    func dropUpdated(info: DropInfo) -> DropProposal? { DropProposal(operation: .move) }
+    func dropUpdated(info: DropInfo) -> DropProposal? {
+        if state.draggingFolder == nil, let dragged = state.draggingTab, dragged !== target, dragged !== pairedWith,
+           zone(info) != nil {
+            update(dragged, info)
+        }
+        return DropProposal(operation: .move)
+    }
 
-    func performDrop(info: DropInfo) -> Bool { endSidebarDrag(state) }
+    func dropExited(info: DropInfo) {
+        if let target, state.splitDropTargetID == target.id { state.splitDropTargetID = nil }
+    }
+
+    func performDrop(info: DropInfo) -> Bool {
+        if let target, let dragged = state.draggingTab, state.splitDropTargetID == target.id, zone(info) == .split {
+            state.pair(dragged, with: target)
+        }
+        return endSidebarDrag(state)
+    }
+
+    /// The tabs (and, among pinned ones, folders) of the list the row is in, in order.
+    private var listIDs: [UUID] {
+        switch section {
+        case .favorites: state.favorites.map(\.id)
+        // Loose pinned tabs are placed among the folders, so they count in `pinnedItems`.
+        case .pinned: folder?.tabs.map(\.id) ?? space.pinnedItems.map(\.id)
+        case .tabs: space.tabs.map(\.id)
+        }
+    }
+
+    private func zone(_ info: DropInfo) -> Zone? {
+        guard target != nil, let axis else { return nil }
+        let length = axis == .vertical ? size.height : size.width
+        guard length > 0 else { return nil }
+        let fraction = (axis == .vertical ? info.location.y : info.location.x) / length
+        if fraction > 0.3, fraction < 0.7, pairedWith == nil, let dragged = state.draggingTab, let target,
+           state.canPair(dragged, with: target) {
+            return .split
+        }
+        return fraction < 0.5 ? .before : .after
+    }
+
+    /// Outlines the row for a split, or puts the dragged tab just before or after it.
+    private func update(_ dragged: Tab, _ info: DropInfo) {
+        guard let target, let zone = zone(info) else { return }
+        if zone == .split {
+            if state.splitDropTargetID != target.id { state.splitDropTargetID = target.id }
+            return
+        }
+        if state.splitDropTargetID == target.id { state.splitDropTargetID = nil }
+        let ids = listIDs
+        var others = ids.filter { $0 != dragged.id }
+        // A split row stands for both its tabs: "after" goes past the second.
+        let second = pairedWith.flatMap { p in others.contains(p.id) ? p : nil }
+        let anchor = zone == .before ? target : (second ?? target)
+        guard let i = others.firstIndex(of: anchor.id) else { return }
+        let index = zone == .before ? i : i + 1
+        others.insert(dragged.id, at: index)
+        // Already there: moving it again would only shuffle the rows under the pointer.
+        guard others != ids else { return }
+        move(dragged, at: index)
+    }
+
+    private func move(_ dragged: Tab, at index: Int) {
+        // A tab dragged to a new place in the list leaves its split.
+        if state.spaces.contains(where: { $0.split?.contains(dragged.id) == true }) { state.leaveSplit(dragged) }
+        state.move(dragged, to: section, in: space, folder: folder, at: index)
+    }
+}
+
+/// Makes a tab row a drop target that knows its own size, so a tab dropped on its middle can
+/// pair with it in a split (see `TabDropDelegate`), and outlines it while that would happen.
+struct TabDropTarget: ViewModifier {
+    @Environment(BrowserState.self) private var state
+    @Environment(\.accent) private var accent
+    let tab: Tab
+    let section: TabSection
+    let space: Space
+    var folder: Folder? = nil
+    let axis: Axis
+    var cornerRadius: CGFloat = 10
+    var pairedWith: Tab? = nil
+    @State private var size: CGSize = .zero
+
+    func body(content: Content) -> some View {
+        let outlined = state.splitDropTargetID == tab.id
+        content
+            .overlay {
+                let shape = RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                shape.fill(accent.opacity(outlined ? 0.14 : 0))
+                    .overlay(shape.strokeBorder(accent.opacity(outlined ? 0.9 : 0), lineWidth: 2))
+                    .overlay(alignment: axis == .vertical ? .trailing : .topTrailing) {
+                        if outlined {
+                            Image(systemName: "rectangle.split.2x1.fill")
+                                .font(.system(size: 10, weight: .semibold))
+                                .foregroundStyle(accent)
+                                .padding(axis == .vertical ? 8 : 4)
+                                .transition(.scale.combined(with: .opacity))
+                        }
+                    }
+                    .allowsHitTesting(false)
+                    .animation(Motion.quick, value: outlined)
+            }
+            .onGeometryChange(for: CGSize.self) { $0.size } action: { size = $0 }
+            .onDrop(of: [.text], delegate: TabDropDelegate(
+                target: tab, section: section, space: space, folder: folder, state: state,
+                axis: axis, size: size, pairedWith: pairedWith
+            ))
+    }
 }
 
 // MARK: - Bottom bar
@@ -1117,26 +1624,30 @@ struct BottomBar: View {
 
             Spacer(minLength: 4)
 
-            HStack(spacing: 2) {
-                ForEach(Array(state.spaces.enumerated()), id: \.element.id) { index, space in
-                    SpaceSwitcherButton(space: space, index: index)
+            if state.isPrivate {
+                IncognitoBadge()
+            } else {
+                HStack(spacing: 2) {
+                    ForEach(Array(state.spaces.enumerated()), id: \.element.id) { index, space in
+                        SpaceSwitcherButton(space: space, index: index)
+                    }
                 }
+                .animation(Motion.snappy, value: state.currentSpaceIndex)
             }
-            .animation(Motion.snappy, value: state.currentSpaceIndex)
 
             Spacer(minLength: 4)
 
             Menu {
-                Button("New Space") { state.addSpace() }
+                if !state.isPrivate { Button("New Space") { state.addSpace() } }
                 Button("New Folder") { state.addFolder() }
                 Button("New Tab") { state.openCommandBar(.newTab) }
+                Button("New Incognito Window") { AppDelegate.shared?.openIncognitoWindow() }
                 Divider()
-                Button("Extensions…") { AppDelegate.shared?.showSettings(tab: .extensions) }
-                Button("Settings…") { AppDelegate.shared?.showSettings(tab: .general) }
+                if !state.isPrivate { Button("Extensions…") { AppDelegate.shared?.showSettings(tab: .extensions) } }
+                Button("Settings…") { AppDelegate.shared?.showSettings() }
             } label: {
                 Image(systemName: "plus")
                     .font(.system(size: 14, weight: .semibold))
-                    .foregroundStyle(.primary.opacity(0.62))
                     .frame(width: 28, height: 28)
                     .contentShape(Rectangle())
             }
@@ -1144,10 +1655,29 @@ struct BottomBar: View {
             .buttonStyle(.plain)
             .menuIndicator(.hidden)
             .fixedSize()
+            .modifier(HoverPlate())
             .help("New Space, Settings…")
         }
         .padding(.horizontal, 10)
         .frame(height: 40)
+    }
+}
+
+/// The soft rounded square behind an icon button on hover, for controls (like a `Menu`) that
+/// can't be an `IconButton`.
+struct HoverPlate: ViewModifier {
+    var cornerRadius: CGFloat = 8
+    @State private var hovering = false
+
+    func body(content: Content) -> some View {
+        content
+            .foregroundStyle(.primary.opacity(hovering ? 0.95 : 0.62))
+            .background(
+                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                    .fill(.primary.opacity(hovering ? 0.1 : 0))
+            )
+            .onHover { hovering = $0 }
+            .animation(.easeOut(duration: 0.15), value: hovering)
     }
 }
 
@@ -1375,11 +1905,16 @@ struct DownloadRow: View {
             Spacer(minLength: 0)
             switch item.state {
             case .running:
-                IconButton(symbol: "xmark", size: 10, side: 22, help: "Cancel") { downloads.cancel(item) }
+                IconButton(symbol: "xmark", size: 10, side: 22, help: "Stop") { downloads.cancel(item) }
             case .finished:
                 IconButton(symbol: "magnifyingglass", size: 11, side: 22, help: "Show in Finder") { downloads.reveal(item) }
             case .failed:
-                EmptyView()
+                if downloads.canRetry(item) {
+                    IconButton(
+                        symbol: "arrow.clockwise", size: 11, side: 22,
+                        help: item.resumeData != nil ? "Resume" : "Try Again"
+                    ) { downloads.retry(item) }
+                }
             }
         }
         .padding(.horizontal, 8)

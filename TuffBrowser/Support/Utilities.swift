@@ -280,11 +280,15 @@ struct OutlineShadow: NSViewRepresentable {
     var radius: CGFloat
     var x: CGFloat = 0
     var y: CGFloat = 0
+    /// Only outside the outline: for a see-through card (a blurred material), which would
+    /// otherwise show — and blur — its own shadow through itself.
+    var hollow = false
 
     func makeNSView(context: Context) -> ShadowView { ShadowView() }
 
     func updateNSView(_ view: ShadowView, context: Context) {
         view.cornerRadius = cornerRadius
+        view.hollowReach = hollow ? radius * 3 + abs(x) + abs(y) : nil
         guard let layer = view.layer else { return }
         layer.shadowColor = NSColor.black.withAlphaComponent(opacity).cgColor
         layer.shadowOpacity = 1
@@ -295,6 +299,9 @@ struct OutlineShadow: NSViewRepresentable {
 
     final class ShadowView: NSView {
         var cornerRadius: CGFloat = 0 { didSet { if cornerRadius != oldValue { updatePath() } } }
+        /// How far the shadow can reach past the outline, when its inside is cut away; nil for
+        /// a solid shadow.
+        var hollowReach: CGFloat? { didSet { if hollowReach != oldValue { updatePath() } } }
 
         override init(frame frameRect: NSRect) {
             super.init(frame: frameRect)
@@ -321,7 +328,21 @@ struct OutlineShadow: NSViewRepresentable {
         private func updatePath() {
             CATransaction.begin()
             CATransaction.setDisableActions(true)
-            layer?.shadowPath = RoundedRectangle(cornerRadius: cornerRadius, style: .continuous).path(in: bounds).cgPath
+            let outline = RoundedRectangle(cornerRadius: cornerRadius, style: .continuous).path(in: bounds).cgPath
+            layer?.shadowPath = outline
+            if let reach = hollowReach {
+                // Everything around the card, and nothing inside it.
+                let mask = (layer?.mask as? CAShapeLayer) ?? CAShapeLayer()
+                let path = CGMutablePath()
+                path.addRect(bounds.insetBy(dx: -reach, dy: -reach))
+                path.addPath(outline)
+                mask.path = path
+                mask.fillRule = .evenOdd
+                mask.frame = bounds
+                layer?.mask = mask
+            } else {
+                layer?.mask = nil
+            }
             CATransaction.commit()
         }
     }
@@ -337,12 +358,19 @@ struct CardShadow: ViewModifier {
     var x: CGFloat = 0
     var y: CGFloat = 0
     var solid = true
+    /// No shadow at all (the Seamless background's flat page).
+    var enabled = true
+    /// Drawn only outside the outline, for a card with a see-through material (see
+    /// `OutlineShadow.hollow`). Keeps the shadow off the live backdrop, which `.shadow` isn't.
+    var hollow = false
 
     func body(content: Content) -> some View {
         // Two branches rather than one `.shadow` with its colour switched to clear: SwiftUI
         // keeps a clear shadow on the layer, and the render server still has to derive it.
-        if solid {
-            content.background { OutlineShadow(cornerRadius: cornerRadius, opacity: opacity, radius: radius, x: x, y: y) }
+        if !enabled {
+            content
+        } else if solid {
+            content.background { OutlineShadow(cornerRadius: cornerRadius, opacity: opacity, radius: radius, x: x, y: y, hollow: hollow) }
         } else {
             content.shadow(color: .black.opacity(opacity), radius: radius, x: x, y: y)
         }

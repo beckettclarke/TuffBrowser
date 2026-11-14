@@ -11,19 +11,53 @@ struct HistoryEntry: Codable {
     var visits: Int
 }
 
-/// A small in-memory history index, persisted as JSON. Used for command bar suggestions.
+/// A small in-memory history index, persisted as JSON. Used for command bar suggestions and
+/// the History page (tuff://history), and filled by imports from other browsers.
+///
+/// The file is read on a background queue at launch, so a long history (an import can bring
+/// tens of thousands of pages) doesn't block the first page. Visits recorded before it is in
+/// are merged with it; anything that needs the whole history first calls `ensureLoaded()`.
 final class HistoryStore {
     static let shared = HistoryStore()
 
     private var entries: [String: HistoryEntry] = [:]
     private let file = Paths.appSupport.appendingPathComponent("history.json")
     private let saver = Debouncer(delay: 3)
-    private let limit = 8000
+    private let limit = 20000
+    private var loaded = false
 
     private init() {
-        if let data = try? Data(contentsOf: file),
-           let list = try? JSONDecoder().decode([HistoryEntry].self, from: data) {
-            for e in list { entries[e.url.absoluteString] = e }
+        let file = self.file
+        DispatchQueue.global(qos: .userInitiated).async {
+            let list = Self.read(file)
+            DispatchQueue.main.async { self.absorb(list) }
+        }
+    }
+
+    private static func read(_ file: URL) -> [HistoryEntry] {
+        guard let data = try? Data(contentsOf: file) else { return [] }
+        return (try? JSONDecoder().decode([HistoryEntry].self, from: data)) ?? []
+    }
+
+    /// Reads the file now if the background read hasn't finished yet.
+    private func ensureLoaded() {
+        guard !loaded else { return }
+        absorb(Self.read(file))
+    }
+
+    /// Takes in the history read from disk, keeping what was recorded in the meantime.
+    private func absorb(_ list: [HistoryEntry]) {
+        guard !loaded else { return }
+        loaded = true
+        for old in list {
+            let key = old.url.absoluteString
+            if var e = entries[key] {
+                e.visits += old.visits
+                if e.title.isEmpty { e.title = old.title }
+                entries[key] = e
+            } else {
+                entries[key] = old
+            }
         }
     }
 
@@ -52,6 +86,128 @@ final class HistoryStore {
         }
     }
 
+    /// Gives a page already in history the title it settled on. Single-page apps change their
+    /// title after their address, so the visit is recorded with the old one first.
+    func updateTitle(url: URL, title: String) {
+        let key = url.absoluteString
+        guard !title.isEmpty, var e = entries[key], e.title != title else { return }
+        e.title = title
+        entries[key] = e
+        saver.schedule { [weak self] in self?.saveNow() }
+    }
+
+    /// Adds history brought over from another browser. A page already here keeps the later
+    /// visit and the higher count, so importing the same browser twice doesn't double anything.
+    /// Returns how many pages were new.
+    @discardableResult
+    func merge(_ imported: [HistoryEntry]) -> Int {
+        ensureLoaded()
+        var added = 0
+        for item in imported {
+            guard let scheme = item.url.scheme?.lowercased(), scheme == "http" || scheme == "https" else { continue }
+            let key = item.url.absoluteString
+            if var e = entries[key] {
+                if item.lastVisit > e.lastVisit {
+                    e.lastVisit = item.lastVisit
+                    if !item.title.isEmpty { e.title = item.title }
+                }
+                e.visits = max(e.visits, item.visits)
+                if e.title.isEmpty { e.title = item.title }
+                entries[key] = e
+            } else {
+                entries[key] = item
+                added += 1
+            }
+        }
+        saveNow()
+        return added
+    }
+
+    /// What the History page is showing: a search, one site, a stretch of time, or all of them.
+    struct Filter {
+        var query = ""
+        /// A site as `URL.displayHost` gives it (no "www.").
+        var host: String?
+        var start: Date?
+        var end: Date?
+
+        func matches(_ e: HistoryEntry, words: [String]) -> Bool {
+            if let start, e.lastVisit < start { return false }
+            if let end, e.lastVisit > end { return false }
+            if let host, e.url.displayHost.lowercased() != host { return false }
+            guard !words.isEmpty else { return true }
+            let haystack = e.title.lowercased() + " " + e.url.absoluteString.lowercased()
+            return words.allSatisfy { haystack.contains($0) }
+        }
+    }
+
+    /// One page of the History page's list: newest first, filtered. Every word of the query has
+    /// to appear in the title or the address.
+    func browse(_ filter: Filter, offset: Int, limit: Int) -> (items: [HistoryEntry], total: Int) {
+        ensureLoaded()
+        let words = filter.query.lowercased().split(whereSeparator: \.isWhitespace).map(String.init)
+        var list = entries.values.filter { filter.matches($0, words: words) }
+        list.sort { $0.lastVisit > $1.lastVisit }
+        let start = min(max(0, offset), list.count)
+        let end = min(list.count, start + max(0, limit))
+        return (Array(list[start..<end]), list.count)
+    }
+
+    /// For the History page's sidebar: how many pages fall in each named stretch of time, and
+    /// the sites visited most.
+    func overview(ranges: [String: (start: Date, end: Date)], siteLimit: Int) -> (total: Int, counts: [String: Int], sites: [(host: String, pages: Int, visits: Int)]) {
+        ensureLoaded()
+        var counts = ranges.mapValues { _ in 0 }
+        var sites: [String: (pages: Int, visits: Int)] = [:]
+        for e in entries.values {
+            for (name, range) in ranges where e.lastVisit >= range.start && e.lastVisit <= range.end {
+                counts[name, default: 0] += 1
+            }
+            let host = e.url.displayHost.lowercased()
+            let old = sites[host] ?? (0, 0)
+            sites[host] = (old.pages + 1, old.visits + e.visits)
+        }
+        let top = sites.sorted { $0.value.visits != $1.value.visits ? $0.value.visits > $1.value.visits : $0.key < $1.key }
+            .prefix(siteLimit)
+            .map { (host: $0.key, pages: $0.value.pages, visits: $0.value.visits) }
+        return (entries.count, counts, Array(top))
+    }
+
+    /// Removes every page from one site (`URL.displayHost`). Returns how many went.
+    @discardableResult
+    func deleteHost(_ host: String) -> Int {
+        ensureLoaded()
+        let host = host.lowercased()
+        let urls = entries.values.filter { $0.url.displayHost.lowercased() == host }.map(\.url)
+        delete(urls)
+        return urls.count
+    }
+
+    /// Removes these pages, for the History page's delete buttons.
+    func delete(_ urls: [URL]) {
+        ensureLoaded()
+        let keys = urls.map(\.absoluteString).filter { entries[$0] != nil }
+        guard !keys.isEmpty else { return }
+        keys.forEach { entries.removeValue(forKey: $0) }
+        saver.schedule { [weak self] in self?.saveNow() }
+        ExtensionEventPush.shared.emit("history.onVisitRemoved", args: [["allHistory": false, "urls": keys]])
+    }
+
+    /// The site to complete a partly typed address to, inline in the command bar: the most
+    /// visited host (without "www.") that starts with what was typed. Only for something that
+    /// could be the start of a host (no spaces or slashes).
+    func hostCompletion(for typed: String) -> String? {
+        let prefix = typed.lowercased()
+        guard !prefix.isEmpty, !prefix.contains(" "), !prefix.contains("/"), !prefix.contains(":") else { return nil }
+        var visits: [String: Int] = [:]
+        for e in entries.values {
+            let host = e.url.displayHost.lowercased()
+            guard host.count > prefix.count, host.hasPrefix(prefix) else { continue }
+            visits[host, default: 0] += e.visits
+        }
+        return visits.max { $0.value != $1.value ? $0.value < $1.value : $0.key > $1.key }?.key
+    }
+
     func search(_ query: String, limit: Int = 4) -> [HistoryEntry] {
         let q = query.lowercased().trimmed
         guard !q.isEmpty else { return [] }
@@ -76,15 +232,22 @@ final class HistoryStore {
         return scored.sorted { $0.0 > $1.0 }.prefix(limit).map(\.1)
     }
 
-    var count: Int { entries.count }
+    var count: Int {
+        ensureLoaded()
+        return entries.count
+    }
 
     func clear(synchronously: Bool = false) {
+        // Whatever is still on disk is about to go anyway.
+        loaded = true
         entries.removeAll()
         saveNow(synchronously: synchronously)
         ExtensionEventPush.shared.emit("history.onVisitRemoved", args: [["allHistory": true, "urls": [String]()]])
     }
 
     func saveNow(synchronously: Bool = false) {
+        // Writing before the file was read would replace it with only this run's visits.
+        ensureLoaded()
         var list = Array(entries.values)
         if list.count > limit {
             list.sort { $0.lastVisit > $1.lastVisit }
@@ -101,13 +264,15 @@ final class HistoryStore {
 
     /// Most-visited pages, for `chrome.topSites.get`.
     func topSites(limit: Int = 20) -> [[String: Any]] {
-        entries.values.sorted { $0.visits > $1.visits }
+        ensureLoaded()
+        return entries.values.sorted { $0.visits > $1.visits }
             .prefix(limit)
             .map { ["url": $0.url.absoluteString, "title": $0.title] }
     }
 
     /// `chrome.history.search`: text match over url / title within a time range, newest first.
     func chromeSearch(text: String, startTime: Double?, endTime: Double?, maxResults: Int) -> [[String: Any]] {
+        ensureLoaded()
         let q = text.lowercased().trimmed
         let start = startTime.map { Date(timeIntervalSince1970: $0 / 1000) } ?? .distantPast
         let end = endTime.map { Date(timeIntervalSince1970: $0 / 1000) } ?? .distantFuture
@@ -125,6 +290,7 @@ final class HistoryStore {
     /// `chrome.history.getVisits`. The store keeps aggregates, not a per-visit log, so report the
     /// last visit as a single entry.
     func chromeVisits(for url: URL) -> [[String: Any]] {
+        ensureLoaded()
         guard let e = entries[url.absoluteString] else { return [] }
         return [[
             "id": e.url.absoluteString,
@@ -147,12 +313,14 @@ final class HistoryStore {
     }
 
     func deleteUrl(_ url: URL) {
+        ensureLoaded()
         entries.removeValue(forKey: url.absoluteString)
         saver.schedule { [weak self] in self?.saveNow() }
         ExtensionEventPush.shared.emit("history.onVisitRemoved", args: [["allHistory": false, "urls": [url.absoluteString]]])
     }
 
     func deleteRange(startTime: Double, endTime: Double) {
+        ensureLoaded()
         let start = Date(timeIntervalSince1970: startTime / 1000)
         let end = Date(timeIntervalSince1970: endTime / 1000)
         let removed = entries.filter { $0.value.lastVisit >= start && $0.value.lastVisit <= end }.map { $0.key }
@@ -170,6 +338,11 @@ final class FaviconStore {
     static let shared = FaviconStore()
 
     private let memory = NSCache<NSString, NSImage>()
+    /// When each host's icon was last fetched this run, so every page load on a site doesn't
+    /// download its icon again.
+    private var fetched: [String: Date] = [:]
+    /// How long an icon is trusted before a page load checks for a new one.
+    private static let refreshAfter: TimeInterval = 24 * 3600
     private let dir: URL
     private let session: URLSession
 
@@ -190,6 +363,14 @@ final class FaviconStore {
     private func file(for key: String) -> URL {
         let safe = key.replacingOccurrences(of: "/", with: "_").replacingOccurrences(of: ":", with: "_")
         return dir.appendingPathComponent(safe + ".png")
+    }
+
+    /// The cached icon file for a host, if there is one: already a PNG, so it can be served as is.
+    func cachedIconFile(forHost host: String) -> URL? {
+        let key = host.lowercased()
+        guard !key.isEmpty else { return nil }
+        let file = file(for: key)
+        return FileManager.default.fileExists(atPath: file.path) ? file : nil
     }
 
     /// Synchronous lookup in the memory and disk caches only.
@@ -222,10 +403,15 @@ final class FaviconStore {
     """
 
     /// Finds the page's declared icon (falling back to /favicon.ico), downloads and caches it.
-    func fetchIcon(from webView: WKWebView, completion: @escaping (NSImage?) -> Void) {
+    /// `persist: false` (Incognito) keeps the icon in memory only, for this run of the app.
+    func fetchIcon(from webView: WKWebView, persist: Bool = true, completion: @escaping (NSImage?) -> Void) {
         guard let pageURL = webView.url, let key = key(for: pageURL),
               pageURL.scheme == "http" || pageURL.scheme == "https" else {
             completion(nil)
+            return
+        }
+        if let image = freshIcon(for: key, persist: persist) {
+            completion(image)
             return
         }
         webView.evaluateJavaScript(Self.iconScript) { [weak self] result, _ in
@@ -233,11 +419,35 @@ final class FaviconStore {
             var candidates: [URL] = []
             if let s = result as? String, let u = URL(string: s) { candidates.append(u) }
             if let fallback = URL(string: "/favicon.ico", relativeTo: pageURL)?.absoluteURL { candidates.append(fallback) }
-            self.download(candidates, key: key, completion: completion)
+            self.download(candidates, key: key, persist: persist, completion: completion)
         }
     }
 
-    private func download(_ candidates: [URL], key: String, completion: @escaping (NSImage?) -> Void) {
+    /// The cached icon for a site not open in any tab, else its /favicon.ico, downloaded and
+    /// cached (the command bar's bang chip uses it).
+    func icon(forHost host: String, completion: @escaping (NSImage?) -> Void) {
+        let key = host.lowercased()
+        guard !key.isEmpty, let site = URL(string: "https://" + key) else { return completion(nil) }
+        if let image = cachedIcon(for: site) { return completion(image) }
+        guard let url = URL(string: "https://\(key)/favicon.ico") else { return completion(nil) }
+        download([url], key: key, persist: true, completion: completion)
+    }
+
+    /// The cached icon for a host when it is recent enough not to fetch again: fetched earlier
+    /// this run, or (outside Incognito) saved to disk within `refreshAfter`.
+    private func freshIcon(for key: String, persist: Bool) -> NSImage? {
+        let now = Date()
+        if let date = fetched[key], now.timeIntervalSince(date) < Self.refreshAfter {
+            return memory.object(forKey: key as NSString)
+        }
+        guard persist,
+              let modified = try? file(for: key).resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate,
+              now.timeIntervalSince(modified) < Self.refreshAfter,
+              let image = cachedIcon(for: URL(string: "https://" + key) ?? file(for: key)) else { return nil }
+        return image
+    }
+
+    private func download(_ candidates: [URL], key: String, persist: Bool, completion: @escaping (NSImage?) -> Void) {
         guard let url = candidates.first else {
             DispatchQueue.main.async { completion(nil) }
             return
@@ -245,9 +455,9 @@ final class FaviconStore {
         let rest = Array(candidates.dropFirst())
         if url.scheme == "data" {
             if let data = try? Data(contentsOf: url), let image = NSImage(data: data), image.isValid {
-                store(image, key: key, completion: completion)
+                store(image, key: key, persist: persist, completion: completion)
             } else {
-                download(rest, key: key, completion: completion)
+                download(rest, key: key, persist: persist, completion: completion)
             }
             return
         }
@@ -255,19 +465,20 @@ final class FaviconStore {
             guard let self else { return }
             let ok = (response as? HTTPURLResponse).map { (200..<300).contains($0.statusCode) } ?? false
             if ok, let data, let image = NSImage(data: data), image.isValid, image.size.width > 0 {
-                self.store(image, key: key, completion: completion)
+                self.store(image, key: key, persist: persist, completion: completion)
             } else {
-                self.download(rest, key: key, completion: completion)
+                self.download(rest, key: key, persist: persist, completion: completion)
             }
         }.resume()
     }
 
-    private func store(_ image: NSImage, key: String, completion: @escaping (NSImage?) -> Void) {
+    private func store(_ image: NSImage, key: String, persist: Bool, completion: @escaping (NSImage?) -> Void) {
         DispatchQueue.main.async {
             let small = image.resized(to: 64)
             small.size = NSSize(width: 32, height: 32)
             self.memory.setObject(small, forKey: key as NSString)
-            if let png = small.pngData { try? png.write(to: self.file(for: key), options: .atomic) }
+            self.fetched[key] = Date()
+            if persist, let png = small.pngData { try? png.write(to: self.file(for: key), options: .atomic) }
             completion(small)
         }
     }
@@ -294,6 +505,17 @@ final class DownloadItem: Identifiable {
     /// When bytes started flowing (reset once the destination is chosen), and when it finished.
     var startedAt = Date()
     var finishedAt: Date?
+    /// Where this download goes: the Settings choice, or what the context menu item said.
+    @ObservationIgnored var saveLocation: DownloadManager.SaveLocation = .settings
+    /// The temporary file WebKit writes while replacing a file that is already there (WebKit
+    /// won't overwrite); it takes the destination's place once the download has finished.
+    @ObservationIgnored var partialFile: URL?
+    /// What WebKit kept of a stopped or failed download, so it can carry on where it left off.
+    var resumeData: Data?
+    /// From an Incognito window: never written to the saved downloads list.
+    @ObservationIgnored var isPrivate = false
+    /// The website data (cookies) the download was made with, for Retry.
+    @ObservationIgnored weak var dataStore: WKWebsiteDataStore?
     @ObservationIgnored var lastSampleBytes: Int64 = 0
     @ObservationIgnored var lastSampleTime: Date?
     @ObservationIgnored var download: WKDownload?
@@ -359,24 +581,31 @@ final class DownloadManager: NSObject {
         }
     }
 
-    func track(_ download: WKDownload, chromeID: Int? = nil, url: URL? = nil) {
-        download.delegate = self
+    /// Where a download is saved.
+    enum SaveLocation {
+        /// As Settings → Downloads says (ask, or the downloads folder).
+        case settings
+        /// Straight to the downloads folder, without asking (context menu "Download Image").
+        case downloadsFolder
+        /// Always asks for a name and place ("Save Image As…").
+        case ask
+    }
+
+    override init() {
+        super.init()
+        loadSaved()
+    }
+
+    func track(
+        _ download: WKDownload, chromeID: Int? = nil, url: URL? = nil, saveLocation: SaveLocation = .settings,
+        isPrivate: Bool = false
+    ) {
         let item = DownloadItem(filename: download.originalRequest?.url?.lastPathComponent ?? "Download")
-        item.download = download
+        item.saveLocation = saveLocation
         item.chromeID = chromeID ?? reserveChromeID()
         item.url = url ?? download.originalRequest?.url
-        // Observe the byte count rather than the fraction: with no Content-Length the fraction
-        // never moves, but bytes still arrive.
-        item.observation = download.progress.observe(\.completedUnitCount, options: [.new]) { [weak item] progress, _ in
-            let value = progress.fractionCompleted
-            let received = progress.completedUnitCount
-            let total = progress.totalUnitCount
-            DispatchQueue.main.async {
-                item?.fraction = value
-                item?.bytesReceived = received
-                item?.totalBytes = total
-            }
-        }
+        item.isPrivate = isPrivate
+        attach(download, to: item)
         items.insert(item, at: 0)
         ExtensionEventPush.shared.emit("downloads.onCreated", args: [[
             "id": item.chromeID ?? 0,
@@ -388,9 +617,8 @@ final class DownloadManager: NSObject {
             "paused": false,
         ]])
         pulse += 1
-        startSpeedSampling()
-        let state = BrowserState.shared
-        if AppSettings.shared.downloads.showPanelOnStart, state.sidebarVisible || state.sidebarPeeking {
+        let state = BrowserState.active
+        if AppSettings.shared.downloads.showPanelOnStart, state.downloadsButtonShowing {
             state.downloadsVisible = true
         }
     }
@@ -405,14 +633,53 @@ final class DownloadManager: NSObject {
         items.first { $0.download === download }
     }
 
+    /// Hands a WebKit download to an item (a new one, or one being retried / resumed) and
+    /// follows its progress.
+    func attach(_ download: WKDownload, to item: DownloadItem) {
+        download.delegate = self
+        item.download = download
+        item.dataStore = download.webView?.configuration.websiteDataStore ?? item.dataStore
+        item.state = .running
+        item.resumeData = nil
+        item.lastSampleTime = nil
+        item.bytesPerSecond = nil
+        // Observe the byte count rather than the fraction: with no Content-Length the fraction
+        // never moves, but bytes still arrive.
+        item.observation = download.progress.observe(\.completedUnitCount, options: [.new]) { [weak item] progress, _ in
+            let value = progress.fractionCompleted
+            let received = progress.completedUnitCount
+            let total = progress.totalUnitCount
+            DispatchQueue.main.async {
+                item?.fraction = value
+                item?.bytesReceived = received
+                item?.totalBytes = total
+            }
+        }
+        startSpeedSampling()
+    }
+
+    /// Stops a download, keeping what has arrived when the server allows it, so Resume can carry on.
     func cancel(_ item: DownloadItem) {
-        item.download?.cancel { _ in }
+        let download = item.download
         item.state = .failed("Cancelled")
         item.download = nil
+        item.observation = nil
+        guard let download else { Self.discardPartialFile(of: item); scheduleSave(); return }
+        download.cancel { [weak self, weak item] data in
+            DispatchQueue.main.async {
+                guard let item else { return }
+                item.resumeData = data
+                if data == nil { Self.discardPartialFile(of: item) }
+                self?.scheduleSave()
+            }
+        }
     }
 
     func clearFinished() {
+        let gone = items.filter { $0.state != .running }
+        gone.forEach(Self.discardIncompleteFile)
         items.removeAll { $0.state != .running }
+        scheduleSave()
     }
 
     func reveal(_ item: DownloadItem) {
@@ -420,18 +687,31 @@ final class DownloadManager: NSObject {
         NSWorkspace.shared.activateFileViewerSelecting([url])
     }
 
-    private static func uniqueDestination(for filename: String) -> URL {
+    /// Deletes what a download that was replacing a file had written so far.
+    fileprivate static func discardPartialFile(of item: DownloadItem) {
+        guard let temp = item.partialFile else { return }
+        item.partialFile = nil
+        try? FileManager.default.removeItem(at: temp)
+    }
+
+    static func uniqueDestination(for filename: String) -> URL {
         var downloads = AppSettings.shared.downloads.folder
         var isDirectory: ObjCBool = false
         if !FileManager.default.fileExists(atPath: downloads.path, isDirectory: &isDirectory) || !isDirectory.boolValue {
             downloads = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask)[0]
         }
-        let clean = filename.replacingOccurrences(of: "/", with: "_")
+        var clean = filename.replacingOccurrences(of: "/", with: "_").replacingOccurrences(of: ":", with: "_")
+        // No name (or only dots and spaces, which would make a hidden or empty one): "Download".
+        while clean.first == "." || clean.first?.isWhitespace == true { clean.removeFirst() }
+        clean = clean.trimmed
+        if clean.isEmpty { clean = "Download" }
         let base = (clean as NSString).deletingPathExtension
         let ext = (clean as NSString).pathExtension
         var candidate = downloads.appendingPathComponent(clean)
         var n = 2
-        while FileManager.default.fileExists(atPath: candidate.path) {
+        // Downloads still running hold their names too: their files may not exist yet.
+        let taken = Set(shared.items.filter { $0.state == .running }.compactMap { $0.destination?.standardizedFileURL.path })
+        while FileManager.default.fileExists(atPath: candidate.path) || taken.contains(candidate.standardizedFileURL.path) {
             let name = ext.isEmpty ? "\(base) \(n)" : "\(base) \(n).\(ext)"
             candidate = downloads.appendingPathComponent(name)
             n += 1
@@ -452,9 +732,24 @@ extension DownloadManager: WKDownloadDelegate {
             item?.destination = url
             // Time spent in the save panel isn't download time.
             item?.startedAt = Date()
-            completionHandler(url)
+            // Replacing a file (the save panel asked first): WebKit won't overwrite one, so the
+            // download goes to a temporary name beside it and replaces it only once it has
+            // finished. A download that fails or is cancelled leaves the old file as it was.
+            if FileManager.default.fileExists(atPath: url.path) {
+                let temp = url.deletingLastPathComponent()
+                    .appendingPathComponent(".\(url.lastPathComponent).\(UUID().uuidString.prefix(8)).download")
+                item?.partialFile = temp
+                completionHandler(temp)
+            } else {
+                completionHandler(url)
+            }
         }
-        guard AppSettings.shared.downloads.askWhereToSave else {
+        let asks = switch item?.saveLocation ?? .settings {
+        case .settings: AppSettings.shared.downloads.askWhereToSave
+        case .downloadsFolder: false
+        case .ask: true
+        }
+        guard asks else {
             accept(destination)
             return
         }
@@ -464,8 +759,6 @@ extension DownloadManager: WKDownloadDelegate {
         panel.canCreateDirectories = true
         let finish: (NSApplication.ModalResponse) -> Void = { response in
             if response == .OK, let url = panel.url {
-                // The save panel already asked about replacing; WebKit won't overwrite.
-                try? FileManager.default.removeItem(at: url)
                 accept(url)
             } else {
                 item?.state = .failed("Cancelled")
@@ -474,7 +767,7 @@ extension DownloadManager: WKDownloadDelegate {
                 completionHandler(nil)
             }
         }
-        if let window = BrowserState.shared.window {
+        if let window = BrowserState.active.window {
             panel.beginSheetModal(for: window, completionHandler: finish)
         } else {
             finish(panel.runModal())
@@ -483,6 +776,18 @@ extension DownloadManager: WKDownloadDelegate {
 
     func downloadDidFinish(_ download: WKDownload) {
         guard let item = item(for: download) else { return }
+        if let temp = item.partialFile, let destination = item.destination {
+            item.partialFile = nil
+            do {
+                _ = try FileManager.default.replaceItemAt(destination, withItemAt: temp)
+            } catch {
+                try? FileManager.default.removeItem(at: temp)
+                item.state = .failed("Couldn’t replace \(destination.lastPathComponent)")
+                item.download = nil
+                item.observation = nil
+                return
+            }
+        }
         item.fraction = 1
         item.finishedAt = Date()
         // The file on disk is the truth; fall back to what the progress counted.
@@ -493,6 +798,8 @@ extension DownloadManager: WKDownloadDelegate {
         item.state = .finished
         item.download = nil
         item.observation = nil
+        item.resumeData = nil
+        scheduleSave()
         if let id = item.chromeID {
             ExtensionEventPush.shared.emit("downloads.onChanged", args: [["id": id, "state": ["current": "complete", "previous": "in_progress"]]])
         }
@@ -510,9 +817,13 @@ extension DownloadManager: WKDownloadDelegate {
 
     func download(_ download: WKDownload, didFailWithError error: Error, resumeData: Data?) {
         guard let item = item(for: download) else { return }
+        // With resume data the partial file is what Resume carries on from.
+        if resumeData == nil { Self.discardPartialFile(of: item) }
+        item.resumeData = resumeData
         item.state = .failed(error.localizedDescription)
         item.download = nil
         item.observation = nil
+        scheduleSave()
         if let id = item.chromeID {
             ExtensionEventPush.shared.emit("downloads.onChanged", args: [["id": id, "state": ["current": "interrupted", "previous": "in_progress"]]])
         }

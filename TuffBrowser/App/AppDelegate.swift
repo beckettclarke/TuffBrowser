@@ -6,8 +6,13 @@ import WebKit
 final class AppDelegate: NSObject {
     private(set) static weak var shared: AppDelegate?
 
-    let state = BrowserState.shared
+    /// The main window's state: the session that is saved and restored.
+    let mainState = BrowserState.shared
+    /// The state menu commands act on: the browser window in front, Incognito or not.
+    var state: BrowserState { BrowserState.active }
     private var windowController: BrowserWindowController?
+    /// Open Incognito windows. Each has its own state, dropped when it closes.
+    private var incognitoControllers: [BrowserWindowController] = []
     private var settingsWindow: SettingsWindowController?
     private let updater = UpdateController()
     /// The quit card on screen, if any.
@@ -28,10 +33,40 @@ final class AppDelegate: NSObject {
 
     func showMainWindow() {
         if windowController == nil {
-            windowController = BrowserWindowController(state: state)
+            windowController = BrowserWindowController(state: mainState)
         }
         windowController?.show()
         NSApp.activate(ignoringOtherApps: true)
+    }
+
+    /// Opens a new Incognito window, with the command bar up to type where to go.
+    @discardableResult
+    func openIncognitoWindow(url: URL? = nil) -> BrowserState {
+        let incognito = BrowserState.makeIncognito()
+        let controller = BrowserWindowController(state: incognito)
+        controller.onClose = { [weak self, weak controller] in
+            incognito.tearDownAll()
+            self?.incognitoControllers.removeAll { $0 === controller }
+            // Site permissions answered in Incognito last only while some Incognito window is open.
+            if self?.incognitoControllers.isEmpty ?? true {
+                SitePermissions.shared.forgetIncognito()
+                SiteSettings.shared.forgetIncognito()
+            }
+        }
+        incognitoControllers.append(controller)
+        controller.show()
+        NSApp.activate(ignoringOtherApps: true)
+        if let url {
+            incognito.newTab(url: url)
+        } else {
+            incognito.openCommandBar(.newTab)
+        }
+        return incognito
+    }
+
+    /// Brings a browser window forward if none is: the main one.
+    private func ensureBrowserWindow() {
+        if BrowserState.active === mainState { showMainWindow() }
     }
 
     /// The Settings window, if it is on screen (prompts raised from Settings are drawn in it).
@@ -39,8 +74,9 @@ final class AppDelegate: NSObject {
         settingsWindow.map(\.window).flatMap { $0.isVisible ? $0 : nil }
     }
 
-    func showSettings(tab: SettingsTab) {
-        if settingsWindow == nil { settingsWindow = SettingsWindowController(state: state) }
+    /// Opens Settings at `tab`, or with nil, at the page you last had open.
+    func showSettings(tab: SettingsTab? = nil) {
+        if settingsWindow == nil { settingsWindow = SettingsWindowController(state: mainState) }
         settingsWindow?.show(tab)
         NSApp.activate(ignoringOtherApps: true)
     }
@@ -48,32 +84,35 @@ final class AppDelegate: NSObject {
     // MARK: Menu actions
 
     @objc func showAbout(_ sender: Any?) { showSettings(tab: .about) }
-    @objc func showSettingsWindow(_ sender: Any?) { showSettings(tab: .general) }
+    @objc func showSettingsWindow(_ sender: Any?) { showSettings() }
     @objc func showExtensions(_ sender: Any?) { showSettings(tab: .extensions) }
     @objc func checkForUpdates(_ sender: Any?) { updater.checkForUpdates() }
     @objc func showBrowserWindow(_ sender: Any?) { showMainWindow() }
 
     @objc func newTab(_ sender: Any?) {
-        showMainWindow()
+        ensureBrowserWindow()
         state.openCommandBar(.newTab)
     }
 
+    @objc func newIncognitoWindow(_ sender: Any?) { openIncognitoWindow() }
+
     @objc func openLocation(_ sender: Any?) {
-        showMainWindow()
+        ensureBrowserWindow()
         state.openCommandBar(.editCurrent)
     }
 
     @objc func newSpace(_ sender: Any?) {
-        showMainWindow()
+        ensureBrowserWindow()
         state.addSpace()
     }
 
     @objc func newFolder(_ sender: Any?) {
-        showMainWindow()
+        ensureBrowserWindow()
         state.addFolder()
     }
 
     @objc func closeTab(_ sender: Any?) {
+        let state = self.state
         // ⌘W closes whichever auxiliary window is in front (Settings, inspector), else the tab.
         if let key = NSApp.keyWindow, key !== state.window {
             key.performClose(sender)
@@ -87,11 +126,26 @@ final class AppDelegate: NSObject {
     @objc func reopenClosedTab(_ sender: Any?) { state.reopenClosedTab() }
     @objc func toggleSidebar(_ sender: Any?) { state.toggleSidebar() }
     @objc func toggleSidePanel(_ sender: Any?) { SidePanelManager.shared.toggleLast() }
+
+    // MARK: Split view
+
+    /// ⌘\: opens a page beside this one, or goes back to one page.
+    @objc func toggleSplit(_ sender: Any?) { state.toggleSplit() }
+    /// ⌥⌘\: gives the keyboard to the other side.
+    @objc func focusOtherSplitSide(_ sender: Any?) { state.focusOtherSplitSide() }
+    @objc func swapSplitSides(_ sender: Any?) { state.swapSplitSides() }
     @objc func reload(_ sender: Any?) { state.selectedTab?.reload() }
     @objc func reloadFromOrigin(_ sender: Any?) { state.selectedTab?.reload(fromOrigin: true) }
     @objc func stopLoading(_ sender: Any?) { state.selectedTab?.stop() }
     @objc func goBack(_ sender: Any?) { state.selectedTab?.goBack() }
     @objc func goForward(_ sender: Any?) { state.selectedTab?.goForward() }
+
+    @objc func showHistory(_ sender: Any?) {
+        ensureBrowserWindow()
+        state.showHistory()
+    }
+
+    @objc func showImport(_ sender: Any?) { showSettings(tab: .importData) }
     @objc func copyLink(_ sender: Any?) { state.copyCurrentURL() }
     @objc func nextTab(_ sender: Any?) { state.selectAdjacentTab(offset: 1) }
     @objc func previousTab(_ sender: Any?) { state.selectAdjacentTab(offset: -1) }
@@ -113,15 +167,20 @@ final class AppDelegate: NSObject {
 
     @objc func zoomIn(_ sender: Any?) {
         guard let tab = state.selectedTab else { return }
+        if let pdf = tab.pdf, pdf.isReady { pdf.zoomIn(); return }
         tab.setZoom(tab.pageZoom * 1.1)
     }
 
     @objc func zoomOut(_ sender: Any?) {
         guard let tab = state.selectedTab else { return }
+        if let pdf = tab.pdf, pdf.isReady { pdf.zoomOut(); return }
         tab.setZoom(tab.pageZoom / 1.1)
     }
 
-    @objc func zoomReset(_ sender: Any?) { state.selectedTab?.setZoom(CGFloat(AppSettings.shared.advanced.defaultZoom)) }
+    @objc func zoomReset(_ sender: Any?) {
+        if let pdf = state.selectedTab?.pdf, pdf.isReady { pdf.setZoom(.auto); return }
+        state.selectedTab?.setZoom(CGFloat(AppSettings.shared.advanced.defaultZoom))
+    }
 
     @objc func togglePin(_ sender: Any?) {
         guard let tab = state.selectedTab, let section = state.section(of: tab) else { return }
@@ -142,10 +201,81 @@ final class AppDelegate: NSObject {
     @objc func selectSpaceByNumber(_ sender: NSMenuItem) { state.switchSpace(to: sender.tag - 1) }
 
     @objc func printPage(_ sender: Any?) {
+        if let pdf = state.selectedTab?.pdf, pdf.isReady { pdf.print(); return }
         guard let webView = state.selectedTab?.webView, let window = state.window else { return }
         let operation = webView.printOperation(with: NSPrintInfo.shared)
         operation.view?.frame = webView.bounds
         operation.runModal(for: window, delegate: nil, didRun: nil, contextInfo: nil)
+    }
+}
+
+// MARK: - Menu validation
+
+extension AppDelegate: NSMenuItemValidation {
+    /// Greys out commands that would do nothing right now (Back with no history, Print with no
+    /// page…), and names the toggles for what they will do. A disabled item's shortcut also goes
+    /// on to the page instead of being swallowed.
+    func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        let state = self.state
+        let tab = state.selectedTab
+        let pdfReady = tab?.pdf?.isReady ?? false
+        switch menuItem.action {
+        case #selector(goBack(_:)):
+            return tab.map { $0.canGoBack || $0.pdfAwaitingCommit } ?? false
+        case #selector(goForward(_:)):
+            return tab?.canGoForward ?? false
+        case #selector(reload(_:)), #selector(reloadFromOrigin(_:)):
+            return tab?.url != nil
+        case #selector(stopLoading(_:)):
+            return tab.map { $0.isLoading || $0.pdf?.phase == .downloading } ?? false
+        case #selector(printPage(_:)):
+            return pdfReady || tab?.webView != nil
+        case #selector(findInPage(_:)), #selector(zoomIn(_:)), #selector(zoomOut(_:)), #selector(zoomReset(_:)):
+            return tab != nil
+        case #selector(copyLink(_:)), #selector(duplicateTab(_:)):
+            return tab?.url != nil
+        case #selector(reopenClosedTab(_:)):
+            return state.hasClosedTabs
+        case #selector(togglePin(_:)):
+            guard let tab, let section = state.section(of: tab) else {
+                menuItem.title = "Pin Tab"
+                return false
+            }
+            menuItem.title = switch section {
+            case .tabs: "Pin Tab"
+            case .pinned: "Unpin Tab"
+            case .favorites: "Remove from Favourites"
+            }
+            return true
+        case #selector(toggleSplit(_:)):
+            let showing = state.visibleSplit != nil
+            menuItem.title = showing ? "Close Split View" : "New Split View…"
+            return showing || tab != nil
+        case #selector(focusOtherSplitSide(_:)), #selector(swapSplitSides(_:)):
+            return state.visibleSplit != nil
+        case #selector(toggleMute(_:)):
+            menuItem.title = tab?.isMuted == true ? "Unmute Tab" : "Mute Tab"
+            return tab != nil
+        case #selector(showInspector(_:)):
+            return tab?.webView != nil && AppSettings.shared.advanced.webInspector
+        case #selector(togglePictureInPicture(_:)):
+            return tab?.isAwake == true || state.allTabs.contains { $0.isInPictureInPicture }
+        case #selector(toggleSidebar(_:)):
+            return state.tabLayout == .vertical
+        case #selector(nextTab(_:)), #selector(previousTab(_:)):
+            return state.orderedTabs(in: state.currentSpace).count > 1
+        case #selector(selectTabByNumber(_:)):
+            let count = state.orderedTabs(in: state.currentSpace).count
+            return menuItem.tag >= 9 ? count > 0 : count >= menuItem.tag
+        case #selector(nextSpace(_:)):
+            return state.currentSpaceIndex + 1 < state.spaces.count
+        case #selector(previousSpace(_:)):
+            return state.currentSpaceIndex > 0
+        case #selector(selectSpaceByNumber(_:)):
+            return state.spaces.count >= menuItem.tag
+        default:
+            return validateMoreMenuItems(menuItem)
+        }
     }
 }
 
@@ -160,7 +290,7 @@ extension AppDelegate: NSApplicationDelegate {
         }
         NSApp.mainMenu = MainMenu.build(target: self)
         ExtensionManager.shared.start()
-        state.restore()
+        mainState.restore()
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -168,6 +298,10 @@ extension AppDelegate: NSApplicationDelegate {
             // Quit without saving anything: this copy never loaded the profile.
             exit(0)
         }
+        // Starts reading history from disk in the background, before the first page wants it.
+        _ = HistoryStore.shared
+        // Puts the compiled ad-blocking lists on (or builds them) before the first page loads.
+        ContentBlocker.shared.start()
         showMainWindow()
         updater.start()
         #if DEBUG
@@ -182,7 +316,7 @@ extension AppDelegate: NSApplicationDelegate {
             NSWorkspace.shared.open(urls, withApplicationAt: app, configuration: NSWorkspace.OpenConfiguration()) { _, _ in exit(0) }
             return
         }
-        for url in urls { state.newTab(url: url) }
+        for url in urls { mainState.newTab(url: url) }
         if windowController != nil { showMainWindow() }
     }
 
@@ -204,14 +338,14 @@ extension AppDelegate: NSApplicationDelegate {
             return .terminateCancel
         }
 
-        let tabCount = state.allTabs.filter { $0.url != nil }.count
+        let tabCount = BrowserState.all.flatMap(\.allTabs).filter { $0.url != nil }.count
         let prompt = Prompt(
             icon: NSApp.applicationIconImage,
             title: "Quit Tuff?",
             subtitle: tabCount == 1 ? "1 tab open" : "\(tabCount) tabs open",
             message: AppSettings.shared.general.restoreSession
                 ? "Your tabs will be back next time you open Tuff."
-                : "Your tabs won’t be restored next time.",
+                : "Your open tabs won’t be restored next time. Spaces, pinned tabs and favourites stay.",
             confirmTitle: "Quit",
             checkbox: "Don’t ask again",
             confirmKey: (KeyboardShortcut("q", modifiers: .command), "⌘Q")
@@ -237,13 +371,14 @@ extension AppDelegate: NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        state.saveNow()
+        mainState.saveNow()
         AppSettings.shared.saveNow()
         if AppSettings.shared.privacy.clearHistoryOnQuit {
             HistoryStore.shared.clear(synchronously: true)
         } else {
             HistoryStore.shared.saveNow(synchronously: true)
         }
+        DownloadManager.shared.saveNow(quitting: true)
     }
 
     func applicationSupportsSecureRestorableState(_ app: NSApplication) -> Bool { true }

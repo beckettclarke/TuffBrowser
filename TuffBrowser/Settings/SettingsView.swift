@@ -3,20 +3,24 @@ import UniformTypeIdentifiers
 import WebKit
 
 enum SettingsTab: String, CaseIterable, Identifiable {
-    case general, appearance, tabs, spaces, search, privacy, downloads, extensions, shortcuts, advanced, about
+    case general, importData, appearance, layout, tabs, spaces, search, downloads, privacy, websites, extensions, mods, shortcuts, advanced, about
     var id: String { rawValue }
 
     var label: String {
         switch self {
         case .general: "General"
-        case .appearance: "Appearance"
+        case .importData: "Import"
+        case .appearance: "Theme"
+        case .layout: "Layout"
         case .tabs: "Tabs"
-        case .spaces: "Spaces"
+        case .spaces: "Spaces & Profiles"
         case .search: "Search"
         case .privacy: "Privacy & Security"
+        case .websites: "Websites"
         case .downloads: "Downloads"
         case .extensions: "Extensions"
-        case .shortcuts: "Shortcuts"
+        case .mods: "Mods"
+        case .shortcuts: "Shortcuts & Gestures"
         case .advanced: "Advanced"
         case .about: "About Tuff"
         }
@@ -25,60 +29,63 @@ enum SettingsTab: String, CaseIterable, Identifiable {
     var symbol: String {
         switch self {
         case .general: "gearshape.fill"
+        case .importData: "square.and.arrow.down.fill"
         case .appearance: "paintpalette.fill"
+        case .layout: "rectangle.split.3x1.fill"
         case .tabs: "square.on.square"
         case .spaces: "square.stack.3d.up.fill"
         case .search: "magnifyingglass"
         case .privacy: "hand.raised.fill"
+        case .websites: "globe"
         case .downloads: "arrow.down.circle.fill"
         case .extensions: "puzzlepiece.extension.fill"
+        case .mods: "wrench.and.screwdriver.fill"
         case .shortcuts: "command"
         case .advanced: "slider.horizontal.3"
         case .about: "info.circle.fill"
         }
     }
 
-    /// Extra words the sidebar search matches.
+    /// A few other names for the page itself. Individual settings are found through
+    /// `SettingsSearch.entries`, not these.
     var keywords: String {
         switch self {
-        case .general: "startup restore session quit default browser motion animations"
-        case .appearance: "theme glass blur grain sheen transparency colour color tint dark light sidebar width corner radius preset"
-        case .tabs: "new tab close idle archive unload sleep memory compact foreground links picture in picture pip video"
-        case .spaces: "space workspace profile icon colour color order"
-        case .search: "engine google duckduckgo kagi suggestions custom history"
-        case .privacy: "history cookies website data cache https javascript camera microphone permissions autoplay fraud"
-        case .downloads: "folder location save ask open files"
-        case .extensions: "add-ons chrome firefox store install"
-        case .shortcuts: "keyboard keys hotkeys"
-        case .advanced: "zoom font size user agent inspector developer gestures swipe export import reset"
-        case .about: "version update"
+        case .general: "startup quit default browser"
+        case .importData: "migrate switch from another browser"
+        case .appearance: "appearance look colour"
+        case .layout: "sidebar tab position"
+        case .tabs: ""
+        case .spaces: "workspaces"
+        case .search: "search engine"
+        case .privacy: "security"
+        case .websites: "sites permissions content"
+        case .downloads: "files"
+        case .extensions: "add-ons plugins"
+        case .mods: "extras tweaks"
+        case .shortcuts: "keyboard keys hotkeys trackpad"
+        case .advanced: "developer"
+        case .about: "version"
         }
     }
 
-    func matches(_ query: String) -> Bool {
-        let q = query.trimmed.lowercased()
-        return q.isEmpty || label.lowercased().contains(q) || keywords.contains(q)
-    }
-
-    /// Sidebar groups, separated by a little space.
-    static let groups: [[SettingsTab]] = [
-        [.general, .appearance],
-        [.tabs, .spaces, .search],
-        [.privacy, .downloads],
-        [.extensions, .shortcuts, .advanced],
-        [.about],
+    /// Sidebar groups, separated by a little space; a group with a title gets a heading.
+    static let groups: [(title: String?, tabs: [SettingsTab])] = [
+        (nil, [.general, .importData]),
+        ("Appearance", [.appearance, .layout]),
+        ("Browsing", [.tabs, .spaces, .search, .downloads]),
+        ("Privacy", [.privacy, .websites]),
+        ("Add-ons", [.extensions, .mods]),
+        (nil, [.shortcuts, .advanced, .about]),
     ]
-}
-
-@Observable
-final class SettingsRouter {
-    var tab: SettingsTab = .general
 }
 
 // MARK: - Window
 
 /// The Settings window wears the same tinted glass as the browser window.
 final class SettingsWindowController: NSObject {
+    /// The Settings window, once it has been opened (there is only ever one).
+    private(set) static weak var current: SettingsWindowController?
+
     let window: NSWindow
     private let router = SettingsRouter()
     private let state: BrowserState
@@ -110,6 +117,7 @@ final class SettingsWindowController: NSObject {
         window.toolbarStyle = .unified
 
         let root = SettingsView(router: router)
+            .environment(router)
             .environment(state)
             .environment(settings)
             .environment(ExtensionManager.shared)
@@ -120,11 +128,21 @@ final class SettingsWindowController: NSObject {
         window.contentView = hostingView
         window.center()
         window.setFrameAutosaveName("TuffSettingsWindow")
+        Self.current = self
         observe()
     }
 
-    func show(_ tab: SettingsTab) {
-        router.tab = tab
+    #if DEBUG
+    /// Debug scripts: type `query` into the sidebar's search field, and with `open`, press Return.
+    func debugSearch(_ query: String, open: Bool) {
+        router.query = query
+        if open, let best = SettingsSearch.best(for: query) { router.go(best.tab, anchor: best.anchor) }
+    }
+    #endif
+
+    /// Shows `tab`, or with nil, the page that was showing last (⌘, works like Safari's).
+    func show(_ tab: SettingsTab?) {
+        if let tab { router.go(tab) }
         let wasVisible = window.isVisible
         window.makeKeyAndOrderFront(nil)
         applyTheme()
@@ -147,8 +165,10 @@ final class SettingsWindowController: NSObject {
 
     private func applyTheme() {
         let theme = settings.theme
-        surface.apply(theme, tint: state.currentTint, to: window)
-        let dark = settings.chromeScheme(for: state.currentTint) == .dark
+        // Settings isn't a browser window: it keeps the space / theme tint even when Seamless
+        // has the browser wearing the page's colour.
+        surface.apply(theme, tint: state.baseTint, to: window)
+        let dark = settings.chromeScheme(for: state.baseTint) == .dark
         let appearance = NSAppearance(named: dark ? .darkAqua : .aqua)
         if hostingView.appearance?.name != appearance?.name { hostingView.appearance = appearance }
         window.appearance = appearance
@@ -164,7 +184,7 @@ struct SettingsView: View {
     @Environment(AppSettings.self) private var settings
 
     var body: some View {
-        let tint = state.currentTint
+        let tint = state.baseTint
         let theme = settings.theme
         let inset = CGFloat(max(6, theme.cardInset))
         let shape = RoundedRectangle(cornerRadius: CGFloat(theme.cardRadius), style: .continuous)
@@ -181,7 +201,7 @@ struct SettingsView: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(
                 ZStack {
-                    Color(nsColor: tint).opacity(theme.style == .solid ? 0 : 0.5)
+                    Color(nsColor: tint).opacity(theme.style.isOpaqueFill ? 0 : 0.5)
                     Rectangle().fill(.primary.opacity(0.035))
                 }
             )
@@ -207,13 +227,17 @@ struct SettingsView: View {
     private func page(_ tab: SettingsTab) -> some View {
         switch tab {
         case .general: GeneralPage()
+        case .importData: ImportPage()
         case .appearance: AppearancePage()
+        case .layout: LayoutPage()
         case .tabs: TabsPage()
         case .spaces: SpacesPage()
         case .search: SearchPage()
         case .privacy: PrivacyPage()
+        case .websites: WebsitesPage()
         case .downloads: DownloadsPage()
         case .extensions: ExtensionsPage()
+        case .mods: ModsPage()
         case .shortcuts: ShortcutsPage()
         case .advanced: AdvancedPage()
         case .about: AboutPage()
@@ -225,8 +249,9 @@ struct SettingsView: View {
 
 struct SettingsSidebar: View {
     @Bindable var router: SettingsRouter
-    @State private var query = ""
     @FocusState private var searchFocused: Bool
+
+    private var query: String { router.query }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -239,23 +264,46 @@ struct SettingsSidebar: View {
                 VStack(alignment: .leading, spacing: 2) {
                     if query.trimmed.isEmpty {
                         ForEach(Array(SettingsTab.groups.enumerated()), id: \.offset) { index, group in
-                            if index > 0 { Color.clear.frame(height: 10) }
-                            ForEach(group) { row($0) }
+                            // A heading already sets a group apart, so it needs less space above.
+                            if index > 0 { Color.clear.frame(height: group.title == nil ? 10 : 5) }
+                            if let title = group.title {
+                                Text(title.uppercased())
+                                    .font(.system(size: 10.5, weight: .semibold))
+                                    .tracking(0.4)
+                                    .foregroundStyle(.primary.opacity(0.4))
+                                    .padding(.leading, 10)
+                                    .padding(.bottom, 3)
+                            }
+                            ForEach(group.tabs) { row($0) }
                         }
                     } else {
-                        let results = SettingsTab.allCases.filter { $0.matches(query) }
-                        if results.isEmpty {
+                        let pages = SettingsSearch.pages(for: query)
+                        let settings = SettingsSearch.results(for: query)
+                        if pages.isEmpty && settings.isEmpty {
                             Text("No results")
                                 .font(.system(size: 12.5))
                                 .foregroundStyle(.primary.opacity(0.45))
                                 .padding(.horizontal, 10)
                                 .padding(.top, 6)
                         }
-                        ForEach(results) { row($0) }
+                        ForEach(pages) { row($0) }
+                        if !pages.isEmpty && !settings.isEmpty { Color.clear.frame(height: 8) }
+                        ForEach(settings.prefix(40)) { entry in
+                            SettingsResultRow(entry: entry) { open(entry) }
+                        }
                     }
                 }
+                // Room to scroll the last row clear of the fade below.
+                .padding(.bottom, 18)
             }
             .scrollIndicators(.never)
+            // Fade the bottom edge so a list that runs past the window reads as one that scrolls.
+            .mask(
+                LinearGradient(
+                    stops: [.init(color: .black, location: 0), .init(color: .black, location: 0.92), .init(color: .clear, location: 1)],
+                    startPoint: .top, endPoint: .bottom
+                )
+            )
 
             Text(AboutPage.versionString)
                 .font(.system(size: 11, weight: .medium))
@@ -272,16 +320,14 @@ struct SettingsSidebar: View {
             Image(systemName: "magnifyingglass")
                 .font(.system(size: 11.5, weight: .semibold))
                 .foregroundStyle(.primary.opacity(0.45))
-            TextField("Search settings", text: $query)
+            TextField("Search settings", text: $router.query)
                 .textFieldStyle(.plain)
                 .font(.system(size: 13, weight: .medium))
                 .focused($searchFocused)
-                .onSubmit {
-                    if let first = SettingsTab.allCases.first(where: { $0.matches(query) }) { router.tab = first }
-                }
+                .onSubmit(openFirstResult)
             if !query.isEmpty {
                 Button {
-                    query = ""
+                    router.query = ""
                 } label: {
                     Image(systemName: "xmark.circle.fill")
                         .font(.system(size: 12))
@@ -300,8 +346,16 @@ struct SettingsSidebar: View {
 
     private func row(_ tab: SettingsTab) -> some View {
         SidebarRow(tab: tab, selected: router.tab == tab) {
-            router.tab = tab
+            router.go(tab)
         }
+    }
+
+    private func open(_ entry: SettingsSearchEntry) {
+        router.go(entry.tab, anchor: entry.anchor)
+    }
+
+    private func openFirstResult() {
+        if let best = SettingsSearch.best(for: query) { router.go(best.tab, anchor: best.anchor) }
     }
 }
 
@@ -371,7 +425,7 @@ struct GeneralPage: View {
             }
 
             SettingsGroup(title: "Startup & quitting") {
-                SwitchRow(title: "Restore tabs and spaces", detail: "Pick up where you left off when Tuff opens.", isOn: $settings.general.restoreSession)
+                SwitchRow(title: "Reopen tabs", detail: "Pick up where you left off when Tuff opens. Spaces, pinned tabs and favourites are always kept.", isOn: $settings.general.restoreSession)
                 SwitchRow(title: "Ask before quitting", detail: "Confirm ⌘Q so a stray keystroke doesn’t close everything.", isOn: $settings.behavior.confirmQuit)
             }
 
@@ -406,39 +460,43 @@ struct AppearancePage: View {
     @Environment(AppSettings.self) private var settings
     @Environment(BrowserState.self) private var state
 
-    private let presetColumns = [GridItem(.adaptive(minimum: 120), spacing: 8)]
+    private let styleColumns = Array(repeating: GridItem(.flexible(), spacing: 6), count: 4)
 
     var body: some View {
         @Bindable var settings = settings
-        SettingsPage(title: "Appearance", subtitle: "The glass, the colour and the shape of the window.") {
-            SettingsGroup(title: "Presets") {
-                LazyVGrid(columns: presetColumns, spacing: 8) {
-                    ForEach(ThemePreset.all) { preset in
-                        PresetTile(preset: preset)
+        SettingsPage(title: "Theme", subtitle: "The window’s background and colour.") {
+            SettingsGroup(title: "Background", footer: settings.theme.style.summary) {
+                LazyVGrid(columns: styleColumns, spacing: 6) {
+                    ForEach(BackgroundStyle.allCases) { style in
+                        StyleTile(style: style)
                     }
                 }
-                .padding(10)
+                .padding(8)
             }
 
-            SettingsGroup(title: "Window") {
-                SettingsRow(title: "Background") {
-                    TuffSegmented(selection: $settings.theme.style, options: BackgroundStyle.allCases) { $0.label }
-                }
-                if settings.theme.style != .solid {
-                    SliderRow(title: "Transparency", value: Binding(
-                        get: { 1 - settings.theme.tintOpacity },
-                        set: { settings.theme.tintOpacity = 1 - $0 }
-                    ), range: 0...1)
-                }
-                if settings.theme.style == .glass {
-                    SliderRow(
-                        title: "Blur",
-                        detail: WindowBlur.isAvailable ? nil : "Not available on this version of macOS. Try Vibrancy.",
-                        value: $settings.theme.blurRadius, range: 0...80, format: { "\(Int($0)) pt" }
+            if settings.theme.style != .seamless {
+                SettingsGroup(title: "Window") {
+                    if !settings.theme.style.isOpaqueFill {
+                        SliderRow(title: "Transparency", value: Binding(
+                            get: { 1 - settings.theme.tintOpacity },
+                            set: { settings.theme.tintOpacity = 1 - $0 }
+                        ), range: 0...1)
+                    }
+                    if settings.theme.style == .glass {
+                        SliderRow(
+                            title: "Blur",
+                            detail: WindowBlur.isAvailable ? nil : "Not available on this version of macOS. Try Vibrancy.",
+                            value: $settings.theme.blurRadius, range: 0...80, format: { "\(Int($0)) pt" }
+                        )
+                    }
+                    SliderRow(title: "Grain", value: $settings.theme.grain, range: 0...1)
+                    SliderRow(title: "Sheen", value: $settings.theme.sheen, range: 0...1)
+                    SwitchRow(
+                        title: "Seamless in Incognito windows",
+                        detail: "Incognito windows take on the colour of the page’s header; other windows keep the background above.",
+                        isOn: $settings.theme.incognitoSeamless
                     )
                 }
-                SliderRow(title: "Grain", value: $settings.theme.grain, range: 0...1)
-                SliderRow(title: "Sheen", value: $settings.theme.sheen, range: 0...1)
             }
 
             SettingsGroup(title: "Colour") {
@@ -462,6 +520,231 @@ struct AppearancePage: View {
                 }
             }
 
+            SettingsGroup(title: "Page", footer: "The rounded card the page sits in, and the gap between it and the window’s edge.") {
+                SliderRow(title: "Corner radius", value: $settings.theme.cardRadius, range: 0...24, step: 1, format: { "\(Int($0)) pt" })
+                SliderRow(title: "Border gap", value: $settings.theme.cardInset, range: 0...20, step: 1, format: { "\(Int($0)) pt" })
+            }
+
+            HStack {
+                Spacer()
+                Button("Reset Theme") { withAnimation(Motion.smooth) { settings.resetTheme() } }
+                    .buttonStyle(TuffButtonStyle())
+                    .settingsAnchor("Reset Theme", radius: 10, inset: -4)
+            }
+        }
+    }
+}
+
+/// One background style, drawn as a small window so the four look as different as they are:
+/// Glass shows a colourful desktop blurred through the tint, Vibrancy the system's milky frosted
+/// material, Solid a flat opaque tint, and Seamless chrome painted the colour of the page's header.
+private struct StyleTile: View {
+    @Environment(AppSettings.self) private var settings
+    @Environment(BrowserState.self) private var state
+    let style: BackgroundStyle
+    @State private var hovering = false
+
+    var body: some View {
+        let selected = settings.theme.style == style
+        let shape = RoundedRectangle(cornerRadius: 9, style: .continuous)
+        Button {
+            withAnimation(Motion.smooth) { settings.theme.style = style }
+        } label: {
+            VStack(alignment: .leading, spacing: 7) {
+                StylePreview(
+                    style: style,
+                    tint: Color(nsColor: state.baseTint),
+                    theme: settings.theme,
+                    horizontal: state.tabLayout == .horizontal
+                )
+                .frame(height: 74)
+                .clipShape(shape)
+                .overlay(
+                    shape.strokeBorder(
+                        selected ? AnyShapeStyle(.primary.opacity(0.85)) : AnyShapeStyle(.primary.opacity(0.12)),
+                        lineWidth: selected ? 2 : 0.5
+                    )
+                )
+                Text(style.label)
+                    .font(.system(size: 12, weight: selected ? .semibold : .medium))
+                    .foregroundStyle(.primary.opacity(selected ? 0.95 : 0.7))
+                    .padding(.leading, 2)
+            }
+            .padding(6)
+            .background(RoundedRectangle(cornerRadius: 12, style: .continuous).fill(.primary.opacity(hovering ? 0.07 : 0)))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(SquishButtonStyle(scale: 0.97))
+        .onHover { hovering = $0 }
+        .animation(Motion.quick, value: hovering)
+        .animation(Motion.quick, value: selected)
+        .help(style.summary)
+    }
+}
+
+private struct StylePreview: View {
+    let style: BackgroundStyle
+    let tint: Color
+    let theme: Theme
+    let horizontal: Bool
+
+    /// The page's header colour in the Seamless sample.
+    private static let header = Color(red: 0.93, green: 0.42, blue: 0.27)
+
+    var body: some View {
+        ZStack {
+            backdrop
+            MiniWindow(
+                horizontal: horizontal,
+                seamless: style == .seamless,
+                chromeInk: style == .vibrancy ? Color.primary.opacity(0.28) : Color.white.opacity(0.42),
+                header: style == .seamless ? Self.header : nil
+            )
+        }
+    }
+
+    @ViewBuilder private var backdrop: some View {
+        switch style {
+        case .glass:
+            // The desktop, blurred through a see-through tint.
+            ZStack {
+                Wallpaper().blur(radius: 5)
+                tint.opacity(min(theme.tintOpacity, 0.6))
+                Image(nsImage: Grain.image).resizable(resizingMode: .tile).opacity(theme.grain * 0.5).blendMode(.overlay)
+            }
+        case .vibrancy:
+            // The system's frosted material: neutral and milky, the colour behind washed out.
+            ZStack {
+                Wallpaper().saturation(0.35).blur(radius: 12)
+                Color(nsColor: .windowBackgroundColor).opacity(0.72)
+            }
+        case .solid:
+            // One flat, opaque colour; nothing shows through.
+            ZStack {
+                tint
+                Image(nsImage: Grain.image).resizable(resizingMode: .tile).opacity(theme.grain * 0.5).blendMode(.overlay)
+            }
+        case .seamless:
+            Self.header
+        }
+    }
+}
+
+/// A colourful desktop for the see-through samples to show.
+private struct Wallpaper: View {
+    var body: some View {
+        GeometryReader { geo in
+            let w = geo.size.width, h = geo.size.height
+            ZStack {
+                LinearGradient(colors: [Color(red: 0.16, green: 0.20, blue: 0.55), Color(red: 0.42, green: 0.16, blue: 0.52)],
+                               startPoint: .topLeading, endPoint: .bottomTrailing)
+                Circle().fill(Color(red: 1.0, green: 0.58, blue: 0.22)).frame(width: w * 0.55).position(x: w * 0.18, y: h * 0.2)
+                Circle().fill(Color(red: 0.98, green: 0.36, blue: 0.62)).frame(width: w * 0.5).position(x: w * 0.9, y: h * 0.95)
+                Circle().fill(Color(red: 0.22, green: 0.82, blue: 0.78)).frame(width: w * 0.38).position(x: w * 0.62, y: h * 0.05)
+            }
+        }
+    }
+}
+
+/// The browser in miniature: its sidebar (or tab row and toolbar) and the page.
+private struct MiniWindow: View {
+    let horizontal: Bool
+    let seamless: Bool
+    let chromeInk: Color
+    /// Seamless: the page's header colour, which the chrome around it shares.
+    let header: Color?
+
+    var body: some View {
+        let inset: CGFloat = seamless ? 0 : 4
+        if horizontal {
+            VStack(spacing: 0) {
+                HStack(spacing: 2.5) {
+                    lights
+                    ForEach(0..<3) { i in
+                        RoundedRectangle(cornerRadius: 2.5, style: .continuous)
+                            .fill(chromeInk.opacity(i == 0 ? 1.6 : 0.8))
+                            .frame(width: 16, height: 7)
+                    }
+                    Spacer(minLength: 0)
+                }
+                .padding(.horizontal, 5)
+                .frame(height: 13)
+                Capsule().fill(chromeInk.opacity(0.9)).frame(height: 5).padding(.horizontal, 6).padding(.vertical, 2.5)
+                page(inset: inset).padding([.leading, .trailing, .bottom], inset)
+            }
+        } else {
+            HStack(spacing: 0) {
+                VStack(alignment: .leading, spacing: 4) {
+                    lights.padding(.top, 4)
+                    Capsule().fill(chromeInk.opacity(0.9)).frame(height: 6)
+                    ForEach(0..<3) { i in
+                        Capsule().fill(chromeInk.opacity(i == 0 ? 1.5 : 0.75)).frame(width: i == 0 ? 22 : 18, height: 3.5)
+                    }
+                    Spacer(minLength: 0)
+                }
+                .padding(.horizontal, 5)
+                .frame(width: 34)
+                page(inset: inset).padding([.top, .trailing, .bottom], inset)
+            }
+        }
+    }
+
+    private var lights: some View {
+        HStack(spacing: 2) {
+            Circle().fill(Color(red: 1, green: 0.37, blue: 0.34))
+            Circle().fill(Color(red: 1, green: 0.74, blue: 0.18))
+            Circle().fill(Color(red: 0.16, green: 0.79, blue: 0.25))
+        }
+        .frame(width: 17, height: 4.5)
+    }
+
+    /// A page: a header bar and some lines of text. In Seamless its header is the chrome's colour
+    /// and it sits flush against it, so the two read as one.
+    private func page(inset: CGFloat) -> some View {
+        let shape = RoundedRectangle(cornerRadius: seamless ? 0 : 4, style: .continuous)
+        return VStack(alignment: .leading, spacing: 3) {
+            ZStack(alignment: .leading) {
+                (header ?? Color(white: 0.86))
+                HStack(spacing: 3) {
+                    Circle().fill(header == nil ? Color(white: 0.6) : .white.opacity(0.9)).frame(width: 5, height: 5)
+                    ForEach(0..<3) { _ in
+                        Capsule().fill(header == nil ? Color(white: 0.7) : .white.opacity(0.7)).frame(width: 8, height: 2)
+                    }
+                }
+                .padding(.leading, 5)
+            }
+            .frame(height: 11)
+            VStack(alignment: .leading, spacing: 3) {
+                Capsule().fill(Color(white: 0.55)).frame(width: 30, height: 3)
+                ForEach(0..<3) { i in
+                    Capsule().fill(Color(white: 0.78)).frame(width: i == 2 ? 28 : 46, height: 2.5)
+                }
+            }
+            .padding(.leading, 5)
+            Spacer(minLength: 0)
+        }
+        .background(Color(white: 0.97))
+        .clipShape(shape)
+    }
+}
+
+// MARK: - Layout
+
+struct LayoutPage: View {
+    @Environment(AppSettings.self) private var settings
+
+    var body: some View {
+        @Bindable var settings = settings
+        SettingsPage(title: "Layout", subtitle: "Where the tabs go and how the window is laid out.") {
+            SettingsGroup(title: "Tabs", footer: "Vertical keeps tabs in the sidebar. Horizontal puts them in a row across the top of the window, with the address bar under them.") {
+                SettingsRow(title: "Main browsing") {
+                    TuffSegmented(selection: $settings.tabs.layout, options: TabLayout.allCases) { $0.label }
+                }
+                SettingsRow(title: "Incognito", detail: "New Incognito window: ⇧⌘N") {
+                    TuffSegmented(selection: $settings.tabs.incognitoLayout, options: TabLayout.allCases) { $0.label }
+                }
+            }
+
             SettingsGroup(title: "Sidebar") {
                 SliderRow(title: "Width", value: $settings.general.sidebarWidth, range: 200...420, step: 1, format: { "\(Int($0)) pt" })
                 SwitchRow(
@@ -471,74 +754,11 @@ struct AppearancePage: View {
                 )
             }
 
-            SettingsGroup(title: "Page") {
-                SliderRow(title: "Corner radius", value: $settings.theme.cardRadius, range: 0...24, step: 1, format: { "\(Int($0)) pt" })
-                SliderRow(title: "Border gap", value: $settings.theme.cardInset, range: 0...20, step: 1, format: { "\(Int($0)) pt" })
-            }
-
-            HStack {
-                Spacer()
-                Button("Reset Appearance") { withAnimation(Motion.smooth) { settings.resetTheme() } }
-                    .buttonStyle(TuffButtonStyle())
+            SettingsGroup(title: "Tab rows") {
+                SwitchRow(title: "Always show close buttons", detail: "Otherwise they appear when you point at a tab.", isOn: $settings.tabs.alwaysShowCloseButton)
+                SwitchRow(title: "Compact rows", detail: "Fit more tabs in the sidebar.", isOn: $settings.tabs.compactRows)
             }
         }
-    }
-}
-
-private struct PresetTile: View {
-    @Environment(AppSettings.self) private var settings
-    @Environment(BrowserState.self) private var state
-    let preset: ThemePreset
-    @State private var hovering = false
-
-    var body: some View {
-        var sample = settings.theme
-        preset.apply(&sample)
-        let selected = sample == settings.theme
-        let tint = Color(nsColor: state.currentTint)
-        return Button {
-            withAnimation(Motion.smooth) { preset.apply(&settings.theme) }
-        } label: {
-            VStack(alignment: .leading, spacing: 7) {
-                ZStack {
-                    LinearGradient(colors: [.white.opacity(0.35), .black.opacity(0.25)], startPoint: .topLeading, endPoint: .bottomTrailing)
-                    tint.opacity(sample.style == .solid ? 1 : sample.tintOpacity)
-                    LinearGradient(
-                        stops: [
-                            .init(color: .white.opacity(0.14 * sample.sheen), location: 0),
-                            .init(color: .clear, location: 0.5),
-                            .init(color: .black.opacity(0.14 * sample.sheen), location: 1),
-                        ],
-                        startPoint: .topLeading, endPoint: .bottomTrailing
-                    )
-                    Image(nsImage: Grain.image).resizable(resizingMode: .tile).opacity(sample.grain * 0.5).blendMode(.overlay)
-                    HStack(spacing: 3) {
-                        VStack(alignment: .leading, spacing: 3) {
-                            ForEach(0..<3) { _ in Capsule().fill(.white.opacity(0.28)).frame(width: 18, height: 3) }
-                        }
-                        .frame(width: 22)
-                        RoundedRectangle(cornerRadius: 4, style: .continuous).fill(.white.opacity(0.75))
-                    }
-                    .padding(5)
-                }
-                .frame(height: 52)
-                .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 8, style: .continuous)
-                        .strokeBorder(selected ? AnyShapeStyle(.primary.opacity(0.85)) : AnyShapeStyle(.primary.opacity(0.12)), lineWidth: selected ? 2 : 0.5)
-                )
-                Text(preset.name)
-                    .font(.system(size: 12, weight: selected ? .semibold : .medium))
-                    .foregroundStyle(.primary.opacity(selected ? 0.95 : 0.7))
-                    .padding(.leading, 2)
-            }
-            .padding(6)
-            .background(RoundedRectangle(cornerRadius: 11, style: .continuous).fill(.primary.opacity(hovering ? 0.07 : 0)))
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(SquishButtonStyle(scale: 0.97))
-        .onHover { hovering = $0 }
-        .animation(Motion.quick, value: hovering)
     }
 }
 
@@ -572,6 +792,16 @@ struct TabsPage: View {
     var body: some View {
         @Bindable var settings = settings
         SettingsPage(title: "Tabs", subtitle: "Opening, closing and tidying up.") {
+            SettingsGroup {
+                SettingsRow(
+                    title: "Tab position",
+                    detail: settings.tabs.layout == .vertical ? "Vertical, in the sidebar." : "Horizontal, across the top of the window.",
+                    symbol: settings.tabs.layout.symbol
+                ) {
+                    SettingsLink(title: "Layout", tab: .layout, anchor: "Main browsing")
+                }
+            }
+
             SettingsGroup(title: "Opening") {
                 SettingsRow(title: "New tabs go at the", detail: "Links opened from a page go right after it.") {
                     TuffSegmented(selection: $settings.tabs.newTabPosition, options: NewTabPosition.allCases) { $0.label }
@@ -605,11 +835,6 @@ struct TabsPage: View {
                     TuffMenu(selection: $settings.general.sleepAfterMinutes, options: Self.sleepOptions, label: Self.sleepLabel)
                 }
             }
-
-            SettingsGroup(title: "Sidebar rows") {
-                SwitchRow(title: "Always show close buttons", detail: "Otherwise they appear when you point at a tab.", isOn: $settings.tabs.alwaysShowCloseButton)
-                SwitchRow(title: "Compact rows", detail: "Fit more tabs in the sidebar.", isOn: $settings.tabs.compactRows)
-            }
         }
     }
 }
@@ -620,7 +845,21 @@ struct SpacesPage: View {
     @Environment(BrowserState.self) private var state
 
     var body: some View {
-        SettingsPage(title: "Spaces", subtitle: "Separate sets of tabs, each with its own colour.") {
+        SettingsPage(title: "Spaces & Profiles", subtitle: "Separate sets of tabs, each with its own colour, and who they’re signed in as.") {
+            SettingsGroup(title: "Spaces", footer: "Switch spaces with ⌃1–9, or swipe sideways with two fingers on the sidebar.") {
+                ForEach(Array(state.spaces.enumerated()), id: \.element.id) { index, space in
+                    SpaceSettingsRow(space: space, index: index)
+                }
+            }
+            HStack {
+                Spacer()
+                Button {
+                    state.addSpace(select: false)
+                } label: {
+                    Label("New Space", systemImage: "plus")
+                }
+                .buttonStyle(TuffButtonStyle(kind: .prominent))
+            }
             SettingsGroup(
                 title: "Profiles",
                 footer: "Every space belongs to a profile. Spaces on the same profile share cookies, sign-ins and the favourites at the top of the sidebar; each profile signs in to sites separately. Extensions can be limited to a profile in Extensions."
@@ -635,20 +874,6 @@ struct SpacesPage: View {
                     state.addProfile()
                 } label: {
                     Label("New Profile", systemImage: "plus")
-                }
-                .buttonStyle(TuffButtonStyle(kind: .prominent))
-            }
-            SettingsGroup(title: "Spaces", footer: "Switch spaces with ⌃1–9, or swipe sideways with two fingers on the sidebar.") {
-                ForEach(Array(state.spaces.enumerated()), id: \.element.id) { index, space in
-                    SpaceSettingsRow(space: space, index: index)
-                }
-            }
-            HStack {
-                Spacer()
-                Button {
-                    state.addSpace(select: false)
-                } label: {
-                    Label("New Space", systemImage: "plus")
                 }
                 .buttonStyle(TuffButtonStyle(kind: .prominent))
             }
@@ -786,6 +1011,16 @@ struct SearchPage: View {
                 SwitchRow(title: "Pages from your history", isOn: $settings.search.historySuggestions)
                 SwitchRow(title: "Open tabs", detail: "Jump to a tab that’s already open instead of opening it again.", isOn: $settings.search.openTabSuggestions)
             }
+
+            SettingsGroup(title: "Bangs") {
+                SettingsRow(
+                    title: "DuckDuckGo Bangs",
+                    detail: settings.mods.bangs ? "On. Type !yt, !w, !gh… to search that site directly." : "Off. Turn on to search sites directly with !yt, !w, !gh…",
+                    symbol: "exclamationmark"
+                ) {
+                    SettingsLink(title: "Mods", tab: .mods, anchor: "DuckDuckGo Bangs")
+                }
+            }
         }
     }
 }
@@ -796,15 +1031,16 @@ struct PrivacyPage: View {
     @Environment(AppSettings.self) private var settings
     @State private var historyCount = HistoryStore.shared.count
     @State private var siteCount: Int?
-    private var permissions = SitePermissions.shared
 
     var body: some View {
         @Bindable var settings = settings
-        SettingsPage(title: "Privacy & Security", subtitle: "What Tuff keeps, and what websites can do.") {
+        SettingsPage(title: "Privacy & Security", subtitle: "What Tuff remembers, and what it blocks.") {
             SettingsGroup(title: "History") {
                 SwitchRow(title: "Save browsing history", detail: "Used for suggestions in the command bar.", isOn: $settings.privacy.saveHistory)
                 SwitchRow(title: "Clear history when Tuff quits", isOn: $settings.privacy.clearHistoryOnQuit)
-                SettingsRow(title: "History", detail: historyCount == 1 ? "1 page" : "\(historyCount) pages") {
+                SettingsRow(title: "History", detail: historyCount == 1 ? "1 page" : "\(historyCount.formatted()) pages") {
+                    Button("Show History") { AppDelegate.shared?.showHistory(nil) }
+                        .buttonStyle(TuffButtonStyle())
                     ConfirmButton(title: "Clear History") {
                         HistoryStore.shared.clear()
                         BrowserState.shared.forgetClosedTabs()
@@ -832,43 +1068,23 @@ struct PrivacyPage: View {
                 }
             }
 
-            SettingsGroup(title: "Security", footer: "HTTPS upgrades apply to tabs opened from now on.") {
-                SwitchRow(title: "Upgrade to HTTPS", detail: "Use secure connections for sites known to support them.", isOn: $settings.privacy.upgradeToHTTPS)
-                SwitchRow(title: "Warn about fraudulent websites", isOn: $settings.privacy.fraudWarnings)
-                SwitchRow(title: "Allow JavaScript", detail: "Most sites need it. Takes effect on the next page load.", isOn: $settings.privacy.javaScript)
-            }
-
-            SettingsGroup(title: "Camera & microphone") {
-                SwitchRow(
-                    title: "Remember my choice by default",
-                    detail: "Starts the “Remember for this site” switch on when a site asks.",
-                    isOn: $settings.privacy.rememberMediaPermissions
-                )
-                if permissions.saved.isEmpty {
-                    SettingsRow(title: "No saved choices", detail: "Sites you allow or block will appear here.")
-                } else {
-                    ForEach(permissions.saved) { entry in
-                        SettingsRow(title: entry.host, detail: entry.kind.label, symbol: entry.kind.symbols.first) {
-                            Text(entry.granted ? "Allowed" : "Blocked")
-                                .font(.system(size: 11.5, weight: .semibold))
-                                .foregroundStyle(entry.granted ? Color.green : Color.red)
-                                .padding(.horizontal, 8)
-                                .frame(height: 20)
-                                .background(Capsule().fill((entry.granted ? Color.green : Color.red).opacity(0.14)))
-                            IconButton(symbol: "xmark", size: 10, side: 24, help: "Forget") {
-                                withAnimation(Motion.snappy) { permissions.remove(entry) }
-                            }
-                        }
-                    }
-                    SettingsRow(title: "Forget all saved choices") {
-                        ConfirmButton(title: "Forget All") { withAnimation(Motion.snappy) { permissions.removeAll() } }
+            SettingsGroup(title: "Content blocking", footer: "Uses EasyList, EasyPrivacy, the uBlock filter lists and Peter Lowe’s list, updated every few days. Turn it off for one site from the page menu.") {
+                SwitchRow(title: "Block ads and trackers", detail: "Stops ad and tracking requests before they load, and hides empty ad spaces.", isOn: $settings.privacy.blockAds)
+                if !settings.privacy.adBlockAllowlist.isEmpty {
+                    SettingsRow(title: "Allowed sites", detail: settings.privacy.adBlockAllowlist.joined(separator: ", ")) {
+                        ConfirmButton(title: "Clear", confirmTitle: "Clear?") { settings.privacy.adBlockAllowlist = [] }
                     }
                 }
             }
 
-            SettingsGroup(title: "Media", footer: "Applies to tabs opened from now on.") {
-                SettingsRow(title: "Autoplay video and audio") {
-                    TuffSegmented(selection: $settings.privacy.autoplay, options: AutoplayPolicy.allCases) { $0.label }
+            SettingsGroup(title: "Security", footer: "HTTPS upgrades apply to tabs opened from now on.") {
+                SwitchRow(title: "Upgrade to HTTPS", detail: "Use secure connections for sites known to support them.", isOn: $settings.privacy.upgradeToHTTPS)
+                SwitchRow(title: "Warn about fraudulent websites", isOn: $settings.privacy.fraudWarnings)
+            }
+
+            SettingsGroup(title: "Websites") {
+                SettingsRow(title: "Permissions, pop-ups, JavaScript and zoom", detail: "What each site may do, and how its pages are shown.", symbol: "globe") {
+                    SettingsLink(title: "Websites", tab: .websites)
                 }
             }
         }
@@ -892,6 +1108,116 @@ struct PrivacyPage: View {
             }
         }
         group.notify(queue: .main) { siteCount = sites.count }
+    }
+}
+
+// MARK: - Websites
+
+/// Everything that's about what sites may do and how their pages are shown: permissions they've
+/// asked for, pop-ups, JavaScript, autoplay, and zoom (overall and remembered per site).
+struct WebsitesPage: View {
+    @Environment(AppSettings.self) private var settings
+    private var permissions = SitePermissions.shared
+    private var siteSettings = SiteSettings.shared
+    private var siteZoom = SiteZoom.shared
+
+    private static let zoomOptions: [Double] = [0.5, 0.67, 0.75, 0.8, 0.9, 1, 1.1, 1.25, 1.5, 1.75, 2]
+
+    /// "JavaScript off · Pop-ups allowed" for a site's own settings.
+    private static func siteSummary(_ entry: SiteSettings.Entry?) -> String {
+        guard let entry else { return "" }
+        var parts: [String] = []
+        if let js = entry.javaScript { parts.append("JavaScript \(js ? "on" : "off")") }
+        if let popups = entry.popups { parts.append("Pop-ups \(popups ? "allowed" : "blocked")") }
+        if let autoplay = entry.autoplay { parts.append("Autoplay: \(autoplay.label)") }
+        return parts.joined(separator: " · ")
+    }
+    private static let fontOptions: [Double] = [0, 9, 10, 11, 12, 14, 16, 18, 20, 24]
+
+    var body: some View {
+        @Bindable var settings = settings
+        SettingsPage(title: "Websites", subtitle: "What sites may do, and how their pages are shown.") {
+            SettingsGroup(title: "Site permissions", footer: "Camera, microphone, location and notifications.") {
+                SwitchRow(
+                    title: "Remember my choice by default",
+                    detail: "Starts the “Remember for this site” switch on when a site asks.",
+                    isOn: $settings.privacy.rememberMediaPermissions
+                )
+                if permissions.saved.isEmpty {
+                    SettingsRow(title: "No saved choices", detail: "Sites you allow or block will appear here.")
+                } else {
+                    ForEach(permissions.saved) { entry in
+                        SettingsRow(title: entry.displayName, detail: entry.kind.label, symbol: entry.kind.symbols.first) {
+                            Text(entry.granted ? "Allowed" : "Blocked")
+                                .font(.system(size: 11.5, weight: .semibold))
+                                .foregroundStyle(entry.granted ? Color.green : Color.red)
+                                .padding(.horizontal, 8)
+                                .frame(height: 20)
+                                .background(Capsule().fill((entry.granted ? Color.green : Color.red).opacity(0.14)))
+                            IconButton(symbol: "xmark", size: 10, side: 24, help: "Forget") {
+                                withAnimation(Motion.snappy) { permissions.remove(entry) }
+                            }
+                        }
+                    }
+                    SettingsRow(title: "Forget all saved choices") {
+                        ConfirmButton(title: "Forget All") { withAnimation(Motion.snappy) { permissions.removeAll() } }
+                    }
+                }
+            }
+
+            SettingsGroup(title: "Content", footer: "Pop-up and autoplay changes apply to tabs opened from now on.") {
+                SwitchRow(title: "Block pop-ups", detail: "Pages can open new tabs only when you click something.", isOn: $settings.privacy.blockPopups)
+                SwitchRow(title: "Block cross-site cookies", detail: "Stops sites tracking you through other sites. An embedded site can still ask to use its cookies.", isOn: $settings.privacy.blockCrossSiteCookies)
+                SwitchRow(title: "Allow JavaScript", detail: "Most sites need it. Takes effect on the next page load.", isOn: $settings.privacy.javaScript)
+                SettingsRow(title: "Autoplay video and audio") {
+                    TuffSegmented(selection: $settings.privacy.autoplay, options: AutoplayPolicy.allCases) { $0.label }
+                }
+            }
+
+            SettingsGroup(title: "Site settings", footer: "Change a site’s settings from the page menu (the button at the end of the address bar).") {
+                let sites = siteSettings.sites.keys.sorted()
+                let access = siteSettings.storageAccess.keys.sorted()
+                if sites.isEmpty && access.isEmpty {
+                    SettingsRow(title: "No sites with their own settings")
+                }
+                ForEach(sites, id: \.self) { site in
+                    SettingsRow(title: site, detail: Self.siteSummary(siteSettings.sites[site]), symbol: "globe") {
+                        IconButton(symbol: "xmark", size: 10, side: 24, help: "Back to defaults") {
+                            withAnimation(Motion.snappy) { siteSettings.remove(site: site) }
+                        }
+                    }
+                }
+                ForEach(access, id: \.self) { key in
+                    let parts = key.split(separator: "|").map(String.init)
+                    let allowed = siteSettings.storageAccess[key] == true
+                    SettingsRow(title: parts.first ?? key, detail: "Cookies on \(parts.last ?? "") · \(allowed ? "Allowed" : "Blocked")", symbol: "lock.open") {
+                        IconButton(symbol: "xmark", size: 10, side: 24, help: "Forget") {
+                            withAnimation(Motion.snappy) { siteSettings.removeStorageAccess(key) }
+                        }
+                    }
+                }
+            }
+
+            SettingsGroup(title: "Zoom & text", footer: "Zoom is remembered for each site. Default zoom applies to the rest; ⌘0 puts a site back to it.") {
+                SettingsRow(title: "Default zoom") {
+                    TuffMenu(selection: $settings.advanced.defaultZoom, options: Self.zoomOptions) { "\(Int(($0 * 100).rounded()))%" }
+                        .onChange(of: settings.advanced.defaultZoom) { siteZoom.refreshOpenTabs() }
+                }
+                ForEach(siteZoom.saved.keys.sorted(), id: \.self) { site in
+                    SettingsRow(title: site, symbol: "plus.magnifyingglass") {
+                        Text("\(Int(((siteZoom.saved[site] ?? 1) * 100).rounded()))%")
+                            .font(.system(size: 12, weight: .semibold).monospacedDigit())
+                            .foregroundStyle(.primary.opacity(0.7))
+                        IconButton(symbol: "xmark", size: 10, side: 24, help: "Reset to default zoom") {
+                            withAnimation(Motion.snappy) { siteZoom.remove(site) }
+                        }
+                    }
+                }
+                SettingsRow(title: "Never use font sizes smaller than") {
+                    TuffMenu(selection: $settings.advanced.minimumFontSize, options: Self.fontOptions) { $0 == 0 ? "No minimum" : "\(Int($0)) pt" }
+                }
+            }
+        }
     }
 }
 
@@ -961,26 +1287,9 @@ struct AdvancedPage: View {
     @Environment(AppSettings.self) private var settings
     @State private var importFailed = false
 
-    private static let zoomOptions: [Double] = [0.5, 0.67, 0.75, 0.8, 0.9, 1, 1.1, 1.25, 1.5, 1.75, 2]
-    private static let fontOptions: [Double] = [0, 9, 10, 11, 12, 14, 16, 18, 20, 24]
-
     var body: some View {
         @Bindable var settings = settings
         SettingsPage(title: "Advanced", subtitle: "For tinkerers.") {
-            SettingsGroup(title: "Pages", footer: "Default zoom applies to new tabs. ⌘0 resets a tab to it.") {
-                SettingsRow(title: "Default zoom") {
-                    TuffMenu(selection: $settings.advanced.defaultZoom, options: Self.zoomOptions) { "\(Int(($0 * 100).rounded()))%" }
-                }
-                SettingsRow(title: "Never use font sizes smaller than") {
-                    TuffMenu(selection: $settings.advanced.minimumFontSize, options: Self.fontOptions) { $0 == 0 ? "No minimum" : "\(Int($0)) pt" }
-                }
-            }
-
-            SettingsGroup(title: "Trackpad & mouse") {
-                SwitchRow(title: "Swipe between pages", detail: "Two-finger swipe on the page to go back and forward.", isOn: $settings.advanced.swipeNavigation)
-                SwitchRow(title: "Link previews", detail: "Force click a link to peek at it.", isOn: $settings.advanced.linkPreviews)
-            }
-
             SettingsGroup(title: "Developer") {
                 SwitchRow(title: "Web Inspector", detail: "⌥⌘I, or right-click › Inspect Element.", isOn: $settings.advanced.webInspector)
             }
@@ -996,7 +1305,7 @@ struct AdvancedPage: View {
                 }
             }
 
-            SettingsGroup(title: "Settings", footer: importFailed ? "That file isn’t a Tuff settings export." : "Exports include appearance and every setting on these pages, but not tabs, history or extensions.") {
+            SettingsGroup(title: "Backup & reset", footer: importFailed ? "That file isn’t a Tuff settings export." : "Exports include appearance and every setting on these pages, but not tabs, history or extensions.") {
                 SettingsRow(title: "Back up or move your settings") {
                     Button("Import…", action: importSettings).buttonStyle(TuffButtonStyle())
                     Button("Export…", action: exportSettings).buttonStyle(TuffButtonStyle())
@@ -1064,8 +1373,19 @@ struct ShortcutsPage: View {
         }
     }
 
+    @Environment(AppSettings.self) private var settings
+
     var body: some View {
-        SettingsPage(title: "Shortcuts", subtitle: "Every keyboard shortcut, straight from the menus.") {
+        @Bindable var settings = settings
+        SettingsPage(title: "Shortcuts & Gestures", subtitle: "Trackpad gestures, and every keyboard shortcut straight from the menus.") {
+            SettingsGroup(title: "Gestures") {
+                SwitchRow(title: "Swipe between pages", detail: "Two-finger swipe on the page to go back and forward.", symbol: "hand.point.left", isOn: $settings.advanced.swipeNavigation)
+                SwitchRow(title: "Link previews", detail: "Force click a link to peek at it.", symbol: "hand.tap", isOn: $settings.advanced.linkPreviews)
+                SettingsRow(title: "Switch spaces", detail: "Swipe sideways with two fingers on the sidebar.", symbol: "hand.draw")
+                SettingsRow(title: "Show the hidden sidebar", detail: "Move the pointer to the window’s left edge.", symbol: "sidebar.left") {
+                    SettingsLink(title: "Layout", tab: .layout, anchor: "Show when the pointer reaches the edge")
+                }
+            }
             ForEach(sections) { section in
                 SettingsGroup(title: section.title) {
                     ForEach(section.shortcuts) { shortcut in
@@ -1081,11 +1401,6 @@ struct ShortcutsPage: View {
                         }
                     }
                 }
-            }
-            SettingsGroup(title: "Gestures") {
-                SettingsRow(title: "Switch spaces", detail: "Swipe sideways with two fingers on the sidebar.", symbol: "hand.draw")
-                SettingsRow(title: "Back and forward", detail: "Swipe sideways with two fingers on the page.", symbol: "hand.point.left")
-                SettingsRow(title: "Show the hidden sidebar", detail: "Move the pointer to the window’s left edge.", symbol: "sidebar.left")
             }
         }
     }

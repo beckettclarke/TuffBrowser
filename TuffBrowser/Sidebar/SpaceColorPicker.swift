@@ -235,10 +235,14 @@ private struct HexField: View {
     let hex: String
     let pick: (String) -> Void
     @State private var text = ""
+    /// True once the user has typed in the box. Only typed text is ever committed: committing
+    /// what the box merely shows would put back a stale colour when it loses focus (closing the
+    /// picker after choosing on the pad or a swatch used to undo that choice this way).
+    @State private var edited = false
     @FocusState private var focused: Bool
 
     var body: some View {
-        TextField("", text: $text)
+        TextField("", text: Binding(get: { text }, set: { text = $0; edited = true }))
             .textFieldStyle(.plain)
             .font(.system(size: 11, weight: .medium, design: .monospaced))
             .foregroundStyle(.primary.opacity(focused ? 0.9 : 0.5))
@@ -246,12 +250,21 @@ private struct HexField: View {
             .focused($focused)
             .frame(width: 62)
             .onAppear { text = hex.uppercased() }
-            .onChange(of: hex) { _, new in if !focused { text = new.uppercased() } }
+            .onChange(of: hex) { _, new in
+                // A pick from the pad or a swatch wins over anything half-typed.
+                text = new.uppercased()
+                edited = false
+            }
             .onChange(of: focused) { _, isFocused in if !isFocused { commit() } }
             .onSubmit(commit)
     }
 
     private func commit() {
+        guard edited else {
+            text = hex.uppercased()
+            return
+        }
+        edited = false
         var s = text.trimmed.uppercased()
         if s.hasPrefix("#") { s.removeFirst() }
         if s.count == 3 { s = s.map { "\($0)\($0)" }.joined() }

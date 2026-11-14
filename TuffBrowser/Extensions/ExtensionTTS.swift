@@ -4,7 +4,10 @@ import AppKit
 /// Native `chrome.tts` for extensions, on top of `AVSpeechSynthesizer`. Method calls are routed here by
 /// `ExtensionAPIBridge`; the `onEvent` stream (start / end / interrupted / paused / resumed) is pushed
 /// back to the speaking extension through `ExtensionEventPush`.
-final class ExtensionTTS: NSObject, AVSpeechSynthesizerDelegate {
+///
+/// `AVSpeechSynthesizerDelegate` requires `Sendable`. The state here is only touched on the main
+/// thread: API calls arrive there, and the delegate callbacks hop there before doing anything.
+final class ExtensionTTS: NSObject, AVSpeechSynthesizerDelegate, @unchecked Sendable {
     static let shared = ExtensionTTS()
 
     private let synthesizer = AVSpeechSynthesizer()
@@ -98,25 +101,27 @@ final class ExtensionTTS: NSObject, AVSpeechSynthesizerDelegate {
         utteranceOwners.removeValue(forKey: key)
     }
 
+    private func onMain(_ utterance: AVSpeechUtterance, _ body: @escaping (AVSpeechUtterance) -> Void) {
+        if Thread.isMainThread { body(utterance) } else { DispatchQueue.main.async { body(utterance) } }
+    }
+
     func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didStart utterance: AVSpeechUtterance) {
-        push("start", utterance)
+        onMain(utterance) { self.push("start", $0) }
     }
 
     func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {
-        push("end", utterance)
-        forget(utterance)
+        onMain(utterance) { self.push("end", $0); self.forget($0) }
     }
 
     func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didCancel utterance: AVSpeechUtterance) {
-        push("interrupted", utterance)
-        forget(utterance)
+        onMain(utterance) { self.push("interrupted", $0); self.forget($0) }
     }
 
     func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didPause utterance: AVSpeechUtterance) {
-        push("paused", utterance)
+        onMain(utterance) { self.push("paused", $0) }
     }
 
     func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didContinue utterance: AVSpeechUtterance) {
-        push("resumed", utterance)
+        onMain(utterance) { self.push("resumed", $0) }
     }
 }

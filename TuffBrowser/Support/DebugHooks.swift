@@ -24,6 +24,26 @@ enum DebugHooks {
         run(commands[...])
     }
 
+    /// The context menu item `rightclick` picks when the menu opens (`pickFromContextMenu`).
+    static var contextMenuPick: String?
+
+    /// Called by the page's context menu as it opens: logs its items, and picks the one a
+    /// `rightclick` command named.
+    static func pickFromContextMenu(_ menu: NSMenu) {
+        guard ProcessInfo.processInfo.environment["TUFF_DEBUG_SCRIPT"] != nil else { return }
+        log("contextmenu \(menu.items.map(\.title).filter { !$0.isEmpty })")
+        guard let title = contextMenuPick else { return }
+        contextMenuPick = nil
+        guard let index = menu.items.firstIndex(where: { $0.title == title }) else {
+            log("contextmenu: no item \(title)")
+            return
+        }
+        DispatchQueue.main.async {
+            menu.performActionForItem(at: index)
+            menu.cancelTracking()
+        }
+    }
+
     private static func log(_ line: String) {
         NSLog("TuffDebug: %@", line)
         guard let logURL else { return }
@@ -37,24 +57,87 @@ enum DebugHooks {
         }
     }
 
+    /// The window later commands act on: an Incognito one after `incognito`, until `main`.
+    private static var target: BrowserState?
+
     private static func run(_ commands: ArraySlice<String>) {
         guard let command = commands.first else { return }
         let rest = commands.dropFirst()
         let parts = command.split(separator: " ", maxSplits: 1).map(String.init)
         let name = parts[0]
         let argument = parts.count > 1 ? parts[1] : ""
-        let state = BrowserState.shared
+        let state = target ?? BrowserState.shared
         var delay = 0.05
 
         switch name {
+        case "incognito":
+            // incognito [url] — opens an Incognito window; later commands act on it.
+            target = AppDelegate.shared?.openIncognitoWindow(url: URL(string: argument))
+            if !argument.isEmpty { target?.closeCommandBar() }
+        case "main":
+            target = nil
+        case "layout":
+            // layout vertical|horizontal [incognito]
+            let words = argument.split(separator: " ")
+            let value = TabLayout(rawValue: words.first.map(String.init) ?? "") ?? .vertical
+            if words.count > 1 { AppSettings.shared.tabs.incognitoLayout = value } else { AppSettings.shared.tabs.layout = value }
+        case "style":
+            // style glass|vibrancy|solid|seamless
+            // style glass|vibrancy|solid|seamless, or style incognito-seamless on|off
+            if let style = BackgroundStyle(rawValue: argument) { AppSettings.shared.theme.style = style }
+            if argument.hasPrefix("incognito-seamless") { AppSettings.shared.theme.incognitoSeamless = argument.hasSuffix("on") }
+        case "headercolor":
+            log("headercolor \(state.selectedTab?.headerColor.map { "\($0)" } ?? "nil") tint=\(state.currentTint)")
         case "wait":
             delay = Double(argument) ?? 1
         case "open":
             if let url = URL(string: argument) { state.newTab(url: url) }
+        case "history":
+            state.showHistory()
+        case "import":
+            // import <browser id> [history,bookmarks,spaces] — e.g. "import zen spaces"
+            let words = argument.split(separator: " ").map(String.init)
+            if let source = BrowserImporter.known.first(where: { $0.id == words.first }),
+               let profile = BrowserImporter.profiles(for: source).first {
+                let kinds = words.count > 1
+                    ? Set(words[1].split(separator: ",").compactMap { ImportKind(rawValue: String($0)) })
+                    : Set(source.kinds)
+                let started = Date()
+                let bundle = BrowserImporter.read(source, profile: profile, kinds: kinds)
+                let summary = MainActor.assumeIsolated { BrowserImporter.apply(bundle, from: source, to: state) }
+                log("import \(source.id) profile=\(profile.name) took=\(String(format: "%.2f", Date().timeIntervalSince(started)))s "
+                    + "problems=\(bundle.problems) — \(summary.text)")
+            } else {
+                log("import: unknown browser \(argument)")
+            }
+        case "zoom":
+            // zoom [level|reload] — sets the selected tab's zoom (or reloads it), then logs it.
+            if argument == "reload" { state.selectedTab?.webView?.reload() }
+            else if let level = Double(argument) { state.selectedTab?.setZoom(CGFloat(level)) }
+            let tab = state.selectedTab
+            log("zoom \(tab?.url?.absoluteString ?? "-") tab=\(tab?.pageZoom ?? 0) view=\(tab?.webView?.pageZoom ?? 0)")
         case "load":
             if let url = URL(string: argument) { state.selectedTab?.load(url) }
         case "snap":
             snapshot(window: state.window, to: argument)
+        case "pagesnap":
+            // pagesnap <path> — the selected tab's page as WebKit draws it. Unlike `snap`, this
+            // works while the screen is locked (window capture comes back white then).
+            let rest2 = rest
+            guard let view = state.selectedTab?.webView else {
+                log("pagesnap: no web view")
+                break
+            }
+            view.takeSnapshot(with: nil) { image, error in
+                if let png = image?.pngData {
+                    try? png.write(to: URL(fileURLWithPath: argument))
+                    log("pagesnap \(argument) \(Int(image!.size.width))x\(Int(image!.size.height))")
+                } else {
+                    log("pagesnap failed: \(error?.localizedDescription ?? "no image")")
+                }
+                run(rest2)
+            }
+            return
         case "snapall":
             for (i, window) in NSApp.windows.enumerated() where window.isVisible {
                 snapshot(window: window, to: "\(argument)-\(i).png")
@@ -64,7 +147,8 @@ enum DebugHooks {
             if argument == "close" { state.closeCommandBar() } else { state.openCommandBar(argument == "edit" ? .editCurrent : .newTab) }
         case "type":
             if let editor = (NSApp.keyWindow ?? state.window)?.firstResponder as? NSTextView {
-                editor.insertText(argument, replacementRange: editor.selectedRange())
+                // "␣" types a space (script lines are trimmed, so a trailing space would be lost).
+                editor.insertText(argument.replacingOccurrences(of: "␣", with: " "), replacementRange: editor.selectedRange())
             } else {
                 log("type: no text editor focused (\(String(describing: (NSApp.keyWindow ?? state.window)?.firstResponder)))")
             }
@@ -72,7 +156,7 @@ enum DebugHooks {
             let selectors: [String: Selector] = [
                 "enter": #selector(NSResponder.insertNewline(_:)), "esc": #selector(NSResponder.cancelOperation(_:)),
                 "down": #selector(NSResponder.moveDown(_:)), "up": #selector(NSResponder.moveUp(_:)),
-                "tab": #selector(NSResponder.insertTab(_:)),
+                "tab": #selector(NSResponder.insertTab(_:)), "backspace": #selector(NSResponder.deleteBackward(_:)),
             ]
             if let selector = selectors[argument], let editor = (NSApp.keyWindow ?? state.window)?.firstResponder as? NSTextView {
                 editor.doCommand(by: selector)
@@ -93,9 +177,81 @@ enum DebugHooks {
             state.updateSwipe(deltaX: CGFloat(Double(argument) ?? 0), width: CGFloat(AppSettings.shared.general.sidebarWidth))
         case "swipeend":
             state.endSwipe(velocityX: CGFloat(Double(argument) ?? 0))
+        case "cleartabs":
+            // Clears the current space's tab list as the divider's Clear button does, and logs what's left.
+            let space = state.currentSpace
+            state.clearTabs(in: space)
+            log("cleartabs left=\(space.tabs.map(\.displayTitle)) selected=\(state.selectedTab?.displayTitle ?? "nil")")
         case "select":
             let list = state.orderedTabs(in: state.currentSpace)
             if let i = Int(argument), list.indices.contains(i) { state.select(list[i]) }
+        case "split":
+            // split <url> — opens url beside the selected tab; split <n> — puts tab n (as `select`
+            // counts) beside it; split off|toggle|swap|other|fraction <0–1>; split state — logs the split.
+            let words = argument.split(separator: " ").map(String.init)
+            switch words.first ?? "" {
+            case "off": state.closeSplit()
+            case "toggle": state.toggleSplit()
+            case "pair":
+                // split pair <dragged n> <target n> — as dropping one tab's row onto another's.
+                let list = state.orderedTabs(in: state.currentSpace)
+                let n = words.dropFirst().compactMap { Int($0) }
+                if n.count == 2, list.indices.contains(n[0]), list.indices.contains(n[1]) { state.pair(list[n[0]], with: list[n[1]]) }
+            case "leave":
+                let list = state.orderedTabs(in: state.currentSpace)
+                if words.count > 1, let n = Int(words[1]), list.indices.contains(n) { state.leaveSplit(list[n]) }
+            case "swap": state.swapSplitSides()
+            case "other": state.focusOtherSplitSide()
+            case "responder":
+                // Hands the keyboard to the other side's page directly, as a click into it would.
+                if let view = state.splitPartner?.webView { state.window?.makeFirstResponder(view) }
+            case "fraction": state.setSplitFraction(Double(words.count > 1 ? words[1] : "") ?? 0.5)
+            case "state":
+                let split = state.visibleSplit
+                let name = { (id: UUID?) in id.flatMap { id in state.allTabs.first { $0.id == id }?.displayTitle } ?? "nil" }
+                log("split key=\(state.window?.isKeyWindow ?? false) active=\(NSApp.isActive) stored=\(state.currentSpace.split.map { "\(name($0.leading))|\(name($0.trailing))" } ?? "nil") frame=\(state.window?.contentView?.frame.size ?? .zero) showing=\(split != nil) leading=\(name(split?.leading)) trailing=\(name(split?.trailing)) fraction=\(split?.fraction ?? 0) selected=\(state.selectedTab?.displayTitle ?? "nil") partner=\(state.splitPartner?.displayTitle ?? "nil") partnerAwake=\(state.splitPartner?.isAwake ?? false) firstResponder=\(state.window?.firstResponder.map { String(describing: type(of: $0)) } ?? "nil") selectedInWindow=\(state.selectedTab?.webView?.window != nil) partnerInWindow=\(state.splitPartner?.webView?.window != nil) webViewsInWindow=\(state.allTabs.filter { $0.webView?.window != nil }.map(\.displayTitle))")
+            default:
+                if let n = Int(argument) {
+                    let list = state.orderedTabs(in: state.currentSpace)
+                    if list.indices.contains(n) { state.split(with: list[n]) }
+                } else if let url = URL(string: argument) {
+                    state.open(url: url, mode: .splitTab)
+                }
+            }
+        case "drag":
+            // drag <n> — as if tab n (as `select` counts) were being dragged; drag off — the drag ended.
+            if argument == "off" {
+                endSidebarDrag(state)
+            } else if let n = Int(argument) {
+                let list = state.orderedTabs(in: state.currentSpace)
+                if list.indices.contains(n) { state.draggingTab = list[n] }
+            }
+        case "viewsnap":
+            // viewsnap <path> — draws the window's views into a picture in-process, which (unlike
+            // `snap`) needs no screen capture. Web pages may come out blank.
+            guard let view = state.window?.contentView?.superview ?? state.window?.contentView,
+                  let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { log("viewsnap: no view"); break }
+            view.cacheDisplay(in: view.bounds, to: rep)
+            try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: argument))
+            log("viewsnap \(argument) \(rep.pixelsWide)x\(rep.pixelsHigh)")
+        case "pagedrop":
+            // pagedrop x y [hover] — feeds the page's drop view (`PageDropView`) a dragged tab at a
+            // point in its own coordinates (top-left origin), hovering only or dropping too.
+            let words = argument.split(separator: " ").map(String.init)
+            let xy = words.prefix(2).compactMap { Double($0) }
+            func find(_ view: NSView) -> PageDropView? {
+                if let view = view as? PageDropView { return view }
+                for sub in view.subviews { if let hit = find(sub) { return hit } }
+                return nil
+            }
+            guard xy.count == 2, let root = state.window?.contentView, let view = find(root) else {
+                log("pagedrop: no drop view")
+                break
+            }
+            let point = CGPoint(x: xy[0], y: xy[1])
+            let accepted = view.update?(point) ?? false
+            log("pagedrop size=\(view.bounds.size) accepted=\(accepted)")
+            if words.count < 3 { _ = view.drop?(point) }
         case "pin":
             if let tab = state.selectedTab { state.move(tab, to: .pinned) }
         case "folder":
@@ -106,6 +262,14 @@ enum DebugHooks {
             // foldertoggle <index>
             let folders = state.currentSpace.folders
             if let i = Int(argument), folders.indices.contains(i) { state.toggle(folders[i]) }
+        case "foldertospace":
+            // foldertospace <folder> <space> — moves a folder of the current space to another space.
+            let parts = argument.split(separator: " ").compactMap { Int($0) }
+            let folders = state.currentSpace.folders
+            if parts.count == 2, folders.indices.contains(parts[0]), state.spaces.indices.contains(parts[1]) {
+                state.move(folders[parts[0]], toSpace: state.spaces[parts[1]])
+            }
+            log("folders " + state.spaces.map { "\($0.name)=\($0.folders.map { "\($0.name)(\($0.tabs.count))" })" }.joined(separator: " "))
         case "tofolder":
             // tofolder <index> — moves the selected tab into that folder of the current space.
             let folders = state.currentSpace.folders
@@ -125,11 +289,95 @@ enum DebugHooks {
             let list = tab?.webView?.backForwardList
             log("history url=\(tab?.url?.absoluteString ?? "-") back=\(list?.backList.map(\.url.absoluteString) ?? []) forward=\(list?.forwardList.map(\.url.absoluteString) ?? []) index=\(state.currentSpace.tabs.firstIndex { $0 === tab } ?? -1) notSecure=\(tab?.isNotSecure ?? false)")
         case "sleep":
-            state.allTabs.filter { $0 !== state.selectedTab }.forEach { $0.sleep() }
+            state.allTabs.filter { !state.isOnScreen($0) }.forEach { $0.sleep() }
         case "find":
-            state.findVisible = argument != "off"
+            // find [query|next|prev|off] — opens the find bar (searching for query), steps
+            // through matches, or closes it.
+            switch argument {
+            case "off": state.closeFind()
+            case "next": state.findAgain(forward: true)
+            case "prev": state.findAgain(forward: false)
+            default:
+                state.findVisible = true
+                if !argument.isEmpty { state.findQuery = argument }
+            }
+        case "findstatus":
+            log("findstatus \(state.findStatus)")
+        case "action":
+            // action <selector> — runs a menu command, e.g. "action viewSource".
+            let sent = NSApp.sendAction(Selector(argument + ":"), to: AppDelegate.shared, from: nil)
+            log("action \(argument) sent=\(sent)")
+        case "site":
+            // site js|popups on|off|default — this tab's site settings.
+            let words = argument.split(separator: " ").map(String.init)
+            let value: Bool? = words.last == "default" ? nil : words.last == "on"
+            SiteSettings.shared.update(state.selectedTab?.url, incognito: state.isPrivate) { entry in
+                if words.first == "js" { entry.javaScript = value } else { entry.popups = value }
+            }
+        case "complete":
+            log("complete \(argument) => \(HistoryStore.shared.hostCompletion(for: argument) ?? "-")")
+        case "forward":
+            state.selectedTab?.goForward()
+        case "reload":
+            state.selectedTab?.reload()
+        case "pdf":
+            // pdf sidebar|more|zoommenu|close|rotate|log, pdf zoom <level|fit|width|auto>,
+            // pdf find <text>, pdf page <n>, pdf scroll <page|vertical|horizontal>,
+            // pdf spreads <none|odd|even>, pdf tool <hand|select>, pdf select <a-b>
+            let words = argument.split(separator: " ", maxSplits: 1).map(String.init)
+            let value = words.count > 1 ? words[1] : ""
+            guard let pdf = state.selectedTab?.pdf else {
+                let list = state.selectedTab?.webView?.backForwardList
+                log("pdf: no PDF showing url=\(state.selectedTab?.url?.absoluteString ?? "-") web=\(state.selectedTab?.webView?.url?.absoluteString ?? "-") "
+                    + "back=\(list?.backList.map(\.url.absoluteString) ?? []) forward=\(list?.forwardList.map(\.url.absoluteString) ?? [])")
+                break
+            }
+            switch words.first ?? "" {
+            case "sidebar": pdf.sidebarVisible = value != "off"
+            case "more": pdf.dropdown = .more
+            case "zoommenu": pdf.dropdown = .zoom
+            case "close": pdf.dropdown = nil
+            case "rotate": pdf.rotate(clockwise: true)
+            case "props": pdf.showProperties()
+            case "export": pdf.exportPages()
+            case "present": pdf.startPresentation()
+            case "contents": pdf.sidebarPane = .outline
+            case "focus":
+                state.focusWebView()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                    log("pdf focus inWindow=\(pdf.view.window === state.window) superview=\(pdf.view.superview != nil) responder=\(String(describing: state.window?.firstResponder))")
+                }
+            case "page": pdf.go(to: (Int(value) ?? 1) - 1)
+            case "scroll": pdf.setScrollMode(PDFViewer.ScrollMode(rawValue: value) ?? .vertical)
+            case "spreads": pdf.setSpreads(PDFViewer.Spreads(rawValue: value) ?? .none)
+            case "tool": pdf.setTool(value == "hand" ? .hand : .select)
+            case "select": pdf.selectedPages = Set(PageRanges.parse(value, count: pdf.pageCount) ?? [])
+            case "find":
+                state.findVisible = true
+                pdf.find(value)
+            case "zoom":
+                switch value {
+                case "fit": pdf.setZoom(.pageFit)
+                case "width": pdf.setZoom(.pageWidth)
+                case "auto": pdf.setZoom(.auto)
+                default: pdf.setZoom(.custom, scale: CGFloat(Double(value) ?? 1))
+                }
+            default:
+                let tab = state.selectedTab
+                let list = tab?.webView?.backForwardList
+                log("pdf phase=\(pdf.phase) url=\(pdf.url.absoluteString) title=\(pdf.displayTitle) pages=\(pdf.pageCount) page=\(pdf.pageIndex + 1) "
+                    + "zoom=\(pdf.zoomLabel) mode=\(pdf.zoomMode) matches=\(pdf.matchCount) file=\(pdf.fileURL?.path ?? "-") "
+                    + "tabURL=\(tab?.url?.absoluteString ?? "-") webURL=\(tab?.webView?.url?.absoluteString ?? "-") "
+                    + "back=\(list?.backList.map(\.url.absoluteString) ?? []) forward=\(list?.forwardList.map(\.url.absoluteString) ?? []) "
+                    + "firstResponder=\(String(describing: state.window?.firstResponder.map { type(of: $0) }))")
+            }
         case "settings":
             AppDelegate.shared?.showSettings(tab: SettingsTab(rawValue: argument) ?? .general)
+        case "settingsquery", "settingsfind":
+            // settingsquery <words> types into the Settings search field; settingsfind also
+            // presses Return (opens the best result and scrolls to it).
+            if SettingsWindowController.current == nil { AppDelegate.shared?.showSettings() }
+            SettingsWindowController.current?.debugSearch(argument, open: name == "settingsfind")
         case "permreq":
             // permreq host — shows the camera / microphone card on the selected tab.
             if let tab = state.selectedTab {
@@ -137,13 +385,18 @@ enum DebugHooks {
                     tab.permissionRequest = PermissionRequest(host: argument, kind: .cameraAndMicrophone) { granted, remember in
                         log("permreq answered granted=\(String(describing: granted)) remember=\(remember)")
                         if let granted {
-                            SitePermissions.shared.record(host: argument, kind: .cameraAndMicrophone, granted: granted, remember: remember)
+                            SitePermissions.shared.record(origin: "https://" + argument, kind: .cameraAndMicrophone, granted: granted, remember: remember, incognito: state.isPrivate)
                         }
                     }
                 }
             }
+        case "permanswer":
+            // permanswer yes|no|none — answers (and remembers) the permission card on the selected tab.
+            let request = state.selectedTab?.permissionRequest
+            log("permanswer \(request.map { "\($0.host) \($0.kind.rawValue)" } ?? "no request")")
+            state.selectedTab?.resolvePermission(granted: argument == "none" ? nil : argument != "no", remember: true)
         case "preset":
-            if let preset = ThemePreset.all.first(where: { $0.id == argument }) { preset.apply(&AppSettings.shared.theme) }
+            if let style = BackgroundStyle(rawValue: argument) { AppSettings.shared.theme.style = style }
         case "theme":
             // theme key=value, e.g. "theme grain=0.8"
             let pair = argument.split(separator: "=").map(String.init)
@@ -391,6 +644,81 @@ enum DebugHooks {
                 run(rest2)
             }
             return
+        case "pagemenu":
+            // pagemenu [off|screenshot] — opens / closes the page menu off the address bar.
+            if argument == "screenshot" { PageMenu.openOn = .screenshot }
+            state.pageMenuVisible = argument != "off"
+        case "extpin":
+            // extpin <action index> on|off — pins an extension to the sidebar or the page menu.
+            let words = argument.split(separator: " ").map(String.init)
+            let actions = ExtensionManager.shared.actions(for: state.selectedTab)
+            if let i = words.first.flatMap({ Int($0) }), actions.indices.contains(i) {
+                ExtensionManager.shared.setPinned(words.last != "off", id: actions[i].id)
+            }
+            log("extpin " + ExtensionManager.shared.actions(for: state.selectedTab).map { "\($0.name)=\($0.pinned)" }.joined(separator: ","))
+        case "screenshot":
+            // screenshot visible|full|select | area x y w h — captures into the editor.
+            let words = argument.split(separator: " ").map(String.init)
+            switch words.first {
+            case "full": Screenshotter.start(.fullPage, in: state)
+            case "select": Screenshotter.start(.area, in: state)
+            case "area":
+                let v = words.dropFirst().compactMap { Double($0) }
+                if v.count == 4, let tab = state.selectedTab, let webView = tab.webView {
+                    Screenshotter.snap(webView, rect: CGRect(x: v[0], y: v[1], width: v[2], height: v[3]), mode: .area, tab: tab, state: state)
+                }
+            default: Screenshotter.start(.visible, in: state)
+            }
+            delay = 1
+        case "shot":
+            // shot info | save <path> | markup | tool <name> | close
+            let words = argument.split(separator: " ", maxSplits: 1).map(String.init)
+            guard let session = state.screenshot else { log("shot: no screenshot"); break }
+            switch words.first {
+            case "save":
+                if words.count > 1, let png = session.pngData { try? png.write(to: URL(fileURLWithPath: words[1])) }
+                log("shot saved \(words.last ?? "")")
+            case "markup":
+                // A sample of every tool, to look at.
+                let w = session.pointSize.width, h = min(session.pointSize.height, 700)
+                let colors = ScreenshotSession.palette
+                session.commit(Annotation(tool: .arrow, color: colors[0], width: 4.5, points: [CGPoint(x: w * 0.15, y: h * 0.2), CGPoint(x: w * 0.4, y: h * 0.45)]))
+                session.commit(Annotation(tool: .box, color: colors[3], width: 4.5, points: [CGPoint(x: w * 0.5, y: h * 0.15), CGPoint(x: w * 0.85, y: h * 0.4)]))
+                session.commit(Annotation(tool: .highlighter, color: colors[1], width: 4.5, points: stride(from: 0.1, through: 0.6, by: 0.05).map { CGPoint(x: w * $0, y: h * 0.62) }))
+                session.commit(Annotation(tool: .pen, color: colors[2], width: 4.5, points: stride(from: 0.0, through: 6.3, by: 0.3).map { CGPoint(x: w * 0.7 + cos($0) * 40, y: h * 0.7 + sin($0) * 40) }))
+                var text = Annotation(tool: .text, color: colors[5], width: 4.5, points: [CGPoint(x: w * 0.15, y: h * 0.8)])
+                text.text = "Look here"
+                session.commit(text)
+            case "tool":
+                session.tool = AnnotationTool(rawValue: words.last ?? "") ?? session.tool
+            case "pick":
+                // shot pick x y — what the Select tool would pick at an image point.
+                let v = (words.count > 1 ? words[1] : "").split(separator: " ").compactMap { Double($0) }
+                session.tool = .select
+                if v.count == 2 { session.select(AnnotationGeometry.hit(session.annotations, at: CGPoint(x: v[0], y: v[1]), tolerance: 5)?.id) }
+                log("shot picked \(session.selected.map { "\($0.tool.rawValue) frame=\(AnnotationGeometry.frame($0))" } ?? "nothing")")
+            case "edit":
+                // shot edit move dx dy | edit <handle> x y — drags the selection, as one undo step.
+                let v = (words.count > 1 ? words[1] : "").split(separator: " ").map(String.init)
+                if let a = session.selected, v.count == 3, let x = Double(v[1]), let y = Double(v[2]) {
+                    let handles: [String: AnnotationHandle] = ["start": .start, "end": .end, "tl": .topLeading, "tr": .topTrailing, "bl": .bottomLeading, "br": .bottomTrailing]
+                    session.update(a.id) { item in
+                        if v[0] == "move" { item = AnnotationGeometry.moved(a, by: CGSize(width: x, height: y)) }
+                        else if let h = handles[v[0]] { item = AnnotationGeometry.resized(a, handle: h, to: CGPoint(x: x, y: y)) }
+                    }
+                    log("shot edited \(session.selected.map { "\($0.points.prefix(2)) frame=\(AnnotationGeometry.frame($0))" } ?? "-")")
+                }
+            case "delete":
+                if let id = session.selectedID { session.delete(id) }
+            case "undo":
+                session.undo()
+            case "redo":
+                session.redo()
+            case "close":
+                state.screenshot = nil
+            default: break
+            }
+            log("shot \(session.mode.rawValue) \(session.image.width)x\(session.image.height) points=\(session.pointSize) annotations=\(session.annotations.count)")
         case "pip":
             state.togglePictureInPicture()
         case "pipinfo":
@@ -431,7 +759,44 @@ enum DebugHooks {
             log("info space=\(state.currentSpaceIndex)/\(state.spaces.count) profile=\(state.currentProfile.name) tabs=\(state.currentSpace.tabs.count) pinned=\(state.currentSpace.pinned.count) favs=\(state.favorites.count) selected=\(tab?.displayTitle ?? "-") url=\(tab?.url?.absoluteString ?? "-") awake=\(state.allTabs.filter(\.isAwake).count) favicon=\(tab?.favicon != nil) loading=\(tab?.isLoading ?? false)")
             if let window = state.window {
                 let buttons = [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton].compactMap { window.standardWindowButton($0) }
-                log("window frame=\(window.frame) lights=\(buttons.map { $0.convert($0.bounds, to: nil) }) firstResponder=\(type(of: window.firstResponder as Any))")
+                log("window frame=\(window.frame) visible=\(window.occlusionState.contains(.visible)) lights=\(buttons.map { $0.convert($0.bounds, to: nil) }) firstResponder=\(type(of: window.firstResponder as Any))")
+            }
+        case "rightclick":
+            // rightclick x y [item title] — a real right-click at a window point; the page's
+            // context menu opens, its items are logged, and the titled one (if any) is picked.
+            let words = argument.split(separator: " ", maxSplits: 2).map(String.init)
+            let xy = words.prefix(2).compactMap { Double($0) }
+            contextMenuPick = words.count > 2 ? words[2] : nil
+            if xy.count == 2, let window = state.window {
+                for type in [NSEvent.EventType.rightMouseDown, .rightMouseUp] {
+                    if let event = NSEvent.mouseEvent(
+                        with: type, location: NSPoint(x: xy[0], y: xy[1]), modifierFlags: [],
+                        timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
+                        context: nil, eventNumber: 0, clickCount: 1, pressure: 1
+                    ) {
+                        window.sendEvent(event)
+                    }
+                }
+            }
+        case "resolve":
+            // resolve <text> — what typing it in the command bar would open.
+            log("resolve \(argument) => \(BrowserState.resolve(argument, engine: AppSettings.shared.general.searchEngine).absoluteString)")
+        case "sheet":
+            // sheet — logs the sheet on the browser window (a save panel, say) and cancels it.
+            let sheet = state.window?.attachedSheet
+            log("sheet \(sheet.map { "\(type(of: $0)) name=\(($0 as? NSSavePanel)?.nameFieldStringValue ?? "-")" } ?? "none")")
+            if let panel = sheet as? NSSavePanel {
+                panel.cancel(nil)
+            } else if let sheet {
+                state.window?.endSheet(sheet, returnCode: .cancel)
+            }
+        case "downloads":
+            if argument == "retry", let item = DownloadManager.shared.items.first(where: { DownloadManager.shared.canRetry($0) }) {
+                log("downloads retry \(item.filename) resume=\(item.resumeData != nil)")
+                DownloadManager.shared.retry(item)
+            }
+            for item in DownloadManager.shared.items {
+                log("download \(item.filename) state=\(item.state) dest=\(item.destination?.path ?? "-") bytes=\(item.bytesReceived)")
             }
         case "click":
             // click x y — a real mouse click delivered through the window's event path.

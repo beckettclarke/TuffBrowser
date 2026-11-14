@@ -147,8 +147,10 @@ underlying data/capability to make it real. Implement natively, then remove the 
       for all three (processor count / arch / model, physical + available memory, boot-volume capacity).
 - [x] **[P2]** `chrome.power` → `ExtensionSystem.swift`: `requestKeepAwake` (system / display) +
       `releaseKeepAwake`, per-extension IOKit power assertions.
-- [ ] **[P2]** `chrome.userScripts` (MV3) → `WKUserScript` registration: `register`, `unregister`, `getScripts`, `update`.
-- [ ] **[P2]** Firefox `browser.contentScripts` → dynamic content-script registration: `register`, `unregister`.
+- [x] **[P2]** `chrome.userScripts` (MV3) → `WKUserScript` registration: `register`, `unregister`, `getScripts`, `update`
+      (`ExtensionContentScripts.swift`). Still missing: `configureWorld` messaging / `runtime.onUserScriptMessage`, `execute`.
+- [x] **[P2]** Firefox `browser.contentScripts` → dynamic content-script registration: `register`, `unregister`
+      (also Firefox MV2 `userScripts.register`). Isolated-world scripts get a world per extension without extension APIs.
 - [ ] **[P2]** `chrome.proxy` → system/proxy config: `settings`, `onProxyError`. (Scope carefully; may be partial.)
 - [ ] **[P2]** `chrome.fontSettings` → font prefs: `getFont`, `setFont`, `clearFont`, `getFontList`, `onFontChanged`.
 
@@ -191,7 +193,7 @@ underlying data/capability to make it real. Implement natively, then remove the 
 
 ## F. [BUG] Extension-code correctness
 
-- [ ] **[BUG]** **Mute lost on sleep/wake** — `Tab.wake()` (Tab.swift:102) re-applies `pageZoom` but not
+- [x] **[BUG]** **Mute lost on sleep/wake** — `Tab.wake()` (Tab.swift:102) re-applies `pageZoom` but not
       `isMuted`. Re-apply mute on wake and after navigation (`_setPageMuted:` is per-page). Also
       `setMuted` (Tab.swift:386) sets `isMuted` then returns early when `webView == nil` without firing
       `tabDidChange` — keep state consistent.
@@ -213,7 +215,7 @@ underlying data/capability to make it real. Implement natively, then remove the 
       Add system-wide Chromium dir to `searchDirectories`.
 - [ ] **[BUG]** `handleKeyEvent` (ExtensionManager.swift:847): handle `_execute_page_action`; define
       deterministic precedence when multiple extensions register the same shortcut.
-- [ ] **[BUG]** `BrowserState.close` for pinned/favorites (BrowserState.swift:219) resets to `homeURL`
+- [x] **[BUG]** `BrowserState.close` for pinned/favorites (BrowserState.swift:219) resets to `homeURL`
       without notifying extensions — fire a URL change so `tabs.onUpdated` isn't stale.
 - [ ] **[BUG]** `SocketRelay` (ExtensionManager.swift:907) mutates the extension's *shared* configuration
       preferences (`inactiveSchedulingPolicy`) — copy the configuration so other web views aren't affected.
@@ -226,13 +228,13 @@ underlying data/capability to make it real. Implement natively, then remove the 
 
 - [ ] **[BUG]** Latent crash — `BrowserState.currentSpace` (BrowserState.swift:81) and `profile(for:)` (:86)
       index `[0]` without an empty guard. Add safe fallbacks.
-- [ ] **[BUG]** `closeIdleTabs` (BrowserState.swift:837) doesn't check `tab.isLoading` (unlike
+- [x] **[BUG]** `closeIdleTabs` (BrowserState.swift:837) doesn't check `tab.isLoading` (unlike
       `sleepIdleTabs`) — a stuck loading tab can be auto-closed. Add the check.
-- [ ] **[BUG]** `DownloadManager.uniqueDestination` (Stores.swift:273) check-then-use race for concurrent
+- [x] **[BUG]** `DownloadManager.uniqueDestination` (Stores.swift:273) check-then-use race for concurrent
       same-name downloads; empty filename yields `" 2"`, `" 3"`. Reserve atomically; handle empty names.
 - [ ] **[BUG]** `FaviconStore.fetchIcon` (Stores.swift:148) uses a separate ephemeral `URLSession`, not the
       tab's profile store — auth-gated favicons fail and per-profile isolation is bypassed. Fetch in-context.
-- [ ] **[BUG]** `WebEngine` sets `developerExtrasEnabled` via KVC without a `responds` guard
+- [x] **[BUG]** `WebEngine` sets `developerExtrasEnabled` via KVC without a `responds` guard
       (WebEngine.swift:90, :131) — guard it like the other private prefs to avoid `NSUndefinedKeyException`.
 - [ ] **[BUG]** `BrowserState.newTab` before restore (BrowserState.swift:172) returns an orphaned `Tab`
       (`browser == nil`, in no space). Queue properly or document the contract.
@@ -243,7 +245,7 @@ underlying data/capability to make it real. Implement natively, then remove the 
 
 ## H. [POLICY] AGENTS.md violations (native dialogs)
 
-- [ ] **[POLICY]** `UpdateController.checkForUpdates` (AppDelegate.swift:284) shows a native `NSAlert`
+- [x] **[POLICY]** `UpdateController.checkForUpdates` (AppDelegate.swift:284) shows a native `NSAlert`
       ("Updates aren't set up for this build") — user-visible via the menu. Replace with a `Prompt` card.
 - [ ] **[POLICY]** `PromptPresenter.fallbackAlert` (Prompt.swift:126) uses `NSAlert` when no host window
       exists. Rare, but still user-visible — replace or justify per the "developer-only" exception.
@@ -267,10 +269,11 @@ underlying data/capability to make it real. Implement natively, then remove the 
 
 ## J. [WONTFIX] Fundamental WebKit limitations (document, don't fight)
 
-- [ ] **[WONTFIX]** `webRequestBlocking` — WebKit can observe but not block/rewrite requests from script.
-      Full uBlock Origin / most Firefox blockers filter nothing (install prompt already warns; uBO Lite works
-      via DNR). Keep the warning accurate.
-- [ ] **[WONTFIX]** No private browsing (`isPrivate` hardcoded false) — document.
+- [ ] **[WONTFIX]** `webRequestBlocking` — WebKit reports requests to extensions only after they are sent, and has
+      no hook to hold one (navigation policy covers frames only; a proxy sees only HTTPS hostnames; taking over
+      http(s) with a scheme handler would mean Tuff doing all networking). Covered instead by Tuff's built-in
+      blocker (`Web/ContentBlocker.swift`). Not carried over: `redirect=`, `removeparam`, header/HTML filtering, `csp=`.
+- [x] Private browsing: Incognito windows (⇧⌘N). Extensions don't run in them (`isPrivate` stays false for the main window).
 - [ ] **[WONTFIX]** No Widevine (FairPlay only) — document.
 - [ ] **[WONTFIX]** Single browser window — `windows.*` semantics are inherently limited; document what
       "window" means in Tuff (see A window-adapter items for the feasible subset).

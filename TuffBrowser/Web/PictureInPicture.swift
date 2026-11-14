@@ -80,8 +80,10 @@ enum PictureInPicture {
         post({ pip: !!v, playing: !!subject && !subject.paused });
       }
 
+      // `disablePictureInPicture` is ignored: sites (Netflix among them) set it to hide the
+      // browser's own PiP button, but this only runs when the user asked for PiP.
       function canPiP(v) {
-        if (v.disablePictureInPicture || v.readyState < 1 || !v.videoWidth) return false;
+        if (v.readyState < 1 || !v.videoWidth) return false;
         return v.webkitSupportsPresentationMode ? v.webkitSupportsPresentationMode('picture-in-picture') : true;
       }
 
@@ -109,9 +111,14 @@ enum PictureInPicture {
         return pick;
       }
 
+      // requestPictureInPicture() rejects while the flag is set, so it is cleared first (and left
+      // cleared: setting it again on a video in PiP takes it out).
       async function enter(v) {
-        if (v.requestPictureInPicture) await v.requestPictureInPicture();
-        else v.webkitSetPresentationMode('picture-in-picture');
+        if (v.disablePictureInPicture) v.disablePictureInPicture = false;
+        if (v.requestPictureInPicture) {
+          try { await v.requestPictureInPicture(); return; } catch (e) { if (!v.webkitSetPresentationMode) throw e; }
+        }
+        v.webkitSetPresentationMode('picture-in-picture');
       }
 
       async function exit(v) {
@@ -217,7 +224,7 @@ extension Tab {
         enteredPictureInPictureAutomatically = false
         // The PiP window's close button pauses the video; its "back to the page" button keeps it
         // playing. For the second, show the page it went back to.
-        if playing, let browser, browser.selectedTab !== self {
+        if playing, let browser, !browser.isOnScreen(self) {
             browser.select(self)
             NSApp.activate()
             browser.window?.makeKeyAndOrderFront(nil)

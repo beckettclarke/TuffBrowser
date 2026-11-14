@@ -6,6 +6,15 @@ import WebKit
 final class BrowserWindow: NSWindow {
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { true }
+
+    /// Called after AppKit may have laid out the title bar again (see `layoutTrafficLights`).
+    var titlebarChanged: (() -> Void)?
+
+    // Setting the title (each time the tab's title changes) re-lays out the title bar, which
+    // puts the traffic lights' container back to AppKit's own height.
+    override var title: String {
+        didSet { if title != oldValue { titlebarChanged?() } }
+    }
 }
 
 /// Owns the single browser window: transparent chrome, background blur, traffic-light
@@ -18,9 +27,17 @@ final class BrowserWindowController: NSObject {
     private var monitors: [Any] = []
     private var appearanceObservation: NSKeyValueObservation?
     private let surface = WindowSurface()
+    /// Called once the window has closed (an Incognito window lets go of its state then).
+    var onClose: (() -> Void)?
+    /// The style the last theme pass applied, to notice a switch to Seamless.
+    private var lastStyle: BackgroundStyle?
 
     /// Height of the sidebar's top control row; the traffic lights are centred in it.
     static let topBarHeight: CGFloat = 40
+    /// Height of the tab strip in the horizontal layout; the traffic lights are centred in it.
+    static let tabStripHeight: CGFloat = 40
+    /// Height of the toolbar (back / forward, address) under the tab strip.
+    static let toolbarHeight: CGFloat = 40
     /// Gap between the window edge and the sidebar when it floats over the page (peeking).
     static let floatingSidebarMargin: CGFloat = 6
     /// Leading inset of the close button when the sidebar is docked.
@@ -68,18 +85,42 @@ final class BrowserWindowController: NSObject {
         hostingView.safeAreaRegions = []
         window.contentView = hostingView
 
-        window.center()
-        window.setFrameAutosaveName("TuffBrowserWindow")
+        if state.isPrivate {
+            // Opens over the main window, a step down and to the right, and never remembers
+            // where it was.
+            // Over the browser window in front, a step down and to the right of it.
+            let front = BrowserState.all.compactMap(\.window).filter(\.isVisible)
+                .min { ($0.orderedIndex) < ($1.orderedIndex) }
+            if let front {
+                var frame = front.frame.offsetBy(dx: 28, dy: -28)
+                if let visible = (front.screen ?? NSScreen.main)?.visibleFrame {
+                    if frame.maxX > visible.maxX { frame.origin.x = visible.minX + 28 }
+                    if frame.minY < visible.minY { frame.origin.y = visible.maxY - frame.height - 28 }
+                }
+                window.setFrame(frame, display: false)
+            } else {
+                window.center()
+            }
+            window.title = "Incognito"
+        } else {
+            window.center()
+            window.setFrameAutosaveName("TuffBrowserWindow")
+        }
         state.window = window
 
         // AppKit puts the traffic lights back whenever it re-lays out the title bar (title
         // changes, key state, resizes…). Watch for that and re-centre them.
+        // The buttons can stay put inside their container while AppKit resizes the container
+        // itself (back to its own title bar height), so watch both.
         if let close = window.standardWindowButton(.closeButton) {
-            close.postsFrameChangedNotifications = true
-            NotificationCenter.default.addObserver(
-                self, selector: #selector(trafficLightsMoved), name: NSView.frameDidChangeNotification, object: close
-            )
+            for view in [close, close.superview, close.superview?.superview].compactMap({ $0 }) {
+                view.postsFrameChangedNotifications = true
+                NotificationCenter.default.addObserver(
+                    self, selector: #selector(trafficLightsMoved), name: NSView.frameDidChangeNotification, object: view
+                )
+            }
         }
+        window.titlebarChanged = { [weak self] in self?.trafficLightsMoved() }
 
         installMonitors()
         observeModel()
@@ -107,6 +148,8 @@ final class BrowserWindowController: NSObject {
     private func observeModel() {
         withObservationTracking {
             _ = settings.theme
+            _ = state.tabLayout
+            _ = state.selectedTab?.headerColor
             _ = state.sidebarVisible
             _ = state.sidebarPeeking
             _ = state.isFullscreen
@@ -122,8 +165,15 @@ final class BrowserWindowController: NSObject {
     }
 
     private func applyTheme() {
-        let theme = settings.theme
-        let tint = theme.useSpaceColors && !state.spaces.isEmpty ? state.currentSpace.color : NSColor(hex: theme.tintHex)
+        let theme = state.theme
+        if theme.style == .seamless, lastStyle != .seamless {
+            // Just switched to Seamless: the colours weren't being worked out until now.
+            for tab in state.allTabs where tab.isAwake { tab.refreshHeaderColor() }
+        }
+        lastStyle = theme.style
+        // Not `currentTint`, which blends spaces mid-swipe: this runs only when it settles.
+        let header = theme.style == .seamless ? state.selectedTab?.headerColor : nil
+        let tint = header ?? (state.isPrivate || theme.useSpaceColors && !state.spaces.isEmpty ? state.baseTint : NSColor(hex: theme.tintHex))
         surface.apply(theme, tint: tint, to: window)
 
         let dark = settings.chromeScheme(for: tint) == .dark
@@ -157,7 +207,8 @@ final class BrowserWindowController: NSObject {
         }
         guard buttons.count == 3, let titlebar = buttons[0].superview, let container = titlebar.superview else { return }
 
-        let visible = state.sidebarVisible || state.sidebarPeeking
+        let horizontal = state.tabLayout == .horizontal
+        let visible = horizontal || state.sidebarVisible || state.sidebarPeeking
         let alpha: CGFloat = visible ? 1 : 0
         if container.alphaValue != alpha {
             NSAnimationContext.runAnimationGroup { context in
@@ -169,12 +220,15 @@ final class BrowserWindowController: NSObject {
 
         // A floating sidebar is inset from the window edges, so its top row (and the buttons
         // centred in it) sits `margin` lower and further right than the docked one.
-        let margin = state.sidebarVisible ? 0 : Self.floatingSidebarMargin
-        let height = Self.topBarHeight
+        let margin = state.sidebarVisible || horizontal ? 0 : Self.floatingSidebarMargin
+        let height = horizontal ? Self.tabStripHeight : Self.topBarHeight
         var frame = container.frame
         frame.size.height = height + margin
         frame.origin.y = window.frame.height - frame.size.height
         if container.frame != frame { container.frame = frame }
+        // The buttons are placed inside this view, so it has to fill the container: left at
+        // AppKit's own height it puts them at a different distance from the top.
+        if titlebar.frame != container.bounds { titlebar.frame = container.bounds }
 
         let spacing = buttons[1].frame.minX - buttons[0].frame.minX
         let buttonHeight = buttons[0].frame.height
@@ -222,7 +276,7 @@ final class BrowserWindowController: NSObject {
     private var sidebarWidth: CGFloat { CGFloat(settings.general.sidebarWidth) }
 
     private func isOverSidebar(_ event: NSEvent) -> Bool {
-        guard event.window === window, state.sidebarVisible || state.sidebarPeeking else { return false }
+        guard event.window === window, state.tabLayout == .vertical, state.sidebarVisible || state.sidebarPeeking else { return false }
         return event.locationInWindow.x <= sidebarWidth
     }
 
@@ -280,7 +334,7 @@ final class BrowserWindowController: NSObject {
 
     /// With the sidebar collapsed, touching the window's left edge floats it over the page.
     private func handleMouseMoved(_ event: NSEvent) {
-        guard !state.sidebarVisible, event.window === window, state.commandBar == nil else { return }
+        guard state.tabLayout == .vertical, !state.sidebarVisible, event.window === window, state.commandBar == nil else { return }
         let x = event.locationInWindow.x
         if !state.sidebarPeeking, x <= 5, settings.behavior.peekSidebarOnEdge {
             state.setPeeking(true)
@@ -292,8 +346,7 @@ final class BrowserWindowController: NSObject {
     private func handleKeyDown(_ event: NSEvent) -> NSEvent? {
         guard event.window === window else { return event }
         if event.keyCode == 53, state.commandBar == nil, state.findVisible { // Esc
-            state.findVisible = false
-            state.focusWebView()
+            state.closeFind()
             return nil
         }
         let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
@@ -321,7 +374,8 @@ final class BrowserWindowController: NSObject {
         }
         switch (event.charactersIgnoringModifiers?.lowercased() ?? "", modifiers) {
         case ("t", [.command]), ("l", [.command]), ("w", [.command]), ("q", [.command]),
-             ("t", [.command, .shift]), ("n", [.command, .control]), ("n", [.command, .option]):
+             ("t", [.command, .shift]), ("n", [.command, .control]), ("n", [.command, .option]),
+             ("n", [.command, .shift]):
             return true
         default:
             return false
@@ -334,7 +388,18 @@ extension BrowserWindowController: NSWindowDelegate {
     func windowDidBecomeKey(_ notification: Notification) { layoutTrafficLights() }
     func windowDidBecomeMain(_ notification: Notification) {
         layoutTrafficLights()
-        ExtensionManager.shared.controller.didFocusWindow(ExtensionManager.shared.windowAdapter)
+        if !state.isPrivate {
+            ExtensionManager.shared.controller.didFocusWindow(ExtensionManager.shared.windowAdapter)
+        }
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        guard state.isPrivate else { return }
+        // Let go of the window's pages, and with them its in-memory cookies and storage.
+        DispatchQueue.main.async { [weak self] in
+            self?.onClose?()
+            self?.onClose = nil
+        }
     }
 
     func windowWillEnterFullScreen(_ notification: Notification) { state.isFullscreen = true }

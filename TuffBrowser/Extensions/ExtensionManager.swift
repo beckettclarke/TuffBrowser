@@ -21,6 +21,11 @@ struct ExtensionRecord: Codable, Identifiable, Equatable {
     var sidePanel: SidePanelPrefs?
     /// Profiles and spaces (by ID) the extension is limited to. Nil or empty: every space.
     var linkedTo: [UUID]?
+    /// Whether its button sits in the sidebar (true) or only in the page menu (false, the
+    /// default).
+    var pinned: Bool?
+
+    var isPinned: Bool { pinned ?? false }
 }
 
 struct SidePanelPrefs: Codable, Equatable {
@@ -38,6 +43,8 @@ struct ExtensionActionInfo: Identifiable {
     /// Whether the extension has a side panel, and whether it is the one open now.
     let hasPanel: Bool
     let panelOpen: Bool
+    /// Shown in the sidebar rather than only in the page menu.
+    let pinned: Bool
 }
 
 /// Hosts WebExtensions (Chrome MV2/MV3 and Firefox) on top of WebKit's `WKWebExtensionController`.
@@ -206,6 +213,12 @@ final class ExtensionManager: NSObject {
         return extensionsDirectory.appendingPathComponent(record.id, isDirectory: true)
     }
 
+    /// The folder an extension is actually loaded from (the staged copy for unpacked ones).
+    func resourcesDirectory(forID id: String) -> URL? {
+        guard let record = records.first(where: { $0.id == id }) else { return nil }
+        return record.path == nil ? directory(for: record) : unpackedCopiesDirectory.appendingPathComponent(id, isDirectory: true)
+    }
+
     /// Copies of unpacked extensions, which is what actually gets loaded (see `stageUnpacked`).
     private var unpackedCopiesDirectory: URL { Paths.appSupport.appendingPathComponent("Unpacked", isDirectory: true) }
 
@@ -314,8 +327,11 @@ final class ExtensionManager: NSObject {
                 if tab.awaitingExtension || tab.webView?.url == nil { tab.rebuildForExtension() }
             }
             if webExtension.hasBackgroundContent {
-                context.loadBackgroundContent { error in
-                    if let error { NSLog("Tuff: background content failed for \(record.name): \(error.localizedDescription)") }
+                // Not awaited here: the rest of loading shouldn't wait on the background page.
+                Task {
+                    do { try await context.loadBackgroundContent() } catch {
+                        NSLog("Tuff: background content failed for \(record.name): \(error.localizedDescription)")
+                    }
                 }
             }
             SidePanelManager.shared.extensionLoaded(record.id)
@@ -330,6 +346,7 @@ final class ExtensionManager: NSObject {
         socketRelays.removeValue(forKey: id)?.stop()
         ExtensionOffscreen.shared.extensionUnloaded(id)
         ExtensionEventPush.shared.extensionUnloaded(id)
+        ExtensionContentScripts.shared.extensionUnloaded(id)
         SidePanelManager.shared.extensionUnloaded(id)
         guard let context = contexts.removeValue(forKey: id) else { return }
         try? controller.unload(context)
@@ -629,7 +646,7 @@ final class ExtensionManager: NSObject {
         var note: String?
         if wanted.contains("webRequestBlocking") {
             note = "This extension blocks requests in a way Tuff’s engine (WebKit) doesn’t support, "
-                + "so that part of it won’t work. If there’s a “Lite” or Manifest V3 edition, add that instead."
+                + "so that part of it won’t work. Tuff’s own blocker (Settings › Privacy) already stops ads and trackers."
         }
 
         return await PromptPresenter.present(Prompt(
@@ -817,9 +834,23 @@ final class ExtensionManager: NSObject {
                 badge: action?.badgeText ?? "",
                 enabled: action?.isEnabled ?? true,
                 hasPanel: hasPanel,
-                panelOpen: hasPanel && panels.openID == record.id && panels.isShowing
+                panelOpen: hasPanel && panels.openID == record.id && panels.isShowing,
+                pinned: record.isPinned
             )
         }
+    }
+
+    /// Moves an extension's button between the sidebar and the page menu.
+    func setPinned(_ pinned: Bool, id: String) {
+        update(id) { $0.pinned = pinned }
+        revision += 1
+    }
+
+    /// Runs an extension's action from somewhere other than its own button (the page menu), with
+    /// any popup it opens hanging off `anchor`.
+    func performAction(id: String, anchoredTo anchor: NSView?) {
+        if let anchor { setAnchor(anchor, for: id) }
+        performAction(id: id)
     }
 
     func setAnchor(_ view: NSView, for id: String) {

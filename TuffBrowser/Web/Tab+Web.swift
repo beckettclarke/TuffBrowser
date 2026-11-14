@@ -6,7 +6,7 @@ import WebKit
 
 extension Tab: WKNavigationDelegate {
     private static let webSchemes: Set<String> = [
-        "http", "https", "about", "file", "data", "blob", "javascript",
+        "http", "https", "about", "file", "data", "blob", "javascript", InternalPage.scheme,
         "webkit-extension", "chrome-extension", "moz-extension", "safari-web-extension",
     ]
 
@@ -14,7 +14,10 @@ extension Tab: WKNavigationDelegate {
         _ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction,
         preferences: WKWebpagePreferences, decisionHandler: @escaping (WKNavigationActionPolicy, WKWebpagePreferences) -> Void
     ) {
-        preferences.allowsContentJavaScript = AppSettings.shared.privacy.javaScript
+        // JavaScript, pop-ups and autoplay, as Settings and the site's own choices say. A
+        // subframe's load follows the page it is in.
+        let pageURL = (navigationAction.targetFrame?.isMainFrame ?? true) ? navigationAction.request.url : webView.url
+        SiteSettings.apply(to: preferences, for: pageURL, incognito: browser?.isPrivate ?? false)
         if navigationAction.shouldPerformDownload {
             decisionHandler(.download, preferences)
             return
@@ -56,7 +59,11 @@ extension Tab: WKNavigationDelegate {
         }
 
         // A main-frame navigation is now in flight; extensions read it as `pendingUrl` until it commits.
-        if navigationAction.targetFrame?.isMainFrame ?? false { pendingURL = url }
+        if navigationAction.targetFrame?.isMainFrame ?? false {
+            pendingURL = url
+            pdfNavigationWillStart(to: url, type: navigationAction.navigationType)
+            ContentBlocker.shared.prepare(webView.configuration.userContentController, for: url)
+        }
         decisionHandler(.allow, preferences)
     }
 
@@ -68,6 +75,11 @@ extension Tab: WKNavigationDelegate {
            let disposition = http.value(forHTTPHeaderField: "Content-Disposition"),
            disposition.lowercased().hasPrefix("attachment") {
             decisionHandler(.download)
+            return
+        }
+        // PDFs open in Tuff's own viewer (see Tab+PDF).
+        if let policy = pdfPolicy(for: navigationResponse) {
+            decisionHandler(policy)
             return
         }
         if navigationResponse.canShowMIMEType || Self.isRenderable(navigationResponse.response.mimeType) {
@@ -91,16 +103,33 @@ extension Tab: WKNavigationDelegate {
     }
 
     func webView(_ webView: WKWebView, navigationAction: WKNavigationAction, didBecome download: WKDownload) {
-        DownloadManager.shared.track(download)
+        DownloadManager.shared.track(download, isPrivate: browser?.isPrivate ?? false)
     }
 
     func webView(_ webView: WKWebView, navigationResponse: WKNavigationResponse, didBecome download: WKDownload) {
-        DownloadManager.shared.track(download)
+        if adoptPDFDownload(download) { return }
+        DownloadManager.shared.track(download, isPrivate: browser?.isPrivate ?? false)
+    }
+
+    /// WebKit's (private) callback for a download started from the page's context menu
+    /// (Download Image, Download Linked File). Without it the download has no delegate, never
+    /// gets a destination, and nothing happens. These go straight to the downloads folder; the
+    /// menu's "Save … As…" items mark theirs to ask where (`TuffWebView.saveContextDownloadAs`).
+    @objc(_webView:contextMenuDidCreateDownload:)
+    func webView(_ webView: WKWebView, contextMenuDidCreateDownload download: WKDownload) {
+        let asks = contextSaveAsRequested.map { Date().timeIntervalSince($0) < 10 } ?? false
+        contextSaveAsRequested = nil
+        DownloadManager.shared.track(download, saveLocation: asks ? .ask : .downloadsFolder, isPrivate: browser?.isPrivate ?? false)
     }
 
     func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
         pendingURL = nil
         mediaFrame = nil
+        // The certificate error page commits at the address that failed; anything else ends it.
+        if let failure = certificateFailure, webView.url != failure.url { certificateFailure = nil }
+        // A new page gets to show dialogs again.
+        pageDialogCount = 0
+        pageDialogsBlocked = false
         if hoveredLink != nil { hoveredLink = nil }
         if isInPictureInPicture {
             isInPictureInPicture = false
@@ -112,7 +141,10 @@ extension Tab: WKNavigationDelegate {
         }
         if let u = webView.url {
             url = u
-            favicon = ExtensionManager.shared.icon(forPage: u) ?? FaviconStore.shared.cachedIcon(for: u) ?? favicon
+            applySiteZoom()
+            favicon = InternalPage.icon(for: u) ?? ExtensionManager.shared.icon(forPage: u)
+                ?? FaviconStore.shared.cachedIcon(for: u) ?? favicon
+            pdfDidCommit(u)
         }
         browser?.tabDidNavigate(self)
     }
@@ -123,12 +155,37 @@ extension Tab: WKNavigationDelegate {
             loadingHome = false
             if let homeURL, !Self.samePage(u, homeURL) { homeLandingURL = u }
         }
-        HistoryStore.shared.record(url: u, title: webView.title ?? "")
-        FaviconStore.shared.fetchIcon(from: webView) { [weak self] image in
+        // Incognito leaves no history and no favicons on disk.
+        let incognito = browser?.isPrivate ?? false
+        if !incognito { HistoryStore.shared.record(url: u, title: webView.title ?? "") }
+        // A PDF's placeholder page has no header or icon of its own to find.
+        if let pdf {
+            // WebKit hands the keyboard to a page it brings back from the back / forward
+            // cache; it belongs to the viewer.
+            pdf.focus()
+            browser?.scheduleSave()
+            return
+        }
+        refreshHeaderColor()
+        // Late styles (a header painted by script, a banner slid in) can change it again.
+        refreshHeaderColor(after: 0.8)
+        refreshHeaderColor(after: 2.5)
+        FaviconStore.shared.fetchIcon(from: webView, persist: !incognito) { [weak self] image in
             guard let self, let image else { return }
             self.favicon = image
         }
         browser?.scheduleSave()
+    }
+
+    /// WebKit's (private) same-document callback: a single-page app (YouTube, GitHub) moving to
+    /// another page with `history.pushState`, or Back / Forward between such pages. These never
+    /// reach `didFinish`, so they're recorded here. `replaceState` and #fragment jumps aren't new
+    /// pages. The page's new title usually comes a moment later (`HistoryStore.updateTitle`).
+    @objc(_webView:navigation:didSameDocumentNavigation:)
+    func webView(_ webView: WKWebView, navigation: WKNavigation?, didSameDocumentNavigation type: Int) {
+        // _WKSameDocumentNavigationType: 0 anchor, 1 push, 2 replace, 3 pop.
+        guard type == 1 || type == 3, !(browser?.isPrivate ?? false), pdf == nil, let u = webView.url else { return }
+        HistoryStore.shared.record(url: u, title: webView.title ?? "")
     }
 
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
@@ -148,12 +205,37 @@ extension Tab: WKNavigationDelegate {
         if ns.domain == "WebKitErrorDomain", [102, 204].contains(ns.code) { return }
         let failingURL = (ns.userInfo[NSURLErrorFailingURLErrorKey] as? URL) ?? url
         guard let failingURL else { return }
+        // An untrusted certificate gets its own page, which can show it and let you through.
+        if let failure = CertificateFailure(error: ns, url: failingURL) {
+            certificateFailure = failure
+            webView.loadSimulatedRequest(URLRequest(url: failingURL), responseHTML: WebEngine.certificateErrorPage(for: failure))
+            return
+        }
         webView.loadSimulatedRequest(URLRequest(url: failingURL), responseHTML: WebEngine.errorPage(for: error, url: failingURL))
     }
 
+    /// The content process went away (memory pressure, or the page crashed it). A tab on screen
+    /// reloads now and one in the background when it is next shown; a page that keeps crashing
+    /// gets an error page instead of reloading forever.
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
-        // The content process was killed (usually memory pressure). Reload if the tab is on screen.
-        if browser?.selectedTab === self { webView.reload() }
+        let now = Date()
+        recentCrashes = recentCrashes.filter { now.timeIntervalSince($0) < 60 } + [now]
+        if recentCrashes.count >= 3 {
+            recentCrashes.removeAll()
+            crashedWhileHidden = false
+            let error = NSError(domain: "Tuff", code: 1, userInfo: [
+                NSLocalizedDescriptionKey: "This page stopped working several times in a row, so Tuff stopped reloading it.",
+            ])
+            if let url = url ?? webView.url {
+                webView.loadSimulatedRequest(URLRequest(url: url), responseHTML: WebEngine.errorPage(for: error, url: url))
+            }
+            return
+        }
+        if browser?.isOnScreen(self) == true {
+            webView.reload()
+        } else {
+            crashedWhileHidden = true
+        }
     }
 
     func webView(
@@ -161,8 +243,20 @@ extension Tab: WKNavigationDelegate {
         completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
     ) {
         let method = challenge.protectionSpace.authenticationMethod
+        // A certificate the user chose to trust on the certificate error page; anything else is
+        // checked by the system as usual (and an untrusted one fails into that page).
+        if method == NSURLAuthenticationMethodServerTrust {
+            let space = challenge.protectionSpace
+            if let trust = space.serverTrust, CertificateExceptions.shared.allows(trust, host: space.host, port: space.port) {
+                completionHandler(.useCredential, URLCredential(trust: trust))
+            } else {
+                completionHandler(.performDefaultHandling, nil)
+            }
+            return
+        }
         let passwordMethods = [NSURLAuthenticationMethodHTTPBasic, NSURLAuthenticationMethodHTTPDigest, NSURLAuthenticationMethodNTLM]
-        guard passwordMethods.contains(method), webView.window != nil else {
+        // A tab in the background asks when it is next shown (see `askForPage`).
+        guard passwordMethods.contains(method), browser != nil else {
             completionHandler(.performDefaultHandling, nil)
             return
         }
@@ -182,8 +276,7 @@ extension Tab: WKNavigationDelegate {
             ]
         )
         Task { @MainActor in
-            let result = await askForPage(prompt)
-            if result.confirmed, result.fields.count == 2 {
+            if let result = await askForPage(prompt), result.confirmed, result.fields.count == 2 {
                 let credential = URLCredential(user: result.fields[0], password: result.fields[1], persistence: .forSession)
                 completionHandler(.useCredential, credential)
             } else {
@@ -221,7 +314,68 @@ extension Tab: WKUIDelegate {
     }
 
     func webViewDidClose(_ webView: WKWebView) {
-        browser?.close(self)
+        // Either the page agreed to a close we asked for (`requestClose`), or it called
+        // `window.close()` itself.
+        if pendingClose != nil {
+            finishClose()
+        } else {
+            browser?.close(self, force: true)
+        }
+    }
+
+    /// The page has unsaved changes and asks before it is left (`beforeunload`): closing the
+    /// tab, reloading or going elsewhere. The tab comes to the front, since the user is acting
+    /// on it.
+    @objc(_webView:runBeforeUnloadConfirmPanelWithMessage:initiatedByFrame:completionHandler:)
+    func webView(
+        _ webView: WKWebView, runBeforeUnloadConfirmPanelWithMessage message: String,
+        initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping (Bool) -> Void
+    ) {
+        guard !pageDialogsBlocked, let browser else { completionHandler(true); return }
+        if browser.selectedTab !== self { browser.select(self) }
+        beforeUnloadShowing = true
+        let prompt = Prompt(
+            icon: favicon,
+            symbol: "exclamationmark.triangle.fill",
+            title: "Leave this page?",
+            subtitle: hostLabel(frame),
+            message: "Changes you made may not be saved.",
+            confirmTitle: "Leave",
+            cancelTitle: "Stay",
+            destructive: true
+        )
+        Task { @MainActor in
+            let leave = await askForPage(prompt)?.confirmed ?? true
+            beforeUnloadShowing = false
+            if !leave { pendingClose = nil }
+            completionHandler(leave)
+        }
+    }
+
+    /// The page called `window.print()` (a "Print" button on a receipt or boarding pass).
+    /// Without this WebKit does nothing. Prints the frame that asked, with the print panel.
+    @objc(_webView:printFrame:pdfFirstPageSize:completionHandler:)
+    func webView(_ webView: WKWebView, printFrame frame: AnyObject, pdfFirstPageSize size: CGSize, completionHandler: @escaping () -> Void) {
+        printFrame(frame, in: webView, then: completionHandler)
+    }
+
+    @objc(_webView:printFrame:)
+    func webView(_ webView: WKWebView, printFrame frame: AnyObject) {
+        printFrame(frame, in: webView, then: {})
+    }
+
+    private func printFrame(_ frame: AnyObject, in webView: WKWebView, then done: @escaping () -> Void) {
+        guard let browser, browser.selectedTab === self, let window = webView.window else { done(); return }
+        let info = NSPrintInfo.shared.copy() as? NSPrintInfo ?? NSPrintInfo.shared
+        var operation: NSPrintOperation?
+        let selector = NSSelectorFromString("_printOperationWithPrintInfo:forFrame:")
+        if webView.responds(to: selector), let imp = webView.method(for: selector) {
+            typealias Fn = @convention(c) (AnyObject, Selector, NSPrintInfo, AnyObject) -> NSPrintOperation?
+            operation = unsafeBitCast(imp, to: Fn.self)(webView, selector, info, frame)
+        }
+        let print = operation ?? webView.printOperation(with: info)
+        if operation == nil { print.view?.frame = webView.bounds }
+        PrintCompletion.run(print, in: window, then: done)
     }
 
     private func hostLabel(_ frame: WKFrameInfo) -> String {
@@ -229,7 +383,8 @@ extension Tab: WKUIDelegate {
         return host.isEmpty ? "This page" : host
     }
 
-    /// The card for a page's alert() / confirm() / prompt().
+    /// The card for a page's alert() / confirm() / prompt(). From the page's second dialog on,
+    /// it offers to stop the page showing any more (a page can loop on `alert`).
     private func pagePrompt(_ frame: WKFrameInfo, _ message: String, cancel: String? = nil, fields: [Prompt.Field] = []) -> Prompt {
         Prompt(
             icon: favicon,
@@ -238,26 +393,46 @@ extension Tab: WKUIDelegate {
             message: message.trimmed.isEmpty ? nil : message,
             confirmTitle: "OK",
             cancelTitle: cancel,
-            fields: fields
+            fields: fields,
+            checkbox: pageDialogCount > 0 ? "Don’t let this page show more dialogs" : nil
         )
     }
 
-    /// Shows a card on behalf of this page, bringing its tab to the front first so it's clear
-    /// which page is asking.
+    /// Shows a card on behalf of this page. A tab in the background doesn't interrupt what is on
+    /// screen: its card waits until the tab is shown, as in Chrome and Safari. Nil when the page
+    /// went away first (tab closed or unloaded), which counts as Cancel.
     @MainActor
-    func askForPage(_ prompt: Prompt) async -> PromptResult {
-        if let browser, browser.selectedTab !== self { browser.select(self) }
+    func askForPage(_ prompt: Prompt) async -> PromptResult? {
+        guard let browser else { return nil }
+        if !browser.isOnScreen(self) {
+            let shown = await withCheckedContinuation { dialogWaiters.append($0) }
+            guard shown else { return nil }
+        }
+        // The other side of a split: it takes the keyboard, so the card is plainly its own.
+        if browser.selectedTab !== self, browser.isOnScreen(self) { browser.select(self) }
+        var prompt = prompt
+        prompt.browser = self.browser ?? browser
         return await PromptPresenter.ask(prompt)
+    }
+
+    /// Shows a page's alert() / confirm() / prompt() card, unless the user has blocked the page's
+    /// dialogs. Nil when it wasn't shown or the page went away.
+    @MainActor
+    private func askForPageDialog(_ prompt: Prompt) async -> PromptResult? {
+        guard !pageDialogsBlocked, let result = await askForPage(prompt) else { return nil }
+        pageDialogCount += 1
+        if result.checked { pageDialogsBlocked = true }
+        return result
     }
 
     func webView(
         _ webView: WKWebView, runJavaScriptAlertPanelWithMessage message: String,
         initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping () -> Void
     ) {
-        guard webView.window != nil else { completionHandler(); return }
+        guard !pageDialogsBlocked else { completionHandler(); return }
         let prompt = pagePrompt(frame, message)
         Task { @MainActor in
-            _ = await askForPage(prompt)
+            _ = await askForPageDialog(prompt)
             completionHandler()
         }
     }
@@ -266,20 +441,25 @@ extension Tab: WKUIDelegate {
         _ webView: WKWebView, runJavaScriptConfirmPanelWithMessage message: String,
         initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping (Bool) -> Void
     ) {
-        guard webView.window != nil else { completionHandler(false); return }
+        guard !pageDialogsBlocked else { completionHandler(false); return }
         let prompt = pagePrompt(frame, message, cancel: "Cancel")
-        Task { @MainActor in completionHandler(await askForPage(prompt).confirmed) }
+        Task { @MainActor in completionHandler(await askForPageDialog(prompt)?.confirmed ?? false) }
     }
 
     func webView(
         _ webView: WKWebView, runJavaScriptTextInputPanelWithPrompt prompt: String, defaultText: String?,
         initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping (String?) -> Void
     ) {
-        guard webView.window != nil else { completionHandler(nil); return }
+        // The notifications script reading `Notification.permission`; nothing to show.
+        if prompt == WebNotifications.permissionQuery {
+            completionHandler(WebNotifications.permission(for: frame, in: self))
+            return
+        }
+        guard !pageDialogsBlocked else { completionHandler(nil); return }
         let card = pagePrompt(frame, prompt, cancel: "Cancel", fields: [Prompt.Field(placeholder: "", text: defaultText ?? "")])
         Task { @MainActor in
-            let result = await askForPage(card)
-            completionHandler(result.confirmed ? result.fields.first ?? "" : nil)
+            let result = await askForPageDialog(card)
+            completionHandler(result?.confirmed == true ? result?.fields.first ?? "" : nil)
         }
     }
 
@@ -304,19 +484,165 @@ extension Tab: WKUIDelegate {
         initiatedByFrame frame: WKFrameInfo, type: WKMediaCaptureType,
         decisionHandler: @escaping (WKPermissionDecision) -> Void
     ) {
+        askPermission(origin: origin, kind: SitePermissionKind(type)) { decisionHandler($0 == true ? .grant : .deny) }
+    }
+
+    /// `navigator.geolocation`. Public from macOS 27; WebKit asks the private method below on
+    /// older versions. Unanswered, WebKit refuses every location request.
+    @available(macOS 27.0, *)
+    @MainActor
+    func webView(
+        _ webView: WKWebView, requestGeolocationPermissionFor origin: WKSecurityOrigin, initiatedBy frame: WKFrameInfo
+    ) async -> WKPermissionDecision {
+        await withCheckedContinuation { continuation in
+            askPermission(origin: origin, kind: .location) { continuation.resume(returning: $0 == true ? .grant : .deny) }
+        }
+    }
+
+    @objc(_webView:requestGeolocationPermissionForOrigin:initiatedByFrame:decisionHandler:)
+    func webView(
+        _ webView: WKWebView, legacyGeolocationPermissionFor origin: WKSecurityOrigin,
+        initiatedBy frame: WKFrameInfo, decisionHandler: @escaping (WKPermissionDecision) -> Void
+    ) {
+        askPermission(origin: origin, kind: .location) { decisionHandler($0 == true ? .grant : .deny) }
+    }
+
+    /// Answers from a remembered choice, else shows the permission card over this tab.
+    /// `decide` gets nil when the request goes unanswered (tab closed, page navigated).
+    /// Answers are kept per origin (scheme, host and port), and Incognito's stay in memory.
+    func askPermission(origin: WKSecurityOrigin, kind: SitePermissionKind, then decide: @escaping (Bool?) -> Void) {
         let host = origin.host
-        let kind = SitePermissionKind(type)
-        if let remembered = SitePermissions.shared.decision(host: host, kind: kind) {
-            decisionHandler(remembered ? .grant : .deny)
+        let key = SitePermissions.origin(of: origin)
+        let incognito = browser?.isPrivate ?? false
+        if let remembered = SitePermissions.shared.decision(origin: key, kind: kind, incognito: incognito) {
+            decide(remembered)
             return
         }
         // A newer request replaces one that is still waiting.
         resolvePermission(granted: nil)
         let request = PermissionRequest(host: host, kind: kind) { granted, remember in
-            guard let granted else { decisionHandler(.deny); return }
-            SitePermissions.shared.record(host: host, kind: kind, granted: granted, remember: remember)
-            decisionHandler(granted ? .grant : .deny)
+            guard let granted else { decide(nil); return }
+            SitePermissions.shared.record(origin: key, kind: kind, granted: granted, remember: remember, incognito: incognito)
+            decide(granted)
         }
         withAnimation(Motion.snappy) { permissionRequest = request }
+    }
+}
+
+// MARK: - Header colour (Seamless background)
+
+extension Tab {
+    /// Works out `headerColor`: the background of what is painted along the page's top edge,
+    /// else its `theme-color`, else the colour WebKit shows past the page's ends.
+    /// Does nothing unless the Seamless background is on.
+    func refreshHeaderColor(after delay: TimeInterval = 0) {
+        let style = browser?.theme.style ?? AppSettings.shared.theme.style
+        guard style == .seamless, let view = webView else { return }
+        if delay > 0 {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self, weak view] in
+                guard let self, let view, self.webView === view else { return }
+                self.refreshHeaderColor()
+            }
+            return
+        }
+        // What is actually painted comes first: a `theme-color` can disagree with the header
+        // (GitHub's is dark over a white bar), and the point is for the two to run together.
+        view.evaluateJavaScript(Self.headerColorScript) { [weak self, weak view] result, _ in
+            guard let self, let view, self.webView === view else { return }
+            if let css = result as? String, let color = NSColor(cssRGB: css) {
+                self.setHeaderColor(color)
+            } else if let theme = view.themeColor, theme.alphaComponent > 0.5 {
+                self.setHeaderColor(theme)
+            } else {
+                self.setHeaderColor(view.underPageBackgroundColor)
+            }
+        }
+    }
+
+    private func setHeaderColor(_ color: NSColor?) {
+        let color = color?.usingColorSpace(.sRGB)
+        guard let color else { return }
+        if let current = headerColor, current.isClose(to: color) { return }
+        withAnimation(.easeOut(duration: 0.22)) { headerColor = color }
+    }
+
+    /// The background colour of the topmost painted element across the top of the page, or "".
+    /// An element with a background image there (a photo header) gives "" too: no flat colour
+    /// would match it.
+    static let headerColorScript = """
+    (() => {
+      const solid = (c) => {
+        const m = /^rgba?\\(([^)]+)\\)$/.exec(c || '');
+        if (!m) return false;
+        const p = m[1].split(/[\\s,\\/]+/).filter(Boolean).map(Number);
+        return p.length < 4 || p[3] >= 0.6;
+      };
+      const paint = (el) => {
+        for (; el && el.nodeType === 1; el = el.parentElement) {
+          const cs = getComputedStyle(el);
+          if (solid(cs.backgroundColor)) return cs.backgroundColor;
+          if (cs.backgroundImage && cs.backgroundImage !== 'none' && el !== document.body && el !== document.documentElement) return '';
+        }
+        return null;
+      };
+      const w = innerWidth;
+      const seen = [];
+      for (const x of [w * 0.5, w * 0.2, w * 0.8]) {
+        const c = paint(document.elementFromPoint(x, 1));
+        if (c === '') return '';
+        if (c) seen.push(c);
+      }
+      if (seen.length) {
+        const counts = {};
+        for (const c of seen) counts[c] = (counts[c] || 0) + 1;
+        return Object.keys(counts).sort((a, b) => counts[b] - counts[a])[0];
+      }
+      for (const el of [document.body, document.documentElement]) {
+        if (el && solid(getComputedStyle(el).backgroundColor)) return getComputedStyle(el).backgroundColor;
+      }
+      return '';
+    })()
+    """
+}
+
+extension NSColor {
+    /// Reads CSS `rgb(r, g, b)` / `rgba(r, g, b, a)` (the form `getComputedStyle` gives).
+    convenience init?(cssRGB css: String) {
+        guard let open = css.firstIndex(of: "("), let close = css.lastIndex(of: ")"), open < close else { return nil }
+        let parts = css[css.index(after: open)..<close]
+            .split(whereSeparator: { $0 == "," || $0 == " " || $0 == "/" })
+            .compactMap { Double($0) }
+        guard parts.count >= 3 else { return nil }
+        self.init(srgbRed: parts[0] / 255, green: parts[1] / 255, blue: parts[2] / 255, alpha: 1)
+    }
+
+    /// Near enough that swapping one for the other wouldn't show.
+    func isClose(to other: NSColor) -> Bool {
+        guard let a = usingColorSpace(.sRGB), let b = other.usingColorSpace(.sRGB) else { return false }
+        return abs(a.redComponent - b.redComponent) < 0.01 && abs(a.greenComponent - b.greenComponent) < 0.01
+            && abs(a.blueComponent - b.blueComponent) < 0.01
+    }
+}
+
+/// Runs a print operation as a sheet and calls back when it is done (AppKit reports that
+/// through a delegate selector).
+final class PrintCompletion: NSObject {
+    private let done: () -> Void
+    private static var running: Set<PrintCompletion> = []
+
+    private init(_ done: @escaping () -> Void) { self.done = done }
+
+    static func run(_ operation: NSPrintOperation, in window: NSWindow, then done: @escaping () -> Void) {
+        let completion = PrintCompletion(done)
+        running.insert(completion)
+        operation.runModal(
+            for: window, delegate: completion,
+            didRun: #selector(printOperationDidRun(_:success:contextInfo:)), contextInfo: nil
+        )
+    }
+
+    @objc private func printOperationDidRun(_ operation: NSPrintOperation, success: Bool, contextInfo: UnsafeMutableRawPointer?) {
+        done()
+        Self.running.remove(self)
     }
 }

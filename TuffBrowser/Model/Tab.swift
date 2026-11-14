@@ -24,10 +24,15 @@ final class Tab: NSObject, Identifiable {
     var hasOnlySecureContent = true
     /// Mirrors `webView != nil` so views can react to wake / sleep.
     var isAwake = false
-    /// A camera / microphone request waiting for an answer (shown as a card over the page).
+    /// A camera, microphone, location or notification request waiting for an answer (shown as a card over the page).
     var permissionRequest: PermissionRequest?
     /// The link under the mouse, shown at the bottom of the page (see `LinkPreview`).
     var hoveredLink: URL?
+    /// The colour across the top of the page (its `theme-color`, or what its header is painted
+    /// with). The Seamless background fills the window with it. Only kept up while Seamless is on.
+    var headerColor: NSColor?
+    /// Set while the tab shows a PDF: Tuff's own viewer (`PDFViewer`) covers the page.
+    var pdf: PDFViewer?
 
     /// The page a pinned / favourite tab was pinned on: where it returns to when it is
     /// "closed", or when its icon is clicked after browsing away (see `isAwayFromHome`).
@@ -69,6 +74,46 @@ final class Tab: NSObject, Identifiable {
     /// The URL of a navigation that has started but not committed yet; what extensions read as
     /// `pendingUrl` on a tab. Cleared when the load commits, fails, or the web view goes away.
     @ObservationIgnored var pendingURL: URL?
+    /// Downloaded PDFs this tab has shown, by address (`PDFViewer.key`), so Back, Forward and
+    /// waking reopen them without fetching again. Deleted when the tab closes.
+    @ObservationIgnored var pdfFiles: [String: URL] = [:]
+    /// The viewer is up but its placeholder page hasn't committed yet (still downloading).
+    @ObservationIgnored var pdfAwaitingCommit = false
+    /// The viewer stands in for the history entry the web view is on without a page committed
+    /// for it (a restored session, or Back / Forward to a PDF; see `commitPDFPage`).
+    @ObservationIgnored var pdfWithoutPage = false
+    /// The viewer, not the web view, says what the address is (still downloading, or
+    /// `pdfWithoutPage`).
+    var pdfHoldsAddress: Bool { pdfAwaitingCommit || pdfWithoutPage }
+    /// The PDF whose placeholder page is being committed (`commitPDFPage`).
+    @ObservationIgnored var committingPDF: String?
+    /// A real response arrived for the main frame since the last commit (so a commit isn't a
+    /// page coming back from the back / forward cache).
+    @ObservationIgnored var mainResponseSeen = false
+    /// How the last main-frame navigation started (a Reload fetches a PDF again).
+    @ObservationIgnored var lastMainNavigationType: WKNavigationType = .other
+    /// Page dialogs (`alert`, sign-in…) asked for while the tab was in the background, waiting
+    /// to be shown when it comes to the front. Resumed with false if the page goes away first.
+    @ObservationIgnored var dialogWaiters: [CheckedContinuation<Bool, Never>] = []
+    /// `alert` / `confirm` / `prompt` cards the current page has shown, and whether the user
+    /// asked for no more of them. Both reset when the page changes.
+    @ObservationIgnored var pageDialogCount = 0
+    @ObservationIgnored var pageDialogsBlocked = false
+    /// The content process crashed while the tab was in the background; it reloads when shown.
+    @ObservationIgnored var crashedWhileHidden = false
+    /// When the content process last crashed, to stop reloading a page that keeps crashing.
+    @ObservationIgnored var recentCrashes: [Date] = []
+    /// A close waiting on the page's `beforeunload` (see `requestClose`), and whether its
+    /// "Leave this page?" card is up.
+    @ObservationIgnored var pendingClose: (() -> Void)?
+    /// Receives find-in-page results (`Tab.find`); WebKit holds its find delegate weakly.
+    @ObservationIgnored var findReporter: FindReporter?
+    /// The certificate problem the tab's error page is about (see `CertificateErrorHandler`).
+    @ObservationIgnored var certificateFailure: CertificateFailure?
+    @ObservationIgnored var beforeUnloadShowing = false
+    /// "Save Image As…" / "Save Linked File As…" was just picked from the page's context menu:
+    /// the download WebKit creates next asks where to save.
+    @ObservationIgnored var contextSaveAsRequested: Date?
 
     private static let audioKeyPath = "_isPlayingAudio"
 
@@ -81,7 +126,7 @@ final class Tab: NSObject, Identifiable {
         self.homeURL = homeURL
         self.savedInteractionState = sessionState
         super.init()
-        if let url { favicon = FaviconStore.shared.cachedIcon(for: url) }
+        if let url { favicon = InternalPage.icon(for: url) ?? FaviconStore.shared.cachedIcon(for: url) }
     }
 
     /// What the address pill shows: an extension's name for its own pages, else the URL's host.
@@ -164,7 +209,9 @@ final class Tab: NSObject, Identifiable {
         view.tab = self
         view.navigationDelegate = self
         view.uiDelegate = self
+        pageZoom = CGFloat(SiteZoom.shared.zoom(for: url, incognito: browser?.isPrivate ?? false))
         view.pageZoom = pageZoom
+        if isMuted { Self.applyMute(true, to: view) }
         webView = view
         observe(view)
         isAwake = true
@@ -175,13 +222,16 @@ final class Tab: NSObject, Identifiable {
                 // after launch). Loading now would fail; `rebuildForExtension()` is called
                 // once it is ready.
                 awaitingExtension = true
-            } else if let state = savedInteractionState {
+            } else if let state = savedInteractionState, !InternalPage.isInternal(url) {
                 view.interactionState = state
                 savedInteractionState = nil
                 // History that WebKit couldn't read back (from an older version, say) leaves
                 // the view empty; fall back to the page itself.
                 if view.backForwardList.currentItem == nil, let url { view.load(URLRequest(url: url)) }
             } else if let url {
+                // Tuff's own pages (tuff://history) are built fresh each time rather than put
+                // back from saved history: a restored copy could come back blank.
+                savedInteractionState = nil
                 loadingHome = homeURL.map { Self.samePage(url, $0) } ?? false
                 view.load(URLRequest(url: url))
             }
@@ -213,7 +263,7 @@ final class Tab: NSObject, Identifiable {
             return owner !== hostExtension
         }
         guard hostExtension != nil, let scheme = url.scheme?.lowercased() else { return false }
-        return ["http", "https", "file"].contains(scheme)
+        return ["http", "https", "file", InternalPage.scheme].contains(scheme)
     }
 
     /// Continues a navigation in a new web view of the right kind. The old view's history can't
@@ -268,8 +318,18 @@ final class Tab: NSObject, Identifiable {
 
     /// Drops the web view but keeps the tab. `resetToHome` is used when "closing" a pinned tab.
     func sleep(resetToHome: Bool = false) {
+        let oldURL = url
+        defer {
+            // Extensions (tabs.onUpdated) see a pinned tab go back to its page.
+            if resetToHome, url != oldURL { browser?.tabDidChange(self, properties: [.URL, .title]) }
+        }
         guard let view = webView else {
-            if resetToHome, let homeURL { url = homeURL }
+            if resetToHome, let homeURL {
+                if url != homeURL { title = "" }
+                url = homeURL
+                savedInteractionState = nil
+                historyBeforeMove = nil
+            }
             return
         }
         if resetToHome {
@@ -290,17 +350,67 @@ final class Tab: NSObject, Identifiable {
         savedInteractionState = nil
         historyBeforeMove = nil
         tearDownWebView()
+        PDFFiles.remove(pdfFiles.values)
+        pdfFiles = [:]
     }
 
-    /// Answers the pending camera / microphone request.
+    /// Answers the pending permission request.
     func resolvePermission(granted: Bool?, remember: Bool = false) {
         guard let request = permissionRequest else { return }
         permissionRequest = nil
         request.respond(granted, remember)
     }
 
+    /// Asks the page whether it can close, then runs `close`. WebKit runs the page's
+    /// `beforeunload` handlers (`_tryClose`); a page with unsaved changes shows the "Leave this
+    /// page?" card, and `close` runs only if the user leaves. A page that doesn't answer quickly
+    /// (a busy or hung process) is closed anyway.
+    func requestClose(then close: @escaping () -> Void) {
+        guard pendingClose == nil else { return }
+        let selector = NSSelectorFromString("_tryClose")
+        guard let webView, !awaitingExtension, webView.responds(to: selector),
+              let imp = webView.method(for: selector) else { close(); return }
+        pendingClose = close
+        typealias Fn = @convention(c) (AnyObject, Selector) -> Bool
+        if unsafeBitCast(imp, to: Fn.self)(webView, selector) {
+            finishClose()
+            return
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
+            guard let self, self.pendingClose != nil, !self.beforeUnloadShowing else { return }
+            self.finishClose()
+        }
+    }
+
+    /// The page agreed to close (`webViewDidClose`), or didn't answer in time.
+    func finishClose() {
+        let close = pendingClose
+        pendingClose = nil
+        close?()
+    }
+
+    /// Called whenever the tab comes to the front: shows the dialogs its page asked for while it
+    /// was in the background, and reloads a page whose process crashed meanwhile.
+    func didBecomeVisible() {
+        if crashedWhileHidden {
+            crashedWhileHidden = false
+            webView?.reload()
+        }
+        let waiters = dialogWaiters
+        dialogWaiters.removeAll()
+        waiters.forEach { $0.resume(returning: true) }
+    }
+
     private func tearDownWebView() {
         resolvePermission(granted: nil)
+        // Dialogs still waiting for the tab to be shown are answered "Cancel".
+        let waiters = dialogWaiters
+        dialogWaiters.removeAll()
+        waiters.forEach { $0.resume(returning: false) }
+        pageDialogCount = 0
+        pageDialogsBlocked = false
+        crashedWhileHidden = false
+        closePDF()
         guard let view = webView else { return }
         observations.removeAll()
         if observingAudio {
@@ -323,6 +433,7 @@ final class Tab: NSObject, Identifiable {
         mediaFrame = nil
         hoveredLink = nil
         pendingURL = nil
+        headerColor = nil
         canGoBack = false
         canGoForward = false
     }
@@ -336,16 +447,25 @@ final class Tab: NSObject, Identifiable {
                     self.title = t
                     self.browser?.tabDidChange(self, properties: .title)
                     if let u = self.url, let scheme = u.scheme, scheme == "http" || scheme == "https" {
+                        if self.browser?.isPrivate == false { HistoryStore.shared.updateTitle(url: u, title: t) }
                         ExtensionEventPush.shared.emit("history.onTitleChanged", args: [["url": u.absoluteString, "title": t]])
                     }
                 }
             },
             view.observe(\.url, options: [.new]) { [weak self] view, _ in
                 guard let self, let u = view.url else { return }
+                // A PDF still downloading keeps its own address showing; the web view is
+                // back on the page the link was on until the PDF's page commits.
+                if self.pdfHoldsAddress { return }
                 if u != self.url {
                     self.url = u
                     self.browser?.tabDidChange(self, properties: .URL)
+                    // A single-page app changes its address without finishing a load.
+                    if !view.isLoading { self.refreshHeaderColor(after: 0.4) }
                 }
+            },
+            view.observe(\.themeColor, options: [.new]) { [weak self] _, _ in
+                self?.refreshHeaderColor()
             },
             view.observe(\.estimatedProgress, options: [.new]) { [weak self] view, _ in
                 self?.progress = view.estimatedProgress
@@ -406,6 +526,11 @@ final class Tab: NSObject, Identifiable {
 
     func reload(fromOrigin: Bool = false) {
         guard let webView else { wake(); return }
+        // A PDF fetches itself again, without a new history entry.
+        if let pdf {
+            pdf.reload(using: webView)
+            return
+        }
         if webView.url == nil, let url {
             webView.load(URLRequest(url: url))
         } else if fromOrigin {
@@ -415,9 +540,28 @@ final class Tab: NSObject, Identifiable {
         }
     }
 
-    func stop() { webView?.stopLoading() }
+    func stop() {
+        if let pdf, pdf.phase == .downloading {
+            pdf.cancelDownload()
+            if pdfAwaitingCommit { dropPendingPDF() } else { pdf.phase = .failed("Loading was stopped.") }
+            return
+        }
+        webView?.stopLoading()
+    }
+
     func goBack() {
+        // Back while a PDF is still coming in: stay on the page the link was on.
+        if pdfAwaitingCommit {
+            dropPendingPDF()
+            return
+        }
         if let webView, webView.canGoBack {
+            // Skips an extra entry for the same PDF (one restored with the session has two).
+            if let pdf, let back = webView.backForwardList.backItem, PDFViewer.key(back.url) == PDFViewer.key(pdf.url),
+               let earlier = webView.backForwardList.backList.last(where: { PDFViewer.key($0.url) != PDFViewer.key(pdf.url) }) {
+                webView.go(to: earlier)
+                return
+            }
             webView.goBack()
             return
         }
@@ -434,23 +578,60 @@ final class Tab: NSObject, Identifiable {
         browser?.tabDidChange(self, properties: .URL)
     }
 
-    func goForward() { webView?.goForward() }
-
-    func setZoom(_ zoom: CGFloat) {
-        pageZoom = max(0.3, min(4, zoom))
-        webView?.pageZoom = pageZoom
-        browser?.tabDidChange(self, properties: .zoomFactor)
+    func goForward() {
+        guard let webView else { return }
+        if let pdf, let next = webView.backForwardList.forwardItem, PDFViewer.key(next.url) == PDFViewer.key(pdf.url),
+           let later = webView.backForwardList.forwardList.first(where: { PDFViewer.key($0.url) != PDFViewer.key(pdf.url) }) {
+            webView.go(to: later)
+            return
+        }
+        webView.goForward()
     }
 
+    /// Zooms the page and remembers it for the site: other open tabs on the same site follow.
+    func setZoom(_ zoom: CGFloat) {
+        let level = max(0.3, min(4, zoom))
+        let incognito = browser?.isPrivate ?? false
+        SiteZoom.shared.set(Double(level), for: url, incognito: incognito)
+        applyZoom(level)
+        guard let key = SiteZoom.key(for: url) else { return }
+        for state in BrowserState.all where state.isPrivate == incognito {
+            for tab in state.allTabs where tab !== self && SiteZoom.key(for: tab.url) == key {
+                tab.applyZoom(level)
+            }
+        }
+    }
+
+    /// Puts the page at its site's remembered zoom. Called on every committed navigation:
+    /// a new site has its own level, and WebKit can drop the zoom when a load moves the page
+    /// to a new web process.
+    func applySiteZoom() {
+        applyZoom(CGFloat(SiteZoom.shared.zoom(for: url, incognito: browser?.isPrivate ?? false)))
+    }
+
+    private func applyZoom(_ level: CGFloat) {
+        let changed = level != pageZoom
+        pageZoom = level
+        if let webView, webView.pageZoom != level { webView.pageZoom = level }
+        if changed { browser?.tabDidChange(self, properties: .zoomFactor) }
+    }
+
+    /// Mutes or unmutes the tab. A sleeping tab remembers it and is muted again when it wakes.
     func setMuted(_ muted: Bool) {
+        guard muted != isMuted else { return }
         isMuted = muted
-        guard let webView else { return }
-        // WebKit has no public per-page mute; `_setPageMuted:` takes a bitmask (1 = audio).
+        if let webView { Self.applyMute(muted, to: webView) }
+        browser?.tabDidChange(self, properties: .muted)
+    }
+
+    /// WebKit has no public per-page mute; `_setPageMuted:` takes a bitmask (1 = audio). The
+    /// page keeps it across navigations, but a new web view (waking, a profile or extension-page
+    /// move) starts unmuted.
+    fileprivate static func applyMute(_ muted: Bool, to webView: WKWebView) {
         let selector = NSSelectorFromString("_setPageMuted:")
         guard webView.responds(to: selector), let imp = webView.method(for: selector) else { return }
         typealias Fn = @convention(c) (AnyObject, Selector, Int) -> Void
         unsafeBitCast(imp, to: Fn.self)(webView, selector, muted ? 1 : 0)
-        browser?.tabDidChange(self, properties: .muted)
     }
 
     func showInspector() {

@@ -99,6 +99,18 @@ enum ExtensionCompat {
         }
     }
 
+    /// Undoes what an earlier development build of Tuff did to uBlock Origin (a hidden page
+    /// that exported its filters, and a version tweak), now that blocking is Tuff's own.
+    private static func removeUBlockLeftovers(from root: URL) {
+        for name in ["__tuff_ubo.html", "__tuff_ubo.js"] {
+            try? FileManager.default.removeItem(at: root.appendingPathComponent(name))
+        }
+        let vapiURL = root.appendingPathComponent("js/vapi-common.js")
+        if let source = try? String(contentsOf: vapiURL, encoding: .utf8), source.contains("|| 128; // Tuff") {
+            try? source.replacingOccurrences(of: "|| 128; // Tuff", with: "|| 120;").write(to: vapiURL, atomically: true, encoding: .utf8)
+        }
+    }
+
     /// Writes the event relay page into an extension, if it isn't there or is out of date.
     private static func writeEventRelay(into root: URL) {
         let url = root.appendingPathComponent(eventRelayPage)
@@ -216,6 +228,7 @@ enum ExtensionCompat {
 
         writeSocketRelay(into: root)
         writeEventRelay(into: root)
+        removeUBlockLeftovers(from: root)
 
         // Everything except module workers loads the shim from its own file.
         let shimURL = root.appendingPathComponent(shimName)
@@ -954,6 +967,31 @@ enum ExtensionCompat {
           });
           implement('search', {
             query: api((query) => call('search', 'query', query)),
+          });
+          // Scripts registered at run time with inline code (WebKit only registers files). Tuff
+          // adds them to every tab as user scripts limited to the requested URLs; see
+          // ExtensionContentScripts. uBlock Origin delivers its scriptlets this way.
+          const scriptHandle = (id) => ({
+            unregister: api(() => call('contentScripts', 'unregister', { id: id })),
+          });
+          implement('contentScripts', {
+            register: api(async (options) => scriptHandle(await call('contentScripts', 'register', options || {}))),
+          });
+          implement('userScripts', {
+            // Chrome (MV3) takes a list and returns nothing; Firefox (MV2) takes one script and
+            // returns a handle.
+            register: api(async (scripts) => {
+              if (Array.isArray(scripts)) return call('userScripts', 'register', { scripts: scripts });
+              return scriptHandle(await call('userScripts', 'registerLegacy', scripts || {}));
+            }),
+            update: api((scripts) => call('userScripts', 'update', { scripts: scripts || [] })),
+            unregister: api((filter) => call('userScripts', 'unregister', { ids: filter && filter.ids })),
+            getScripts: api(async (filter) => (await call('userScripts', 'getScripts', { ids: filter && filter.ids })) || []),
+            configureWorld: api(() => undefined),
+            resetWorldConfiguration: api(() => undefined),
+            getWorldConfigurations: api(() => []),
+            execute: api(() => { throw new Error('userScripts.execute is not supported in Tuff.'); }),
+            onBeforeScript: event('userScripts.onBeforeScript'),
           });
         }
       }

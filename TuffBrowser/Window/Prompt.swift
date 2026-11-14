@@ -21,6 +21,9 @@ struct Prompt: Identifiable {
 
     let id = UUID()
     var host: Host = .browser
+    /// The browser window's state for `.browser` cards (an Incognito window's page asks in
+    /// that window). Nil: the browser window in front.
+    var browser: BrowserState?
     var icon: NSImage?
     /// SF Symbol drawn in a tile when there is no `icon`.
     var symbol = "puzzlepiece.extension.fill"
@@ -64,6 +67,8 @@ struct PromptResult {
 enum PromptPresenter {
     private static var queue: [(Prompt, CheckedContinuation<PromptResult, Never>)] = []
     private static var current: (id: UUID, continuation: CheckedContinuation<PromptResult, Never>)?
+    /// The state whose window shows the card on screen.
+    private static var currentState: BrowserState = .shared
 
     /// The prompt on screen now, if any.
     static var currentID: UUID? { current?.id }
@@ -85,7 +90,7 @@ enum PromptPresenter {
     static func resolve(_ confirmed: Bool) {
         guard let (_, continuation) = current else { return }
         current = nil
-        let state = BrowserState.shared
+        let state = currentState
         let live = state.prompt
         let result = PromptResult(
             confirmed: confirmed,
@@ -102,7 +107,9 @@ enum PromptPresenter {
     private static func showNext() {
         guard current == nil, !queue.isEmpty else { return }
         let (prompt, continuation) = queue.removeFirst()
-        let state = BrowserState.shared
+        // Settings belongs to the main window's state, so its cards are drawn from there.
+        let state = prompt.host == .settings ? BrowserState.shared : (prompt.browser ?? BrowserState.active)
+        currentState = state
         let host: NSWindow? = switch prompt.host {
         case .browser: state.window
         case .settings: AppDelegate.shared?.visibleSettingsWindow ?? state.window
@@ -167,8 +174,11 @@ struct PromptCard: View {
     @Environment(BrowserState.self) private var state
     let prompt: Prompt
 
+    /// The tint of the window the card covers (Settings doesn't take on a page's colour).
+    private var tint: NSColor { prompt.host == .settings ? state.baseTint : state.currentTint }
+
     private var confirmColor: NSColor {
-        prompt.destructive ? .systemRed : state.currentTint.derivedAccent
+        prompt.destructive ? .systemRed : tint.derivedAccent
     }
     private var confirmFill: Color { Color(nsColor: confirmColor) }
     /// Dark text on a light accent, white on a deep one.
@@ -289,12 +299,12 @@ struct PromptCard: View {
         .background(
             ZStack {
                 VisualEffect(material: .hudWindow, blending: .withinWindow)
-                Color(nsColor: state.currentTint).opacity(0.55)
+                Color(nsColor: tint).opacity(0.55)
             }
         )
         .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous).strokeBorder(.primary.opacity(0.14), lineWidth: 1))
-        .shadow(color: .black.opacity(0.4), radius: 40, y: 18)
+        .modifier(CardShadow(cornerRadius: 18, opacity: 0.4, radius: 40, y: 18, hollow: true))
     }
 }
 
@@ -423,7 +433,7 @@ private struct PromptIcon: View {
     }
 }
 
-private struct PromptButtonStyle: ButtonStyle {
+struct PromptButtonStyle: ButtonStyle {
     var fill: AnyShapeStyle
     var text: Color
     /// Smaller when the label ends in a `KeyHint`, so the chip sits snug in the capsule's curve.

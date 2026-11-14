@@ -37,7 +37,7 @@
   suspended process, and attaching to one blocked the main thread for 0.3–0.6 s in about half
   the tries measured.
 - Rows and tiles get `selected` from their list, not by asking `state.selectedTab`; views that
-  change many times a second (`LoadingBar`) read their own state so their parents don't re-run.
+  change many times a second (`LoadingSpinner`, `LinkPreview`) read their own state so their parents don't re-run.
 - Measuring: `hitch start` / `hitch stop <label>`, `layers <path>`, `timeopen <url>`,
   `timeload <url>`, `snapscreen <path>` in `TUFF_DEBUG_SCRIPT` (see `Support/PerfProbe.swift`).
   Page benchmarks need the screen unlocked: a locked Mac reports every page as hidden.

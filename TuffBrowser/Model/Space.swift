@@ -17,6 +17,24 @@ enum PinnedItem: Identifiable {
     var folder: Folder? { if case .folder(let folder) = self { folder } else { nil } }
 }
 
+/// Two tabs shown side by side. The split shows whenever the space's selected tab is one of
+/// them; the selected one is the side that has the keyboard (the "focused" side).
+struct SplitPair: Equatable, Codable {
+    var leading: UUID
+    var trailing: UUID
+    /// The leading side's share of the width.
+    var fraction: Double = 0.5
+
+    static let fractionRange = 0.2...0.8
+
+    func contains(_ id: UUID?) -> Bool { id == leading || id == trailing }
+
+    /// The other side of `id`, if `id` is one side.
+    func partner(of id: UUID?) -> UUID? {
+        id == leading ? trailing : id == trailing ? leading : nil
+    }
+}
+
 @Observable
 final class Space: Identifiable {
     let id: UUID
@@ -31,6 +49,8 @@ final class Space: Identifiable {
     var pinnedItems: [PinnedItem] = []
     var tabs: [Tab] = []
     var selectedTabID: UUID?
+    /// Two of the space's tabs shown side by side (see `SplitPair`).
+    var split: SplitPair?
 
     init(id: UUID = UUID(), name: String, icon: String, colorHex: String, profileID: UUID) {
         self.id = id

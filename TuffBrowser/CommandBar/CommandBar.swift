@@ -16,6 +16,12 @@ struct Suggestion: Identifiable, Equatable {
     var icon: NSImage?
 
     static func == (a: Suggestion, b: Suggestion) -> Bool { a.id == b.id }
+
+    /// The page of a history suggestion (which can be removed from history).
+    var historyURL: URL? {
+        if case .history(let url) = kind { return url }
+        return nil
+    }
 }
 
 /// Dimmed scrim + the floating command bar (⌘T / ⌘L).
@@ -46,11 +52,56 @@ struct CommandBarOverlay: View {
     }
 }
 
+/// The horizontal layout's command bar: typed into right where the address bar is, with the
+/// suggestions dropping down under it, as in Safari and Chrome.
+struct DockedCommandBar: View {
+    @Environment(BrowserState.self) private var state
+    let mode: CommandBarMode
+    /// The address bar's frame in `RootView.space`; the field sits exactly over it.
+    let frame: CGRect
+    @State private var appeared = false
+
+    static let minWidth: CGFloat = 380
+
+    var body: some View {
+        let width = max(frame.width, Self.minWidth)
+        ZStack(alignment: .topLeading) {
+            // A click anywhere else puts the address back.
+            Color.clear
+                .contentShape(Rectangle())
+                .onTapGesture { state.closeCommandBar() }
+
+            CommandBarView(mode: mode, docked: true, fieldHeight: frame.height)
+                .id(mode)
+                .frame(width: width)
+                .opacity(appeared ? 1 : 0)
+                .offset(x: frame.minX, y: frame.minY)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .onAppear {
+            withAnimation(.easeOut(duration: 0.12)) { appeared = true }
+        }
+    }
+}
+
+/// Where the toolbar's address bar is, so the docked command bar can sit on it.
+struct URLPillFrameKey: PreferenceKey {
+    static let defaultValue: CGRect = .zero
+    static func reduce(value: inout CGRect, nextValue: () -> CGRect) {
+        let next = nextValue()
+        if next != .zero { value = next }
+    }
+}
+
 struct CommandBarView: View {
     @Environment(BrowserState.self) private var state
     @Environment(AppSettings.self) private var settings
     @Environment(\.accent) private var accent
     let mode: CommandBarMode
+    /// Drawn in the toolbar's address bar (horizontal layout) rather than floating mid-window.
+    var docked = false
+    /// The docked field's height: the address bar's.
+    var fieldHeight: CGFloat = 30
 
     @State private var text = ""
     @State private var initialText = ""
@@ -58,6 +109,35 @@ struct CommandBarView: View {
     @State private var remote: [Suggestion] = []
     @State private var selection = 0
     @State private var fetchTask: Task<Void, Never>?
+    /// A leading `!bang` that has been typed and turned into a chip; `text` is then just the query.
+    @State private var chip: Bang?
+    /// The site the typed text completes to inline ("git" → "github.com"), from history.
+    @State private var completedText: String?
+    /// Set by ⌫: no completion again until something is typed (else deleting the completion
+    /// would bring it straight back).
+    @State private var suppressCompletion = false
+    @State private var lastLength = 0
+
+    /// The completion shown, selected, after the typed text.
+    private var completionSuffix: String? {
+        guard let full = completedText, chip == nil, !text.isEmpty, full.count > text.count,
+              full.lowercased().hasPrefix(text.lowercased()) else { return nil }
+        return String(full.dropFirst(text.count))
+    }
+
+    /// The bang this search goes to: the chip, one typed at the end (`cats !yt`), or one being
+    /// typed at the start that hasn't had its space yet (`!yt`).
+    private var activeBang: BangMatch? { bangMatch(for: text) }
+
+    private func bangMatch(for input: String) -> BangMatch? {
+        if let chip { return BangMatch(bang: chip, query: input.trimmed, position: .leading) }
+        guard settings.mods.bangs else { return nil }
+        return BangStore.shared.match(input)
+    }
+
+    private var chipAnimation: Animation? {
+        settings.animationsEnabled ? .spring(response: 0.34, dampingFraction: 0.7) : nil
+    }
 
     private var suggestions: [Suggestion] {
         var seen = Set<String>()
@@ -66,67 +146,114 @@ struct CommandBarView: View {
 
     var body: some View {
         let items = suggestions
+        let trailingBang = activeBang.flatMap { chip == nil && $0.position == .trailing ? $0.bang : nil }
+        let radius: CGFloat = docked ? 10 : 18
+        let shape = RoundedRectangle(cornerRadius: radius, style: .continuous)
         VStack(spacing: 0) {
-            HStack(spacing: 12) {
-                Image(systemName: mode == .newTab ? "magnifyingglass" : "globe")
-                    .font(.system(size: 16, weight: .medium))
+            HStack(spacing: docked ? 8 : 12) {
+                Image(systemName: mode == .newTab ? "magnifyingglass" : mode == .splitTab ? "rectangle.split.2x1" : "globe")
+                    .font(.system(size: docked ? 12 : 16, weight: .medium))
                     .foregroundStyle(.secondary)
-                    .frame(width: 22)
+                    .frame(width: docked ? 16 : 22)
+                if let chip {
+                    BangChip(bang: chip, compact: docked, animated: settings.animationsEnabled)
+                        .id(chip.trigger)
+                        .transition(BangChip.transition(edge: .leading))
+                }
                 KeyTextField(
                     text: $text,
-                    placeholder: mode == .newTab ? "Search or enter address…" : "Search or enter address…",
-                    fontSize: 18, fontWeight: .regular,
+                    placeholder: chip.map { "Search \($0.name)…" } ?? "Search or enter address…",
+                    fontSize: docked ? 13.5 : 18, fontWeight: docked ? .medium : .regular,
                     selectAllOnFocus: true,
                     onSubmit: submit,
                     onCancel: { state.closeCommandBar() },
                     onMoveUp: { move(-1, count: items.count) },
                     onMoveDown: { move(1, count: items.count) },
-                    onTab: { move(1, count: items.count) }
+                    onTab: { move(1, count: items.count) },
+                    onDeleteAtStart: chip == nil ? nil : removeChip,
+                    completionSuffix: completionSuffix,
+                    onDelete: {
+                        suppressCompletion = true
+                        if completedText != nil {
+                            completedText = nil
+                            // Deleting just the completion leaves `text` as it was.
+                            DispatchQueue.main.async { refresh(for: text) }
+                        }
+                    },
+                    onShiftDelete: { removeSelectedHistory(items) }
                 )
-                .frame(height: 26)
-                if mode == .newTab {
-                    Text("New Tab")
-                        .font(.system(size: 11, weight: .semibold))
+                .frame(height: docked ? 20 : 26)
+                if let trailingBang {
+                    BangChip(bang: trailingBang, compact: docked, animated: settings.animationsEnabled)
+                        .id(trailingBang.trigger)
+                        .transition(BangChip.transition(edge: .trailing))
+                }
+                if mode != .editCurrent {
+                    Text(mode == .splitTab ? "Split View" : "New Tab")
+                        .font(.system(size: docked ? 10.5 : 11, weight: .semibold))
                         .foregroundStyle(.secondary)
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 4)
+                        .padding(.horizontal, docked ? 7 : 8)
+                        .padding(.vertical, docked ? 2 : 4)
                         .background(Capsule().fill(.primary.opacity(0.08)))
                 }
             }
-            .padding(.horizontal, 18)
-            .frame(height: 58)
+            .padding(.leading, docked ? 10 : 18)
+            .padding(.trailing, docked ? 8 : 18)
+            .frame(height: docked ? fieldHeight : 58)
+            .animation(chipAnimation, value: chip)
+            .animation(chipAnimation, value: trailingBang)
 
             if !items.isEmpty {
                 Rectangle().fill(.primary.opacity(0.1)).frame(height: 1)
-                VStack(spacing: 2) {
+                VStack(spacing: docked ? 1 : 2) {
                     ForEach(Array(items.enumerated()), id: \.element.id) { index, item in
-                        SuggestionRow(item: item, selected: index == selection, accent: accent)
+                        SuggestionRow(
+                            item: item, selected: index == selection, accent: accent, compact: docked,
+                            onRemove: item.historyURL == nil ? nil : { remove(item) }
+                        )
                             .onTapGesture { activate(item) }
                             .onHover { if $0 { selection = index } }
                     }
                 }
-                .padding(8)
+                .padding(docked ? 5 : 8)
                 .transition(.opacity)
             }
         }
-        .frame(width: 640)
+        .frame(width: docked ? nil : 640)
         .background(
             ZStack {
                 VisualEffect(material: .hudWindow, blending: .withinWindow)
-                Color(nsColor: state.currentTint).opacity(0.55)
+                Color(nsColor: state.currentTint).opacity(docked ? 0.7 : 0.55)
             }
         )
-        .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous).strokeBorder(.primary.opacity(0.14), lineWidth: 1))
-        .shadow(color: .black.opacity(0.4), radius: 40, y: 18)
+        .clipShape(shape)
+        .overlay(
+            docked
+                ? shape.strokeBorder(accent.opacity(0.75), lineWidth: 1.5)
+                : shape.strokeBorder(.primary.opacity(0.14), lineWidth: 1)
+        )
+        .modifier(CardShadow(
+            cornerRadius: radius, opacity: docked ? (items.isEmpty ? 0.12 : 0.3) : 0.4,
+            radius: docked ? 16 : 40, y: docked ? 8 : 18, hollow: true
+        ))
         .animation(Motion.quick, value: items.count)
         .onAppear {
+            if settings.mods.bangs { BangStore.shared.prepare() }
             if mode == .editCurrent, let url = state.selectedTab?.url {
                 text = url.absoluteString
                 initialText = text
             }
         }
-        .onChange(of: text) { _, new in refresh(for: new) }
+        .onChange(of: text) { _, new in
+            // "!yt " — a known bang finished with a space — becomes a chip.
+            if chip == nil, settings.mods.bangs, let token = BangStore.shared.leadingToken(new) {
+                chip = token.bang
+                text = token.rest
+                return
+            }
+            refresh(for: new)
+        }
+        .onChange(of: chip) { refresh(for: text) }
         .onDisappear { fetchTask?.cancel() }
     }
 
@@ -137,17 +264,42 @@ struct CommandBarView: View {
         selection = (selection + delta + count) % count
     }
 
+    /// ⌫ at the start of the field: an empty field gets the bang back as text to edit; otherwise
+    /// the chip just goes and the query stays.
+    private func removeChip() {
+        guard let bang = chip else { return }
+        chip = nil
+        if text.isEmpty { text = "!" + bang.trigger }
+    }
+
     private func submit() {
         let items = suggestions
-        if items.indices.contains(selection), !text.trimmed.isEmpty, text != initialText || selection > 0 {
+        let hasInput = !text.trimmed.isEmpty || chip != nil
+        if items.indices.contains(selection), hasInput, text != initialText || selection > 0 || chip != nil {
             activate(items[selection])
-        } else if !text.trimmed.isEmpty {
-            let input = text
+        } else if hasInput {
+            let input = chip.map { "!\($0.trigger) " + text } ?? text
             state.closeCommandBar()
             state.open(input: input, mode: mode)
         } else {
             state.closeCommandBar()
         }
+    }
+
+    /// ⇧⌫ on a history suggestion: forget that page.
+    private func removeSelectedHistory(_ items: [Suggestion]) -> Bool {
+        guard items.indices.contains(selection), items[selection].historyURL != nil else { return false }
+        remove(items[selection])
+        return true
+    }
+
+    /// Removes a history suggestion's page from history and from the list.
+    private func remove(_ item: Suggestion) {
+        guard let url = item.historyURL else { return }
+        HistoryStore.shared.delete([url])
+        let keep = selection
+        refresh(for: text)
+        selection = min(keep, max(0, suggestions.count - 1))
     }
 
     private func activate(_ item: Suggestion) {
@@ -156,17 +308,29 @@ struct CommandBarView: View {
         case .go(let url), .history(let url):
             state.open(url: url, mode: mode)
         case .search(let query):
-            state.open(url: settings.general.searchEngine.searchURL(for: query), mode: mode)
+            let url = activeBang?.bang.url(for: query) ?? settings.general.searchEngine.searchURL(for: query)
+            state.open(url: url, mode: mode)
         case .tab(let id):
-            if let tab = state.allTabs.first(where: { $0.id == id }) { state.select(tab) }
+            guard let tab = state.allTabs.first(where: { $0.id == id }) else { return }
+            if mode == .splitTab { state.split(with: tab) } else { state.select(tab) }
         }
     }
 
     private func refresh(for input: String) {
-        let query = input.trimmed
+        let bang = bangMatch(for: input)
+        let query = (bang?.query ?? input).trimmed
         selection = 0
         fetchTask?.cancel()
-        guard !query.isEmpty, input != initialText else {
+        // Inline completion: only while typing forwards, and not over a bang or a search.
+        let grew = input.count > lastLength
+        lastLength = input.count
+        if grew { suppressCompletion = false }
+        completedText = nil
+        if bang == nil, chip == nil, !suppressCompletion, settings.search.historySuggestions,
+           input != initialText, input == input.trimmed {
+            completedText = HistoryStore.shared.hostCompletion(for: input)
+        }
+        guard bang != nil || (!query.isEmpty && input != initialText) else {
             local = []
             remote = []
             return
@@ -175,24 +339,51 @@ struct CommandBarView: View {
 
         // Instant, local results.
         var items: [Suggestion] = []
-        let resolved = BrowserState.resolve(query, engine: engine)
-        let isSearch = resolved == engine.searchURL(for: query)
-        if isSearch {
-            items.append(Suggestion(id: "search:" + query, kind: .search(query), title: query, subtitle: "Search \(engine.label)", symbol: "magnifyingglass"))
+        if let bang {
+            let icon = bang.bang.homeURL.flatMap { FaviconStore.shared.cachedIcon(for: $0) }
+            if query.isEmpty, let home = bang.bang.homeURL {
+                // Just the chip: ↩ opens the site.
+                local = [Suggestion(id: "go:" + home.absoluteString, kind: .go(home), title: bang.bang.name, subtitle: bang.bang.domain, symbol: "arrow.up.right", icon: icon)]
+                remote = []
+                return
+            }
+            items.append(Suggestion(id: "bang:" + query, kind: .search(query), title: query, subtitle: "Search \(bang.bang.name)", symbol: "magnifyingglass", icon: icon))
+        } else if let completedText {
+            // ↩ opens the completed site.
+            let resolved = BrowserState.resolve(completedText, engine: engine)
+            items.append(Suggestion(id: "go:" + resolved.absoluteString, kind: .go(resolved), title: completedText, subtitle: "Open", symbol: "arrow.up.right", icon: FaviconStore.shared.cachedIcon(for: resolved)))
         } else {
-            items.append(Suggestion(id: "go:" + resolved.absoluteString, kind: .go(resolved), title: query, subtitle: "Open", symbol: "arrow.up.right"))
+            let resolved = BrowserState.resolve(query, engine: engine)
+            if resolved == engine.searchURL(for: query) {
+                items.append(Suggestion(id: "search:" + query, kind: .search(query), title: query, subtitle: "Search \(engine.label)", symbol: "magnifyingglass"))
+            } else {
+                items.append(Suggestion(id: "go:" + resolved.absoluteString, kind: .go(resolved), title: query, subtitle: "Open", symbol: "arrow.up.right"))
+            }
         }
 
         let needle = query.lowercased()
-        let openTabs = !settings.search.openTabSuggestions ? [] : state.allTabs.filter { tab in
+        // In a split, only the current space's tabs can go beside this one.
+        let candidates = mode == .splitTab ? state.allTabs.filter { state.canSplit(with: $0) } : state.allTabs
+        let openTabs = !settings.search.openTabSuggestions ? [] : candidates.filter { tab in
             tab !== state.selectedTab
                 && (tab.displayTitle.lowercased().contains(needle) || (tab.url?.absoluteString.lowercased().contains(needle) ?? false))
         }
         for tab in openTabs.prefix(2) {
             items.append(Suggestion(
                 id: "tab:" + tab.id.uuidString, kind: .tab(tab.id), title: tab.displayTitle,
-                subtitle: "Switch to Tab", symbol: "rectangle.on.rectangle", icon: tab.favicon
+                subtitle: mode == .splitTab ? "Open in Split View" : "Switch to Tab",
+                symbol: mode == .splitTab ? "rectangle.split.2x1" : "rectangle.on.rectangle", icon: tab.favicon
             ))
+        }
+
+        // Tuff's own pages, by name ("hist" → History).
+        if needle.count >= 3 {
+            for page in InternalPage.allCases where page != .source && page.title.lowercased().hasPrefix(needle) {
+                items.append(Suggestion(
+                    id: "page:" + page.rawValue, kind: .go(page.url), title: page.title,
+                    subtitle: "Tuff", symbol: page.symbol
+                ))
+            }
         }
 
         let openURLs = Set(openTabs.prefix(2).compactMap { $0.url?.absoluteString })
@@ -233,10 +424,110 @@ struct CommandBarView: View {
     }
 }
 
+/// A `!bang` the command bar recognised: the site's icon and name in an accent capsule. It
+/// pops in with a little blur-to-sharp spring, then a single sheen runs across it.
+struct BangChip: View {
+    @Environment(\.accent) private var accent
+    let bang: Bang
+    var compact = false
+    var animated = true
+    @State private var icon: NSImage?
+    @State private var sheen: CGFloat = -0.6
+
+    var body: some View {
+        HStack(spacing: compact ? 4 : 5) {
+            Group {
+                if let icon {
+                    Image(nsImage: icon)
+                        .resizable()
+                        .interpolation(.high)
+                        .clipShape(RoundedRectangle(cornerRadius: compact ? 3 : 3.5, style: .continuous))
+                        .transition(.opacity.combined(with: .scale(scale: 0.6)))
+                } else {
+                    Text("!")
+                        .font(.system(size: compact ? 11 : 12.5, weight: .heavy, design: .rounded))
+                        .foregroundStyle(accent)
+                        .transition(.opacity)
+                }
+            }
+            .frame(width: compact ? 13 : 15, height: compact ? 13 : 15)
+            Text(bang.name)
+                .font(.system(size: compact ? 12 : 13.5, weight: .semibold))
+                .lineLimit(1)
+                .frame(maxWidth: compact ? 140 : 180, alignment: .leading)
+                .fixedSize(horizontal: true, vertical: false)
+        }
+        .padding(.leading, compact ? 5 : 6)
+        .padding(.trailing, compact ? 8 : 10)
+        .frame(height: compact ? 20 : 26)
+        .background(Capsule().fill(accent.opacity(0.22)))
+        .overlay(Capsule().strokeBorder(accent.opacity(0.5), lineWidth: 0.75))
+        .overlay {
+            GeometryReader { geo in
+                LinearGradient(colors: [.white.opacity(0), .white.opacity(0.32), .white.opacity(0)], startPoint: .leading, endPoint: .trailing)
+                    .frame(width: geo.size.width * 0.45)
+                    .offset(x: sheen * geo.size.width)
+            }
+            .clipShape(Capsule())
+            .blendMode(.plusLighter)
+            .allowsHitTesting(false)
+        }
+        .help("!\(bang.trigger) — \(bang.domain)")
+        .onAppear {
+            guard animated else { return }
+            withAnimation(.easeInOut(duration: 0.75).delay(0.12)) { sheen = 1.2 }
+        }
+        .task(id: bang.domain) {
+            if let home = bang.homeURL, let cached = FaviconStore.shared.cachedIcon(for: home) {
+                icon = cached
+                return
+            }
+            let domain = bang.domain
+            let image = await withCheckedContinuation { done in
+                FaviconStore.shared.icon(forHost: domain) { done.resume(returning: $0) }
+            }
+            guard !Task.isCancelled, let image else { return }
+            withAnimation(animated ? Motion.snappy : nil) { icon = image }
+        }
+    }
+
+    static func transition(edge: HorizontalEdge) -> AnyTransition {
+        let anchor: UnitPoint = edge == .leading ? .leading : .trailing
+        return .asymmetric(
+            insertion: .modifier(
+                active: ChipPop(scale: 0.55, blur: 5, opacity: 0, anchor: anchor),
+                identity: ChipPop(scale: 1, blur: 0, opacity: 1, anchor: anchor)
+            ),
+            removal: .modifier(
+                active: ChipPop(scale: 0.8, blur: 3, opacity: 0, anchor: anchor),
+                identity: ChipPop(scale: 1, blur: 0, opacity: 1, anchor: anchor)
+            )
+        )
+    }
+
+    private struct ChipPop: ViewModifier {
+        let scale: CGFloat
+        let blur: CGFloat
+        let opacity: Double
+        let anchor: UnitPoint
+
+        func body(content: Content) -> some View {
+            content
+                .scaleEffect(scale, anchor: anchor)
+                .blur(radius: blur)
+                .opacity(opacity)
+        }
+    }
+}
+
 struct SuggestionRow: View {
     let item: Suggestion
     let selected: Bool
     let accent: Color
+    /// Smaller rows, for the dropdown under the docked address bar.
+    var compact = false
+    /// A history row can be removed (its × shows while it is selected; ⇧⌫ does the same).
+    var onRemove: (() -> Void)?
 
     var body: some View {
         HStack(spacing: 12) {
@@ -256,27 +547,30 @@ struct SuggestionRow: View {
             .frame(width: 22)
 
             Text(item.title)
-                .font(.system(size: 14, weight: .medium))
+                .font(.system(size: compact ? 13 : 14, weight: .medium))
                 .lineLimit(1)
 
             if !item.subtitle.isEmpty {
                 Text("— " + item.subtitle)
-                    .font(.system(size: 13))
+                    .font(.system(size: compact ? 12 : 13))
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
             }
             Spacer(minLength: 0)
-            if selected {
+            if selected, let onRemove {
+                IconButton(symbol: "xmark", size: 9, weight: .bold, side: 20, help: "Remove from History  ⇧⌫", action: onRemove)
+                    .transition(.opacity)
+            } else if selected {
                 Image(systemName: "return")
                     .font(.system(size: 11, weight: .semibold))
                     .foregroundStyle(.secondary)
                     .transition(.opacity)
             }
         }
-        .padding(.horizontal, 10)
-        .frame(height: 38)
+        .padding(.horizontal, compact ? 8 : 10)
+        .frame(height: compact ? 32 : 38)
         .background(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
+            RoundedRectangle(cornerRadius: compact ? 7 : 10, style: .continuous)
                 .fill(selected ? AnyShapeStyle(accent.opacity(0.28)) : AnyShapeStyle(.clear))
         )
         .contentShape(Rectangle())
