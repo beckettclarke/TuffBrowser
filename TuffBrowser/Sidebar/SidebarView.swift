@@ -715,6 +715,7 @@ private struct SplitTabHalf: View {
             }
         }
         .onHover { hovering = $0 }
+        .onMiddleClick { state.close(tab) }
         .animation(Motion.quick, value: hovering)
         .animation(Motion.quick, value: focused)
         .help(tab.displayTitle)
@@ -1330,6 +1331,7 @@ struct TabRow: View {
             }
         }
         .onHover { hovering = $0 }
+        .onMiddleClick { state.close(tab) }
         .animation(Motion.quick, value: hovering)
         .animation(Motion.quick, value: selected)
         .animation(Motion.quick, value: split)

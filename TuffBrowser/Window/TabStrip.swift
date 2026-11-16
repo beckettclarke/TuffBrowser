@@ -215,6 +215,7 @@ struct StripTab: View {
             }
         }
         .onHover { hovering = $0 }
+        .onMiddleClick { state.close(tab) }
         .animation(Motion.quick, value: hovering)
         .animation(Motion.quick, value: selected)
         .animation(Motion.snappy, value: tab.isPlayingAudio)

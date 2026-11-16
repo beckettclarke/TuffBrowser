@@ -434,6 +434,57 @@ struct SquishButtonStyle: ButtonStyle {
     }
 }
 
+extension View {
+    /// Runs `action` when the middle mouse button is pressed and released over this view.
+    /// SwiftUI has no gesture for it, so this watches the app's events, and only while the
+    /// pointer is over the view: one row at a time has a monitor, not every row.
+    func onMiddleClick(perform action: @escaping () -> Void) -> some View {
+        modifier(MiddleClickModifier(action: action))
+    }
+}
+
+private struct MiddleClickModifier: ViewModifier {
+    let action: () -> Void
+    @State private var watcher = MiddleClickWatcher()
+
+    func body(content: Content) -> some View {
+        content
+            .onHover { inside in
+                if inside { watcher.start(action) } else { watcher.stop() }
+            }
+            .onDisappear { watcher.stop() }
+    }
+}
+
+private final class MiddleClickWatcher {
+    private var monitor: Any?
+    /// The button went down over the view, so a release over it is a click.
+    private var pressed = false
+
+    func start(_ action: @escaping () -> Void) {
+        stop()
+        monitor = NSEvent.addLocalMonitorForEvents(matching: [.otherMouseDown, .otherMouseUp]) { [weak self] event in
+            guard let self, event.buttonNumber == 2 else { return event }
+            if event.type == .otherMouseDown {
+                pressed = true
+                return nil
+            }
+            guard pressed else { return event }
+            pressed = false
+            action()
+            return nil
+        }
+    }
+
+    func stop() {
+        if let monitor { NSEvent.removeMonitor(monitor) }
+        monitor = nil
+        pressed = false
+    }
+
+    deinit { stop() }
+}
+
 enum Motion {
     static let snappy = Animation.spring(response: 0.3, dampingFraction: 0.82)
     static let smooth = Animation.spring(response: 0.42, dampingFraction: 0.88)
