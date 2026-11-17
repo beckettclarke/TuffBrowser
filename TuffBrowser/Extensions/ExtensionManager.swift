@@ -365,6 +365,7 @@ final class ExtensionManager: NSObject {
             Task { @MainActor in await self.load(record) }
         } else {
             unload(id)
+            extensionRemoved(id)
         }
     }
 
@@ -372,6 +373,7 @@ final class ExtensionManager: NSObject {
         guard let record = records.first(where: { $0.id == id }) else { return }
         ExtensionEventPush.shared.emit("management.onUninstalled", args: [id])
         unload(id)
+        extensionRemoved(id)
         if record.path == nil {
             try? FileManager.default.removeItem(at: directory(for: record))
         } else {
@@ -379,6 +381,14 @@ final class ExtensionManager: NSObject {
         }
         records.removeAll { $0.id == id }
         saveRecords()
+    }
+
+    /// An extension was turned off or removed: browser settings, site settings and the theme it
+    /// changed go back to how they were (as in Chrome and Firefox).
+    private func extensionRemoved(_ id: String) {
+        ExtensionSettings.shared.extensionRemoved(id)
+        ExtensionContentSettings.shared.extensionRemoved(id)
+        ExtensionTheme.shared.reset(extensionID: id)
     }
 
     func reload(id: String) {
@@ -1059,9 +1069,35 @@ extension ExtensionManager: WKWebExtensionControllerDelegate {
         _ controller: WKWebExtensionController, openNewWindowUsing configuration: WKWebExtension.WindowConfiguration,
         for extensionContext: WKWebExtensionContext, completionHandler: @escaping ((any WKWebExtensionWindow)?, (any Error)?) -> Void
     ) {
-        trace("openNewWindow type=\(configuration.windowType.rawValue) urls=\(configuration.tabURLs) tabs=\(configuration.tabs.count)")
-        // Tuff has one window; extension "windows" become tabs in it.
-        for url in configuration.tabURLs { browser.newTab(url: url) }
+        trace("openNewWindow type=\(configuration.windowType.rawValue) urls=\(configuration.tabURLs) tabs=\(configuration.tabs.count) private=\(configuration.shouldBePrivate)")
+        // An Incognito window really opens, but extensions don't run in Incognito, so the
+        // extension gets no window back (as in Chrome without "Allow in Incognito").
+        if configuration.shouldBePrivate {
+            if let delegate = AppDelegate.shared {
+                let urls = configuration.tabURLs
+                let incognito = delegate.openIncognitoWindow(url: urls.first)
+                for url in urls.dropFirst() { incognito.newTab(url: url, select: false) }
+            }
+            completionHandler(nil, nil)
+            return
+        }
+        // Tuff has one window, so a new "window" is the main one showing what it was made for:
+        // its new tabs open side by side, and tabs it was asked to move there stay where they are
+        // and the first is brought forward. A popup window opens as a tab too, and the window
+        // keeps its size and state (they belong to the user's window, not the extension's).
+        let focused = configuration.shouldBeFocused
+        var first: Tab?
+        var previous: Tab?
+        for url in configuration.tabURLs {
+            let tab = browser.newTab(url: url, select: false, after: previous)
+            if first == nil { first = tab }
+            previous = tab
+        }
+        if first == nil { first = configuration.tabs.compactMap { $0 as? Tab }.first }
+        if focused {
+            if let first { first.browser?.select(first) }
+            browser.window?.makeKeyAndOrderFront(nil)
+        }
         completionHandler(windowAdapter, nil)
     }
 

@@ -77,9 +77,12 @@ things are left over. Missing features are in TODOS.md (section K).
 | The side panel could "open" with nothing to show on any tab. | `SidePanelManager.open` |
 | Extension pages with no `<script>` tag never got the compatibility shim; module-worker shim replacement relied on fragile markers. | `ExtensionCompat.shimInsertionPoint`, `moduleStart` / `moduleEnd` |
 | A card raised with the browser window closed fell back to a native `NSAlert`. | `PromptPresenter.showNext` |
+| Favicons were fetched without the page's cookies, so icons behind a sign-in failed. Requests now carry the page profile's cookies for the icon's address (and no other profile's). | `FaviconStore.request(for:context:)` |
+| A proxy bypass list set by an extension was dropped: Network's Swift `ProxyConfiguration.excludedDomains` doesn't keep its domains, so proxies are built with the C API. | `ExtensionSettings.proxyConfigurations` |
 
 New debug-script commands (debug builds only): `press [cmd+][shift+][opt+][ctrl+]<key|tab>` sends
 a real key event, and `responder` logs what has keyboard focus. `move x y` and `middleclick x y` post
 pointer events through the event queue (window points, origin bottom-left). Added 2026-11-17:
 `popups` (what the pop-up blocker stopped), `historymenu` (fills and logs the History menu),
-`pasteandgo <text>`, `capture` (camera / mic / full-screen state) and `fsbanner`.
+`pasteandgo <text>`, `capture` (camera / mic / full-screen state) and `fsbanner`. Later the same day: `inspect` (opens
+Web Inspector for the selected tab, for testing `devtools_page` extensions).

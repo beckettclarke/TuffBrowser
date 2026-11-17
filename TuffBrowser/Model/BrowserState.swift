@@ -246,6 +246,10 @@ final class BrowserState {
         return space.allPinned.contains { $0 === tab } ? .pinned : .tabs
     }
 
+    /// A Firefox theme extension's window colour (`browser.theme`), over the user's tint and
+    /// space colours. Never in Incognito, where extensions don't run.
+    var extensionTint: NSColor? { isPrivate ? nil : ExtensionTheme.shared.tint }
+
     /// The tint currently showing, blended between neighbours while swiping spaces.
     var currentTint: NSColor {
         if theme.style == .seamless, let header = selectedTab?.headerColor { return header }
@@ -255,6 +259,7 @@ final class BrowserState {
     /// The tint from the space colours or the theme, before Seamless puts the page's colour in.
     var baseTint: NSColor {
         if isPrivate { return NSColor(hex: Self.incognitoTintHex) }
+        if let extensionTint { return extensionTint }
         guard settings.theme.useSpaceColors, !spaces.isEmpty else { return NSColor(hex: settings.theme.tintHex) }
         let p = max(0, min(Double(spaces.count - 1), pagerPosition))
         let lower = Int(p.rounded(.down))
@@ -1028,9 +1033,10 @@ final class BrowserState {
     // MARK: Folders
 
     /// Adds a folder to a space's pinned section, optionally moving a tab into it, and starts
-    /// editing its name.
+    /// editing its name. Not `interactive` (an extension's `tabs.group`), it is only added:
+    /// the sidebar, space and name field are left alone.
     @discardableResult
-    func addFolder(in space: Space? = nil, with tab: Tab? = nil) -> Folder {
+    func addFolder(in space: Space? = nil, with tab: Tab? = nil, interactive: Bool = true) -> Folder {
         let space = space ?? currentSpace
         let taken = Set(space.folders.map(\.name))
         var name = "New Folder"
@@ -1043,22 +1049,28 @@ final class BrowserState {
             ?? space.pinnedItems.count
         animate { space.pinnedItems.insert(.folder(folder), at: index) }
         if let tab { move(tab, to: .pinned, in: space, folder: folder) }
-        if space !== currentSpace, let index = spaces.firstIndex(where: { $0 === space }) { switchSpace(to: index) }
-        if !sidebarVisible { toggleSidebar() }
-        renamingFolderID = folder.id
+        if interactive {
+            if space !== currentSpace, let index = spaces.firstIndex(where: { $0 === space }) { switchSpace(to: index) }
+            if !sidebarVisible { toggleSidebar() }
+            renamingFolderID = folder.id
+        }
+        if !isPrivate { ExtensionTabGroups.shared.folderCreated(folder) }
         scheduleSave()
         return folder
     }
 
     func toggle(_ folder: Folder) {
         animate { folder.isOpen.toggle() }
+        if !isPrivate { ExtensionTabGroups.shared.folderChanged(folder) }
         scheduleSave()
     }
 
     func rename(_ folder: Folder, to name: String) {
         let trimmed = name.trimmed
+        let changed = !trimmed.isEmpty && trimmed != folder.name
         if !trimmed.isEmpty { folder.name = trimmed }
         if renamingFolderID == folder.id { renamingFolderID = nil }
+        if changed, !isPrivate { ExtensionTabGroups.shared.folderChanged(folder) }
         scheduleSave()
     }
 
@@ -1074,6 +1086,7 @@ final class BrowserState {
             space.pinnedItems.insert(contentsOf: folder.tabs.map(PinnedItem.tab), at: index)
         }
         if renamingFolderID == folder.id { renamingFolderID = nil }
+        if !isPrivate { ExtensionTabGroups.shared.folderRemoved(folder) }
         scheduleSave()
     }
 
@@ -1082,6 +1095,7 @@ final class BrowserState {
         guard let space = space(containing: folder), let index = space.pinnedIndex(of: folder.id),
               space.pinnedItems.indices.contains(index + offset) else { return }
         animate { space.pinnedItems.swapAt(index, index + offset) }
+        if !isPrivate { ExtensionTabGroups.shared.folderMoved(folder) }
         scheduleSave()
     }
 
@@ -1095,6 +1109,7 @@ final class BrowserState {
             let item = space.pinnedItems.remove(at: from)
             space.pinnedItems.insert(item, at: target)
         }
+        if !isPrivate { ExtensionTabGroups.shared.folderMoved(folder) }
         scheduleSave()
     }
 
@@ -1117,19 +1132,27 @@ final class BrowserState {
             }
         }
         if renamingFolderID == folder.id { renamingFolderID = nil }
+        if !isPrivate { ExtensionTabGroups.shared.folderMoved(folder) }
         scheduleSave()
     }
 
     // MARK: Profiles
 
     @discardableResult
-    func addProfile(name: String = "New Profile") -> Profile {
+    func addProfile(name: String = "New Profile", icon: String? = nil) -> Profile {
         let used = Set(profiles.map(\.icon))
-        let icon = Profile.icons.first { !used.contains($0) } ?? "person.fill"
+        let icon = icon ?? Profile.icons.first { !used.contains($0) } ?? "person.fill"
         let profile = isPrivate ? Profile(name: name, icon: icon, privateStore: .nonPersistent()) : Profile(name: name, icon: icon)
         animate { profiles.append(profile) }
+        if !isPrivate { ExtensionContainers.shared.profileCreated(profile) }
         scheduleSave()
         return profile
+    }
+
+    /// The user renamed a profile or changed its icon.
+    func profileDidChange(_ profile: Profile) {
+        if !isPrivate { ExtensionContainers.shared.profileChanged(profile) }
+        scheduleSave()
     }
 
     /// Moves a space to another profile. Its favourites change with it; if the tab it was
@@ -1154,6 +1177,7 @@ final class BrowserState {
     /// Deletes a profile: its spaces move to another profile and its favourites are closed.
     func delete(_ profile: Profile) {
         guard profiles.count > 1, let fallback = profiles.first(where: { $0 !== profile }) else { return }
+        let containerInfo = isPrivate ? nil : ExtensionContainers.shared.info(profile)
         let previous = selectedTab
         for space in spaces(in: profile) { space.profileID = fallback.id }
         for tab in profile.favorites {
@@ -1168,6 +1192,7 @@ final class BrowserState {
         animate { profiles.removeAll { $0 === profile } }
         if !profile.usesSharedStore, !profile.isPrivate { DataStores.removeStore(forProfile: profile.id) }
         ext?.profileDeleted(profile.id)
+        if let containerInfo { ExtensionContainers.shared.profileRemoved(containerInfo) }
         spaceDidChange(previous: previous)
     }
 

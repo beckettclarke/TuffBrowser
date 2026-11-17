@@ -129,6 +129,16 @@ extension Tab: WKWebExtensionTab {
     }
 
     func shouldGrantPermissionsOnUserGesture(for context: WKWebExtensionContext) -> Bool { true }
+
+    // Reader mode (`tabs.toggleReaderMode`, `isArticle`, `isInReaderMode`).
+    func isReaderModeAvailable(for context: WKWebExtensionContext) -> Bool { reader != nil || canUseReader }
+
+    func isReaderModeActive(for context: WKWebExtensionContext) -> Bool { reader != nil }
+
+    func setReaderModeActive(_ active: Bool, for context: WKWebExtensionContext, completionHandler: @escaping ((any Error)?) -> Void) {
+        if active { openReader() } else { closeReader() }
+        completionHandler(nil)
+    }
 }
 
 // MARK: - The browser window as seen by extensions (browser.windows.*)

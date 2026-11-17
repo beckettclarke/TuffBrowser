@@ -6,11 +6,6 @@ options:
   createIntermediateGroups: true
   generateEmptyDirectories: true
 
-packages:
-  Sparkle:
-    url: https://github.com/sparkle-project/Sparkle
-    from: 2.6.4
-
 settings:
   base:
     MARKETING_VERSION: 0.1.0
@@ -18,6 +13,8 @@ settings:
     SWIFT_VERSION: "5.0"
     SWIFT_STRICT_CONCURRENCY: minimal
     DEAD_CODE_STRIPPING: YES
+    # Apple Silicon only: a universal build doubles the executable for Intel Macs.
+    ARCHS: arm64
 
 targets:
   TuffBrowser:
@@ -25,8 +22,6 @@ targets:
     platform: macOS
     sources:
       - path: TuffBrowser
-    dependencies:
-      - package: Sparkle
     scheme:
       testTargets:
         - TuffBrowserTests
@@ -49,11 +44,6 @@ targets:
         NSCameraUsageDescription: A website you opened in Tuff wants to use your camera.
         NSMicrophoneUsageDescription: A website you opened in Tuff wants to use your microphone.
         NSLocationUsageDescription: A website you opened in Tuff wants to use your location.
-        # Sparkle. Set these two before shipping a release (see README).
-        SUFeedURL: $(TUFF_APPCAST_URL)
-        SUPublicEDKey: $(TUFF_SPARKLE_PUBLIC_KEY)
-        SUEnableAutomaticChecks: true
-        SUScheduledCheckInterval: 86400
         CFBundleURLTypes:
           - CFBundleURLName: Web site URL
             CFBundleTypeRole: Viewer
@@ -79,9 +69,6 @@ targets:
         DEVELOPMENT_TEAM: ""
         LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/../Frameworks"
         COMBINE_HIDPI_IMAGES: YES
-        # Fill these in (or override on the xcodebuild command line) to enable auto-updates.
-        TUFF_APPCAST_URL: ""
-        TUFF_SPARKLE_PUBLIC_KEY: ""
       configs:
         Debug:
           # Its own identity, so a Debug build never shares WebKit storage (including
@@ -90,9 +77,8 @@ targets:
           ENABLE_HARDENED_RUNTIME: NO
           SWIFT_OPTIMIZATION_LEVEL: -Onone
         Release:
-          # Ad-hoc signed builds cannot load Sparkle.framework under the hardened runtime
-          # (library validation needs a real Team ID). scripts/release.sh turns this on when
-          # you sign with a Developer ID, which notarization requires.
+          # scripts/release.sh turns the hardened runtime on when you sign with a Developer ID,
+          # which notarization requires.
           ENABLE_HARDENED_RUNTIME: NO
           SWIFT_OPTIMIZATION_LEVEL: -O
           SWIFT_COMPILATION_MODE: wholemodule

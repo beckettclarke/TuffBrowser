@@ -6,6 +6,8 @@ struct Suggestion: Identifiable, Equatable {
         case search(String)
         case history(URL)
         case tab(UUID)
+        /// Text for an extension's omnibox keyword (`chrome.omnibox`).
+        case keyword(String)
     }
 
     let id: String
@@ -117,10 +119,16 @@ struct CommandBarView: View {
     /// would bring it straight back).
     @State private var suppressCompletion = false
     @State private var lastLength = 0
+    /// An extension's omnibox keyword that has been typed ("gh "): the rest of the input goes to it.
+    @State private var keyword: ExtensionOmnibox.Keyword?
+    /// Set once the input has been sent to the keyword's extension, so closing isn't a cancel.
+    @State private var keywordEntered = false
+    /// Which onInputChanged the suggestions showing answer, so a late answer can't replace a newer one.
+    @State private var keywordRequest = 0
 
     /// The completion shown, selected, after the typed text.
     private var completionSuffix: String? {
-        guard let full = completedText, chip == nil, !text.isEmpty, full.count > text.count,
+        guard let full = completedText, chip == nil, keyword == nil, !text.isEmpty, full.count > text.count,
               full.lowercased().hasPrefix(text.lowercased()) else { return nil }
         return String(full.dropFirst(text.count))
     }
@@ -130,6 +138,7 @@ struct CommandBarView: View {
     private var activeBang: BangMatch? { bangMatch(for: text) }
 
     private func bangMatch(for input: String) -> BangMatch? {
+        if keyword != nil { return nil }
         if let chip { return BangMatch(bang: chip, query: input.trimmed, position: .leading) }
         guard settings.mods.bangs else { return nil }
         return BangStore.shared.match(input)
@@ -160,9 +169,13 @@ struct CommandBarView: View {
                         .id(chip.trigger)
                         .transition(BangChip.transition(edge: .leading))
                 }
+                if let keyword {
+                    ExtensionKeywordChip(keyword: keyword, compact: docked)
+                        .transition(BangChip.transition(edge: .leading))
+                }
                 KeyTextField(
                     text: $text,
-                    placeholder: chip.map { "Search \($0.name)…" } ?? "Search or enter address…",
+                    placeholder: chip.map { "Search \($0.name)…" } ?? keyword.map { "Ask \($0.name)…" } ?? "Search or enter address…",
                     fontSize: docked ? 13.5 : 18, fontWeight: docked ? .medium : .regular,
                     selectAllOnFocus: true,
                     onSubmit: submit,
@@ -170,7 +183,7 @@ struct CommandBarView: View {
                     onMoveUp: { move(-1, count: items.count) },
                     onMoveDown: { move(1, count: items.count) },
                     onTab: { move(1, count: items.count) },
-                    onDeleteAtStart: chip == nil ? nil : removeChip,
+                    onDeleteAtStart: chip == nil && keyword == nil ? nil : removeChip,
                     completionSuffix: completionSuffix,
                     onDelete: {
                         suppressCompletion = true
@@ -201,6 +214,7 @@ struct CommandBarView: View {
             .padding(.trailing, docked ? 8 : 18)
             .frame(height: docked ? fieldHeight : 58)
             .animation(chipAnimation, value: chip)
+            .animation(chipAnimation, value: keyword)
             .animation(chipAnimation, value: trailingBang)
 
             if !items.isEmpty {
@@ -245,8 +259,15 @@ struct CommandBarView: View {
             }
         }
         .onChange(of: text) { _, new in
+            // "gh " — an extension's omnibox keyword and a space — hands the input to it.
+            if chip == nil, keyword == nil, mode != .splitTab, let match = ExtensionOmnibox.shared.match(new) {
+                keyword = match.keyword
+                ExtensionOmnibox.shared.started(match.keyword)
+                text = match.rest
+                return
+            }
             // "!yt " — a known bang finished with a space — becomes a chip.
-            if chip == nil, settings.mods.bangs, let token = BangStore.shared.leadingToken(new) {
+            if chip == nil, keyword == nil, settings.mods.bangs, let token = BangStore.shared.leadingToken(new) {
                 chip = token.bang
                 text = token.rest
                 return
@@ -254,7 +275,10 @@ struct CommandBarView: View {
             refresh(for: new)
         }
         .onChange(of: chip) { refresh(for: text) }
-        .onDisappear { fetchTask?.cancel() }
+        .onDisappear {
+            fetchTask?.cancel()
+            if let keyword, !keywordEntered { ExtensionOmnibox.shared.cancelled(keyword) }
+        }
     }
 
     /// Fetches search suggestions with no cookies and nothing kept on disk. `URLSession.shared`
@@ -278,6 +302,12 @@ struct CommandBarView: View {
     /// ⌫ at the start of the field: an empty field gets the bang back as text to edit; otherwise
     /// the chip just goes and the query stays.
     private func removeChip() {
+        if let current = keyword {
+            keyword = nil
+            ExtensionOmnibox.shared.cancelled(current)
+            if text.isEmpty { text = current.keyword } else { refresh(for: text) }
+            return
+        }
         guard let bang = chip else { return }
         chip = nil
         if text.isEmpty { text = "!" + bang.trigger }
@@ -285,6 +315,11 @@ struct CommandBarView: View {
 
     private func submit() {
         let items = suggestions
+        if keyword != nil {
+            activate(items.indices.contains(selection) ? items[selection]
+                     : Suggestion(id: "keyword:", kind: .keyword(text), title: text, subtitle: "", symbol: "puzzlepiece.extension"))
+            return
+        }
         let hasInput = !text.trimmed.isEmpty || chip != nil
         if items.indices.contains(selection), hasInput, text != initialText || selection > 0 || chip != nil {
             activate(items[selection])
@@ -314,6 +349,12 @@ struct CommandBarView: View {
     }
 
     private func activate(_ item: Suggestion) {
+        if case .keyword(let content) = item.kind, let keyword {
+            keywordEntered = true
+            state.closeCommandBar()
+            ExtensionOmnibox.shared.entered(keyword, text: content, newTab: mode == .newTab)
+            return
+        }
         state.closeCommandBar()
         switch item.kind {
         case .go(let url), .history(let url):
@@ -324,10 +365,43 @@ struct CommandBarView: View {
         case .tab(let id):
             guard let tab = state.allTabs.first(where: { $0.id == id }) else { return }
             if mode == .splitTab { state.split(with: tab) } else { state.select(tab) }
+        case .keyword:
+            break
+        }
+    }
+
+    /// Keyword mode: the typed text as the first row (with the extension's default
+    /// suggestion), then what the extension suggests for it, when it answers.
+    private func refreshKeyword(_ keyword: ExtensionOmnibox.Keyword, input: String) {
+        selection = 0
+        fetchTask?.cancel()
+        completedText = nil
+        let omnibox = ExtensionOmnibox.shared
+        let fallback = omnibox.defaultSuggestion(for: keyword.extensionID)
+            .map { $0.replacingOccurrences(of: "%s", with: input) } ?? keyword.name
+        local = [Suggestion(
+            id: "keyword:" + input, kind: .keyword(input), title: input.isEmpty ? keyword.name : input,
+            subtitle: fallback, symbol: "puzzlepiece.extension", icon: keyword.icon
+        )]
+        keywordRequest += 1
+        let request = keywordRequest
+        omnibox.changed(keyword, text: input) { results in
+            guard request == keywordRequest, self.keyword == keyword else { return }
+            remote = results.prefix(7).map { result in
+                Suggestion(
+                    id: "keyword:" + result.content, kind: .keyword(result.content),
+                    title: result.description, subtitle: result.description == result.content ? "" : result.content,
+                    symbol: "puzzlepiece.extension", icon: keyword.icon
+                )
+            }
         }
     }
 
     private func refresh(for input: String) {
+        if let keyword {
+            refreshKeyword(keyword, input: input)
+            return
+        }
         let bang = bangMatch(for: input)
         let query = (bang?.query ?? input).trimmed
         selection = 0
@@ -528,6 +602,39 @@ struct BangChip: View {
                 .blur(radius: blur)
                 .opacity(opacity)
         }
+    }
+}
+
+/// An extension's omnibox keyword, as a chip in the command bar: its icon and name.
+struct ExtensionKeywordChip: View {
+    @Environment(\.accent) private var accent
+    let keyword: ExtensionOmnibox.Keyword
+    var compact = false
+
+    var body: some View {
+        HStack(spacing: compact ? 4 : 5) {
+            Group {
+                if let icon = keyword.icon {
+                    Image(nsImage: icon).resizable().interpolation(.high)
+                } else {
+                    Image(systemName: "puzzlepiece.extension.fill")
+                        .font(.system(size: compact ? 10 : 11.5, weight: .semibold))
+                        .foregroundStyle(accent)
+                }
+            }
+            .frame(width: compact ? 13 : 15, height: compact ? 13 : 15)
+            Text(keyword.name)
+                .font(.system(size: compact ? 12 : 13.5, weight: .semibold))
+                .lineLimit(1)
+                .frame(maxWidth: compact ? 140 : 180, alignment: .leading)
+                .fixedSize(horizontal: true, vertical: false)
+        }
+        .padding(.leading, compact ? 5 : 6)
+        .padding(.trailing, compact ? 8 : 10)
+        .frame(height: compact ? 20 : 26)
+        .background(Capsule().fill(accent.opacity(0.22)))
+        .overlay(Capsule().strokeBorder(accent.opacity(0.5), lineWidth: 0.75))
+        .help("\(keyword.keyword) — \(keyword.name)")
     }
 }
 

@@ -1,12 +1,10 @@
 # Tuff — Extension & App TODO list
 
-> **Consider replacing the Sparkle framework.** Tuff uses Sparkle only for app updates
-> (`UpdateController` in `App/AppDelegate.swift`, package in `project.yml`). Its update windows
-> are native AppKit (clashing with the custom-dialog rule in AGENTS.md), ad-hoc builds can't load
-> it under the hardened runtime, and it adds a framework plus XPC helpers to the bundle. Weigh a
-> small in-house updater (signed appcast or GitHub Releases check → download → verify signature
-> → swap and relaunch, with `Prompt` cards) against keeping Sparkle with a custom user driver
-> (`SPUUserDriver`) so at least the UI matches.
+> **App updates: none built in.** Sparkle was removed on 2026-11-17 (it was never configured, so it
+> never updated anything, and it added a framework plus XPC helpers to the bundle). The "Check for
+> Updates…" menu item and About button went with it. If updates are wanted later, write a small
+> in-house updater (signed appcast or GitHub Releases check → download → verify signature → swap
+> and relaunch, with `Prompt` cards).
 
 Generated from a full-source audit (every Swift file + the compat shim + the install pipeline),
 cross-checked against the WebKit SDK headers (`WKWebExtensionTab.h`, `WKWebExtensionWindow.h`,
@@ -50,8 +48,10 @@ method is missing in `Extensions/ExtensionBridge.swift`. These are the easiest, 
       and `tabs.create({openerTabId})`. Done: new weak `Tab.openerTab`, set in `BrowserState.newTab(after:)`.
 - [x] **[P0]** Implement `setSelected(_:for:completionHandler:)` → `tabs.update({active})` / `tabs.highlight`
       selection path. Done: selects via `browser.select(self)` when `selected` is true (deselect is a no-op).
-- [ ] **[P3]** Implement reader-mode trio `isReaderModeAvailable` / `isReaderModeActive` /
+- [x] **[P3]** Implement reader-mode trio `isReaderModeAvailable` / `isReaderModeActive` /
       `setReaderModeActive` (WebKit reader-mode tab APIs). Low demand; optional.
+      Done (2026-11-17): on Tuff's reader mode (`Reader/Reader.swift`), which now also reports `.readerMode` changes.
+      Runtime-verified: `tabs.get` gives `isArticle: true` on example.com.
 
 ### Window adapter (`BrowserWindowAdapter: WKWebExtensionWindow`)
 - [x] **[P0]** Implement `setWindowState(_:for:completionHandler:)` → `windows.update({state})`
@@ -60,8 +60,13 @@ method is missing in `Extensions/ExtensionBridge.swift`. These are the easiest, 
       Done: uses the same screen-coordinate convention as `frame(for:)` so a get/set round-trips.
 - [x] **[P0]** Implement `close(for:completionHandler:)` → `windows.remove()`. Done: single-window model —
       `performClose` on the browser window; session kept, window returns from the Dock, no tabs destroyed.
-- [ ] **[P2]** `openNewWindowUsing` (ExtensionManager.swift:955) ignores `windowType`, incognito, and
+- [x] **[P2]** `openNewWindowUsing` (ExtensionManager.swift:955) ignores `windowType`, incognito, and
       moving existing tabs (`configuration.tabs`). At least honour moving existing tabs; document the rest.
+      Done (2026-11-17): `incognito: true` opens a real Incognito window with the URLs (the extension gets no
+      window back, since extensions don't run there). Otherwise the "new window" is the main one: its URLs
+      open side by side, the first (or the first tab it was asked to move) is brought forward if `focused`,
+      and nothing is selected if `focused: false`. Popup windows open as tabs, and `state` / size are
+      ignored (they would resize the user's only window). Runtime-verified.
 
 > **Status: all 8 P0 items implemented and Debug build verified (`make build` → BUILD SUCCEEDED).**
 > Files touched: `Extensions/ExtensionBridge.swift`, `Model/Tab.swift`, `Model/BrowserState.swift`,
@@ -102,15 +107,28 @@ underlying data/capability to make it real. Implement natively, then remove the 
       (uninstall needs a confirm card; events need the push mechanism).
 - [x] **[P1]** `chrome.sessions` → wired to `BrowserState.closedTabs`: `getRecentlyClosed`, `restore`
       (by id, or most recent when omitted), `getDevices` (empty — no sync) implemented. Added stable
-      `id` + `closedAt` to `ClosedTab` (optional, so old sessions still decode). **`onChanged` still inert.**
+      `id` + `closedAt` to `ClosedTab` (optional, so old sessions still decode). `onChanged` fires on close,
+      restore and clear (event push).
 - [x] **[P1]** `chrome.topSites` → `get` implemented, derived from `HistoryStore` visit counts.
 - [x] **[P1]** `chrome.browsingData` → `remove`, `removeCache`, `removeCookies`, `removeLocalStorage`,
-      `removeHistory`, `settings` implemented (async, across all profile stores). `removeDownloads` /
-      `removeFormData` / `removePasswords` pending (no clean WebKit data-type mapping).
-- [ ] **[P1]** `chrome.tabGroups` → map to Tuff folders (Model/Folder.swift): `get`, `query`, `update`,
+      `removeHistory`, `settings` implemented (async, across all profile stores).
+      2026-11-17: `downloads` clears the (non-Incognito) downloads list since `since`, files kept, as in
+      Chrome. `formData` / `passwords` succeed with nothing to do: Tuff saves neither.
+- [x] **[P1]** `chrome.tabGroups` → map to Tuff folders (Model/Folder.swift): `get`, `query`, `update`,
       `move`, `onCreated`/`onUpdated`/`onMoved`/`onRemoved`. Also `tabs.group`/`ungroup`.
-- [ ] **[P1]** Firefox `browser.contextualIdentities` → map to Tuff profiles (Model/Profile.swift):
+      Done (2026-11-17): `Extensions/ExtensionGroups.swift`. Grouping pins a tab into the folder; ungrouping
+      returns it to the space's regular tabs; a folder made by `tabs.group` goes away with its last tab
+      (the user's own folders never do). Group ids are per session; folders have no colour, so a colour an
+      extension sets lasts the session. Events come from `BrowserState` (the user's folder changes fire them
+      too). Extensions that declare `tabGroups` get `groupId` on `tabs.query` / `tabs.get` and can query by it.
+      Runtime-verified (group, get, update, query by groupId, ungroup, onCreated/onUpdated/onRemoved).
+- [x] **[P1]** Firefox `browser.contextualIdentities` → map to Tuff profiles (Model/Profile.swift):
       `query`, `get`, `create`, `update`, `remove`, `onCreated`/`onUpdated`/`onRemoved`.
+      Done (2026-11-17): `cookieStoreId` is `firefox-container-<profile id>`; icons map to SF Symbols, colours
+      are derived from the profile's first space (or the one an extension set, for the session). `remove`
+      deletes the profile only after a destructive `Prompt` card. Extensions that declare
+      `contextualIdentities` get `cookieStoreId` on tabs, can query by it, and `tabs.create({cookieStoreId})`
+      opens the tab in a space of that profile (an error if the profile has no space yet). Runtime-verified.
 
 > **Bridge built (this batch):** `Extensions/ExtensionAPIs.swift` (`ExtensionAPIBridge`) generalizes the
 > side-panel bridge: the shim calls `tabs.create({url:'tuff-api://<ns>/<method>/?d=<json>'})`, Tuff answers
@@ -139,15 +157,37 @@ underlying data/capability to make it real. Implement natively, then remove the 
 
 - [x] **[P2]** `chrome.idle` → `ExtensionSystem.swift`: `queryState` (CGEventSource HID idle time),
       `setDetectionInterval`, and `onStateChanged` (timer polls and pushes on change) implemented.
-- [ ] **[P2]** `chrome.clipboard` (Firefox) + `clipboardRead`/`clipboardWrite` → `NSPasteboard`.
-- [ ] **[P2]** `chrome.privacy` → map to `AppSettings.privacy` (network/webRTC/cookies etc. as feasible).
-- [ ] **[P2]** `chrome.contentSettings` → map to `SitePermissions` (camera/mic/cookies/JS/images…).
-- [ ] **[P2]** Firefox `browser.browserSettings` → map to `AppSettings` (allowPopups, cookies, JS, etc.).
-- [ ] **[P2]** Firefox `browser.theme` → map to Tuff `Theme` (getCurrent, update, reset, onUpdated).
-- [ ] **[P2]** Firefox `browser.find` → wire to the find bar (RootView.swift `FindBar`): `find`, `highlightResults`, `removeHighlighting`.
+- [x] **[P2]** `chrome.clipboard` (Firefox) + `clipboardRead`/`clipboardWrite` → `NSPasteboard`.
+      Done (2026-11-17): `setImageData` (png / jpeg) writes to the pasteboard. The image travels in the bridge
+      URL, so very large images may not fit. Runtime-verified.
+- [x] **[P2]** `chrome.privacy` → map to `AppSettings.privacy` (network/webRTC/cookies etc. as feasible).
+      Done (2026-11-17): `Extensions/ExtensionSettings.swift` (one `ChromeSetting` model for privacy, proxy,
+      browserSettings and fonts, with level of control, `clear`, `onChange`, and the old value put back when
+      the extension is turned off or removed). Controllable: `services.safeBrowsingEnabled`,
+      `services.searchSuggestEnabled`, `websites.thirdPartyCookiesAllowed`, Firefox `websites.cookieConfig`.
+      The rest report what WebKit does as `not_controllable`. Runtime-verified.
+- [x] **[P2]** `chrome.contentSettings` → map to `SitePermissions` (camera/mic/cookies/JS/images…).
+      Done (2026-11-17): `javascript` / `popups` on `SiteSettings` (per host, or every site via `<all_urls>`,
+      which changes Settings → Privacy); `location` / `notifications` / `camera` / `microphone` on
+      `SitePermissions` (allow / block / ask). `cookies`, `images`, etc. report Tuff's behaviour and refuse
+      `set`. `clear`, and turning the extension off or removing it, takes its changes back out. Runtime-verified.
+- [x] **[P2]** Firefox `browser.browserSettings` → map to `AppSettings` (allowPopups, cookies, JS, etc.).
+      Done (2026-11-17): all of Firefox's keys answer with what Tuff does; `verticalTabs` is controllable.
+- [x] **[P2]** Firefox `browser.theme` → map to Tuff `Theme` (getCurrent, update, reset, onUpdated).
+      Done (2026-11-17): a theme's `frame` colour tints the window over the user's tint and space colours
+      (never in Incognito) until `reset` or the extension is turned off; the user's theme is never changed.
+      Runtime-verified.
+- [x] **[P2]** Firefox `browser.find` → wire to the find bar (RootView.swift `FindBar`): `find`, `highlightResults`, `removeHighlighting`.
+      Done (2026-11-17): searched in a content world of its own instead of the find bar, with `caseSensitive`,
+      `entireWord`, `matchDiacritics`, `rangeData` and `rectData`; highlights use the CSS Custom Highlight API.
+      Runtime-verified.
 - [x] **[P2]** `chrome.search` → `query` implemented (opens the configured engine; CURRENT_TAB / NEW_TAB).
       Firefox `browser.search.get` pending.
-- [ ] **[P2]** `chrome.omnibox` → command-bar keyword integration: `setDefaultSuggestion`, `onInputStarted/Changed/Entered/Cancelled`.
+- [x] **[P2]** `chrome.omnibox` → command-bar keyword integration: `setDefaultSuggestion`, `onInputStarted/Changed/Entered/Cancelled`.
+      Done (2026-11-17): typing an extension's keyword and a space in the command bar turns it into a chip;
+      the rest goes to `onInputChanged`, its `suggest()` results list under the field, ↩ sends
+      `onInputEntered` (`newForegroundTab` from ⌘T, `currentTab` from ⌘L), and Esc / ⌫ on the chip cancels.
+      Runtime-verified. `onDeleteSuggestion` isn't offered yet.
 - [x] **[P2]** `chrome.tts` → `ExtensionTTS.swift` (AVSpeechSynthesizer): `speak`, `stop`, `pause`, `resume`,
       `getVoices`, `isSpeaking` implemented (180 voices returned in test); `onEvent` (start/end/interrupted/
       paused/resumed) pushed via the event mechanism.
@@ -159,10 +199,21 @@ underlying data/capability to make it real. Implement natively, then remove the 
       (`ExtensionContentScripts.swift`). Still missing: `configureWorld` messaging / `runtime.onUserScriptMessage`, `execute`.
 - [x] **[P2]** Firefox `browser.contentScripts` → dynamic content-script registration: `register`, `unregister`
       (also Firefox MV2 `userScripts.register`). Isolated-world scripts get a world per extension without extension APIs.
-- [ ] **[P2]** `chrome.proxy` → system/proxy config: `settings`, `onProxyError`. (Scope carefully; may be partial.)
-- [ ] **[P2]** `chrome.fontSettings` → font prefs: `getFont`, `setFont`, `clearFont`, `getFontList`, `onFontChanged`.
+- [x] **[P2]** `chrome.proxy` → system/proxy config: `settings`, `onProxyError`. (Scope carefully; may be partial.)
+      Done (2026-11-17): `fixed_servers` (HTTP / HTTPS CONNECT and SOCKS5, with `bypassList`) and `system` /
+      `direct`, on every website data store through `WKWebsiteDataStore.proxyConfigurations`; Firefox's
+      `manual` shape too. `pac_script`, `auto_detect` and SOCKS4 are refused with an error. Kept across launches.
+      Runtime-verified: a dead proxy blocks a new site, clearing it restores direct loads. `onProxyError` and
+      proxy sign-in (`webRequest.onAuthRequired`) are inert.
+- [x] **[P2]** `chrome.fontSettings` → font prefs: `getFont`, `setFont`, `clearFont`, `getFontList`, `onFontChanged`.
+      Done (2026-11-17): the standard family and default / fixed sizes (WebKit private prefs) and minimum
+      size (Settings) can be set; WebKit has no accessor for the other generic families, so they report
+      their macOS defaults as `not_controllable`. `getFontList` lists system fonts only (pages don't get
+      user-installed ones). Runtime-verified: the page font changes live and in new tabs.
 
 ## D. [P3] Hard / niche inert namespaces (list for completeness; likely leave as no-ops)
+
+Reviewed 2026-11-17: still no-op stand-ins. Neither WebKit nor macOS gives Tuff anything to build these on.
 
 - [ ] **[P3]** `gcm`, `instanceID` (push messaging) — needs a push service; probably WONTFIX.
 - [ ] **[P3]** `debugger` (attach debugger protocol) — large; probably WONTFIX.
@@ -201,7 +252,9 @@ underlying data/capability to make it real. Implement natively, then remove the 
       Done (2026-11-17): resize / move, debounced 0.3 s; listeners get `windows.getLastFocused()`.
 - [ ] **[P3]** `runtime.onSuspendCanceled` / `onUpdateAvailable` / `onRestartRequired` /
       `onBrowserUpdateAvailable` / `onUserScriptMessage` / `onUserScriptConnect` / `onConnectNative` — mostly
-      lifecycle/debug; wire the ones that become relevant (e.g. onUpdateAvailable once auto-update lands).
+      lifecycle/debug; wire the ones that become relevant.
+      Looked at 2026-11-17: `onUpdateAvailable` isn't needed, since extension updates install at once
+      (`ExtensionUpdates.swift`); Chrome only fires it when it has to wait. The rest stay inert.
 - [ ] **[P3]** `webRequest.onActionIgnored`, `action.onUserSettingsChanged`, `commands.onChanged`,
       `declarativeNetRequest.onRuleMatchedDebug`, `extension.onRequest`/`onRequestExternal` — minor/debug.
 
@@ -267,8 +320,11 @@ underlying data/capability to make it real. Implement natively, then remove the 
       `sleepIdleTabs`) — a stuck loading tab can be auto-closed. Add the check.
 - [x] **[BUG]** `DownloadManager.uniqueDestination` (Stores.swift:273) check-then-use race for concurrent
       same-name downloads; empty filename yields `" 2"`, `" 3"`. Reserve atomically; handle empty names.
-- [ ] **[BUG]** `FaviconStore.fetchIcon` (Stores.swift:148) uses a separate ephemeral `URLSession`, not the
+- [x] **[BUG]** `FaviconStore.fetchIcon` (Stores.swift:148) uses a separate ephemeral `URLSession`, not the
       tab's profile store — auth-gated favicons fail and per-profile isolation is bypassed. Fetch in-context.
+      Done (2026-11-17): still its own cookie-less session, but each request now carries the cookies the page's
+      profile store holds for the icon's address (`WKHTTPCookieStore`, RFC 6265 domain / path / secure
+      matching), the page's user agent and an origin referrer. Unit-tested; favicons runtime-checked.
 - [x] **[BUG]** `WebEngine` sets `developerExtrasEnabled` via KVC without a `responds` guard
       (WebEngine.swift:90, :131) — guard it like the other private prefs to avoid `NSUndefinedKeyException`.
 - [x] **[BUG]** `BrowserState.newTab` before restore (BrowserState.swift:172) returns an orphaned `Tab`
@@ -292,16 +348,26 @@ underlying data/capability to make it real. Implement natively, then remove the 
 
 ## I. [VERIFY] Confirm before acting
 
-- [ ] **[VERIFY]** **`sidePanel` bypass risk** — the shim installs Tuff's bridge only `if absent(root,'sidePanel')`.
+- [x] **[VERIFY]** **`sidePanel` bypass risk** — the shim installs Tuff's bridge only `if absent(root,'sidePanel')`.
       The WebKit binary contains `sidePanel`/`getLayout`/`setLayout` strings (possibly generic false positives).
       At runtime, check whether WebKit exposes any `sidePanel` object; if it does, Tuff's working bridge is
       bypassed for WebKit's partial one. If so, force Tuff's implementation.
-- [ ] **[VERIFY]** **`devtools_page` / `chrome.devtools.*`** — no host handling exists; binary has
+      Checked 2026-11-17 in an extension page: `chrome.sidePanel.open` is the shim's own function, so WebKit
+      exposes no `sidePanel` and Tuff's bridge is the one in use. Nothing to change.
+- [x] **[VERIFY]** **`devtools_page` / `chrome.devtools.*`** — no host handling exists; binary has
       `inspectedWindow`/`devtools_page` but lacks `getResources`/`setContent`. Confirm whether React/Redux/Vue
       DevTools can work at all; if not, document as unsupported (see J).
-- [ ] **[VERIFY]** Re-confirm any "inert" namespace before implementing it — generic binary strings
+      Checked 2026-11-17 (new `inspect` debug command opens Web Inspector): WebKit loads an extension's
+      `devtools_page` when Web Inspector opens, with no Tuff code needed. It provides
+      `devtools.inspectedWindow.eval` / `reload` / `tabId`, `devtools.panels.create` / `themeName` /
+      `onThemeChanged`, and `devtools.network`. Missing: `inspectedWindow.getResources`, `panels.elements` /
+      `sources` sidebars and `openResource`. So DevTools that only add a panel and `eval` in the page can work;
+      ones needing the Elements sidebar won't fully work. Not tried with React / Vue DevTools themselves.
+- [x] **[VERIFY]** Re-confirm any "inert" namespace before implementing it — generic binary strings
       (`notifications`, `downloads`, `cpu`, `search`, …) false-positive; trust distinctive camelCase API
       identifiers and a runtime `typeof chrome.X` check in an extension page.
+      2026-11-17: done for this batch. Every namespace added here was checked to be absent at runtime first
+      (the shim only fills in names WebKit leaves undefined).
 
 ---
 

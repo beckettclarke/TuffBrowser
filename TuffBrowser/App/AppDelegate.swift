@@ -1,5 +1,4 @@
 import AppKit
-import Sparkle
 import SwiftUI
 import WebKit
 
@@ -14,7 +13,6 @@ final class AppDelegate: NSObject {
     /// Open Incognito windows. Each has its own state, dropped when it closes.
     private var incognitoControllers: [BrowserWindowController] = []
     private var settingsWindow: SettingsWindowController?
-    private let updater = UpdateController()
     /// The quit card on screen, if any.
     private var quitPromptID: UUID?
     /// Set once the user has said yes, so the follow-up `terminate` goes straight through.
@@ -91,7 +89,6 @@ final class AppDelegate: NSObject {
     @objc func showAbout(_ sender: Any?) { showSettings(tab: .about) }
     @objc func showSettingsWindow(_ sender: Any?) { showSettings() }
     @objc func showExtensions(_ sender: Any?) { showSettings(tab: .extensions) }
-    @objc func checkForUpdates(_ sender: Any?) { updater.checkForUpdates() }
     @objc func showBrowserWindow(_ sender: Any?) { showMainWindow() }
 
     @objc func newTab(_ sender: Any?) {
@@ -316,7 +313,6 @@ extension AppDelegate: NSApplicationDelegate {
         // Puts the compiled ad-blocking lists on (or builds them) before the first page loads.
         ContentBlocker.shared.start()
         showMainWindow()
-        updater.start()
         #if DEBUG
         DebugHooks.runIfRequested()
         #endif
@@ -429,39 +425,5 @@ extension AppDelegate: NSApplicationDelegate {
         let me = ProcessInfo.processInfo.processIdentifier
         return NSRunningApplication.runningApplications(withBundleIdentifier: id)
             .first { $0.processIdentifier != me && !$0.isTerminated }
-    }
-}
-
-/// Sparkle wrapper. The updater only starts once a feed URL and signing key are configured,
-/// so development builds don't nag about a missing appcast.
-final class UpdateController {
-    private var controller: SPUStandardUpdaterController?
-
-    var isConfigured: Bool {
-        let info = Bundle.main.infoDictionary
-        let feed = info?["SUFeedURL"] as? String ?? ""
-        let key = info?["SUPublicEDKey"] as? String ?? ""
-        return feed.hasPrefix("https://") && !key.isEmpty
-    }
-
-    func start() {
-        guard isConfigured, controller == nil else { return }
-        controller = SPUStandardUpdaterController(startingUpdater: true, updaterDelegate: nil, userDriverDelegate: nil)
-    }
-
-    func checkForUpdates() {
-        if let controller {
-            controller.checkForUpdates(nil)
-            return
-        }
-        Task { @MainActor in
-            await PromptPresenter.present(Prompt(
-                symbol: "arrow.triangle.2.circlepath",
-                title: "Updates aren’t set up for this build",
-                message: "Set TUFF_APPCAST_URL and TUFF_SPARKLE_PUBLIC_KEY in project.yml (see the README), then rebuild. Sparkle will handle the rest.",
-                confirmTitle: "OK",
-                cancelTitle: nil
-            ))
-        }
     }
 }

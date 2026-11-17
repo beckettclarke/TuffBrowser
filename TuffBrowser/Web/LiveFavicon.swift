@@ -101,7 +101,8 @@ extension Tab {
               page.scheme == "http" || page.scheme == "https" else { return }
         faviconRequest += 1
         let request = faviconRequest
-        FaviconStore.shared.icon(at: iconURL, pageURL: page, persist: !(browser?.isPrivate ?? false)) { [weak self] image in
+        let context = webView.map { FaviconStore.RequestContext(webView: $0) } ?? FaviconStore.RequestContext()
+        FaviconStore.shared.icon(at: iconURL, pageURL: page, persist: !(browser?.isPrivate ?? false), context: context) { [weak self] image in
             guard let self, let image, request == self.faviconRequest else { return }
             self.favicon = image
             self.faviconHost = page.host(percentEncoded: false)?.lowercased()

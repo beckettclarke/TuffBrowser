@@ -101,7 +101,7 @@ struct SpaceProfilePicker: View {
                 .help("Rename Profile")
             }
             if renaming {
-                TextField("Profile name", text: Binding(get: { profile.name }, set: { profile.name = $0; state.scheduleSave() }))
+                TextField("Profile name", text: Binding(get: { profile.name }, set: { profile.name = $0; state.profileDidChange(profile) }))
                     .textFieldStyle(.roundedBorder)
                     .font(.system(size: 13))
                     .focused($nameFocused)
@@ -148,6 +148,7 @@ struct ProfileSettingsRow: View {
                     ForEach(Profile.icons, id: \.self) { icon in
                         Button {
                             withAnimation(Motion.snappy) { profile.icon = icon }
+                            state.profileDidChange(profile)
                         } label: {
                             Image(systemName: icon)
                                 .font(.system(size: 13, weight: .medium))

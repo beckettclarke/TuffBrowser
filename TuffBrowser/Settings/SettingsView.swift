@@ -1729,9 +1729,6 @@ struct AboutPage: View {
                 .font(.system(size: 13.5))
                 .foregroundStyle(.primary.opacity(0.65))
                 .padding(.top, 14)
-            Button("Check for Updates…") { AppDelegate.shared?.checkForUpdates(nil) }
-                .buttonStyle(TuffButtonStyle(kind: .prominent))
-                .padding(.top, 22)
             Spacer()
         }
         .frame(maxWidth: .infinity)

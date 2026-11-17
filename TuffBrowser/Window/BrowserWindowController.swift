@@ -174,7 +174,8 @@ final class BrowserWindowController: NSObject {
         lastStyle = theme.style
         // Not `currentTint`, which blends spaces mid-swipe: this runs only when it settles.
         let header = theme.style == .seamless ? state.selectedTab?.headerColor : nil
-        let tint = header ?? (state.isPrivate || theme.useSpaceColors && !state.spaces.isEmpty ? state.baseTint : NSColor(hex: theme.tintHex))
+        let tint = header ?? state.extensionTint
+            ?? (state.isPrivate || theme.useSpaceColors && !state.spaces.isEmpty ? state.baseTint : NSColor(hex: theme.tintHex))
         surface.apply(theme, tint: tint, to: window)
 
         let dark = settings.chromeScheme(for: tint) == .dark

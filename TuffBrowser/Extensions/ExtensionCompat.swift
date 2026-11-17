@@ -30,7 +30,7 @@ enum ExtensionCompat {
     /// whenever `patch` learns to hook the shim in somewhere new, so extensions installed by
     /// an older build are brought up to date the next time they load.
     private static let markerName = "__tuff_compat.level"
-    private static let level = "3"
+    private static let level = "4"
 
     /// The hidden page that opens WebSockets for an extension's service worker (see the shim).
     static let socketRelayPage = "__tuff_socket.html"
@@ -877,10 +877,12 @@ enum ExtensionCompat {
           // first listener subscribes with Tuff so it only wakes extensions that actually listen.
           // listener -> its filter (webNavigation's `{ url: [UrlFilter] }`), per event name.
           const nativeEvents = {};
+          const eventObjects = {};
           const event = (name) => {
+            if (eventObjects[name]) return eventObjects[name];
             const listeners = new Map();
             nativeEvents[name] = listeners;
-            return {
+            return eventObjects[name] = {
               addListener: (fn, filter) => {
                 if (typeof fn !== 'function') return;
                 const first = listeners.size === 0;
@@ -938,6 +940,15 @@ enum ExtensionCompat {
             }
             if (msg.window) {
               try { args[0] = await root.windows.getLastFocused(); } catch (e) {}
+            }
+            // A tab group or theme: its window's id.
+            if ((msg.groupWindow || msg.themeWindow) && args[0] && typeof args[0] === 'object') {
+              try { args[0].windowId = (await root.windows.getLastFocused()).id; } catch (e) {}
+            }
+            // omnibox.onInputChanged: the listener's suggest() callback.
+            if (msg.suggest !== undefined) {
+              const request = msg.suggest;
+              args.push((results) => { call('omnibox', 'suggest', { request, suggestions: results || [] }).catch(() => {}); });
             }
             return args;
           };
@@ -1086,6 +1097,262 @@ enum ExtensionCompat {
           implement('search', {
             query: api((query) => call('search', 'query', query)),
           });
+          // Tab ids <-> Tuff's indexes in the window (Tuff can't know WebKit's ids).
+          const indexOf = async (tabId) => (await root.tabs.get(tabId)).index;
+          const indexesOf = async (ids) => Promise.all((Array.isArray(ids) ? ids : [ids]).map(indexOf));
+          const focusedWindowId = async () => { try { return (await root.windows.getLastFocused()).id; } catch (e) { return -1; } };
+          const inWindow = async (group) => { if (group && typeof group === 'object') group.windowId = await focusedWindowId(); return group; };
+          let declared = [];
+          try {
+            const manifest = root.runtime.getManifest() || {};
+            declared = [].concat(manifest.permissions || [], manifest.optional_permissions || []);
+          } catch (e) {}
+          // An event made of several others, each listener's argument reshaped.
+          const mappedEvent = (sources, transform) => {
+            const wrappers = new Map();
+            return {
+              addListener: (fn) => {
+                if (typeof fn !== 'function' || wrappers.has(fn)) return;
+                wrappers.set(fn, sources.map(([source, extra]) => {
+                  const wrapper = (details) => fn(transform(details, extra));
+                  source.addListener(wrapper);
+                  return [source, wrapper];
+                }));
+              },
+              removeListener: (fn) => {
+                (wrappers.get(fn) || []).forEach(([source, wrapper]) => source.removeListener(wrapper));
+                wrappers.delete(fn);
+              },
+              hasListener: (fn) => wrappers.has(fn),
+              hasListeners: () => wrappers.size > 0,
+            };
+          };
+
+          // chrome.tabGroups, on Tuff's folders (see ExtensionGroups).
+          implement('tabGroups', {
+            get: api(async (groupId) => inWindow(await call('tabGroups', 'get', { groupId: groupId }))),
+            query: api(async (queryInfo) => {
+              const q = Object.assign({}, queryInfo);
+              const wanted = q.windowId;
+              delete q.windowId;
+              const groups = (await call('tabGroups', 'query', q)) || [];
+              const id = await focusedWindowId();
+              groups.forEach((g) => { g.windowId = id; });
+              return wanted === undefined || wanted === -2 || wanted === id ? groups : [];
+            }),
+            update: api(async (groupId, updateProperties) => inWindow(await call('tabGroups', 'update', { groupId: groupId, updateProperties: updateProperties || {} }))),
+            move: api(async (groupId, moveProperties) => inWindow(await call('tabGroups', 'move', { groupId: groupId, moveProperties: moveProperties || {} }))),
+            onCreated: event('tabGroups.onCreated'),
+            onUpdated: event('tabGroups.onUpdated'),
+            onMoved: event('tabGroups.onMoved'),
+            onRemoved: event('tabGroups.onRemoved'),
+            TAB_GROUP_ID_NONE: -1,
+            Color: { GREY: 'grey', BLUE: 'blue', RED: 'red', YELLOW: 'yellow', GREEN: 'green', PINK: 'pink', PURPLE: 'purple', CYAN: 'cyan', ORANGE: 'orange' },
+          });
+          // tabs.group / ungroup, and the fields WebKit's tab objects lack (groupId, and Firefox's
+          // cookieStoreId) for extensions that ask for tab groups or containers.
+          let tabsNamespace;
+          try { tabsNamespace = root.tabs; } catch (e) {}
+          if (tabsNamespace && typeof tabsNamespace === 'object') {
+            const t = tabsNamespace;
+            if (absent(t, 'group')) {
+              add(t, 'group', api(async (options) => {
+                const o = options || {};
+                return call('tabs', 'group', { tabs: await indexesOf(o.tabIds), groupId: o.groupId });
+              }));
+            }
+            if (absent(t, 'ungroup')) {
+              add(t, 'ungroup', api(async (tabIds) => call('tabs', 'ungroup', { tabs: await indexesOf(tabIds) })));
+            }
+            if (absent(t, 'TAB_ID_NONE')) add(t, 'TAB_ID_NONE', -1);
+            const wantsGroups = declared.includes('tabGroups');
+            const wantsContainers = declared.includes('contextualIdentities');
+            const query = t.query, get = t.get, createTab = t.create;
+            if ((wantsGroups || wantsContainers) && typeof query === 'function' && typeof get === 'function') {
+              const decorate = async (list) => {
+                let extras = {};
+                try { extras = (await call('tabs', 'extras', {})) || {}; } catch (e) {}
+                for (const tab of list) {
+                  if (!tab || typeof tab.index !== 'number') continue;
+                  if (wantsGroups) { const g = (extras.groupIds || [])[tab.index]; tab.groupId = typeof g === 'number' ? g : -1; }
+                  if (wantsContainers) tab.cookieStoreId = (extras.cookieStoreIds || [])[tab.index] || 'firefox-default';
+                }
+                return list;
+              };
+              add(t, 'query', api(async (queryInfo) => {
+                const q = Object.assign({}, queryInfo);
+                const groupId = q.groupId, cookieStoreId = q.cookieStoreId;
+                delete q.groupId;
+                delete q.cookieStoreId;
+                let list = await decorate((await query.call(t, q)) || []);
+                if (groupId !== undefined) list = list.filter((tab) => tab.groupId === groupId);
+                if (cookieStoreId !== undefined) list = list.filter((tab) => tab.cookieStoreId === cookieStoreId);
+                return list;
+              }));
+              add(t, 'get', api(async (tabId) => (await decorate([await get.call(t, tabId)]))[0]));
+              if (wantsContainers && typeof createTab === 'function') {
+                add(t, 'create', api(async (properties) => {
+                  const p = Object.assign({}, properties);
+                  const store = p.cookieStoreId;
+                  delete p.cookieStoreId;
+                  if (!store || store === 'firefox-default') return createTab.call(t, p);
+                  let url = p.url;
+                  if (url) { try { url = new URL(url, scope.location.href).href; } catch (e) {} }
+                  const index = await call('contextualIdentities', 'openTab', { url: url, active: p.active !== false, cookieStoreId: store });
+                  const all = (await query.call(t, {})) || [];
+                  return (await decorate(all.filter((tab) => tab.index === index)))[0];
+                }));
+              }
+              pins.push(t);
+            }
+          }
+
+          // Firefox containers, on Tuff's profiles.
+          implement('contextualIdentities', {
+            query: api((details) => call('contextualIdentities', 'query', details || {})),
+            get: api((cookieStoreId) => call('contextualIdentities', 'get', { cookieStoreId: cookieStoreId })),
+            create: api((details) => call('contextualIdentities', 'create', details || {})),
+            update: api((cookieStoreId, details) => call('contextualIdentities', 'update', { cookieStoreId: cookieStoreId, details: details || {} })),
+            remove: api((cookieStoreId) => call('contextualIdentities', 'remove', { cookieStoreId: cookieStoreId })),
+            move: api(() => undefined),
+            onCreated: event('contextualIdentities.onCreated'),
+            onUpdated: event('contextualIdentities.onUpdated'),
+            onRemoved: event('contextualIdentities.onRemoved'),
+          });
+
+          // types.ChromeSetting: chrome.privacy, chrome.proxy.settings, Firefox browserSettings.
+          const setting = (path) => ({
+            get: api((details) => call('settings', 'get', Object.assign({}, details, { path: path }))),
+            set: api((details) => call('settings', 'set', { path: path, value: (details || {}).value, scope: (details || {}).scope })),
+            clear: api((details) => call('settings', 'clear', { path: path, scope: (details || {}).scope })),
+            onChange: event('settings.onChange.' + path),
+          });
+          const settingsIn = (prefix, names) => {
+            const object = {};
+            for (const name of names) object[name] = setting(prefix + '.' + name);
+            return object;
+          };
+          implement('privacy', {
+            network: settingsIn('privacy.network', ['networkPredictionEnabled', 'webRTCIPHandlingPolicy', 'peerConnectionEnabled',
+              'httpsOnlyMode', 'globalPrivacyControl']),
+            services: settingsIn('privacy.services', ['alternateErrorPagesEnabled', 'autofillEnabled', 'autofillAddressEnabled',
+              'autofillCreditCardEnabled', 'passwordSavingEnabled', 'safeBrowsingEnabled', 'safeBrowsingExtendedReportingEnabled',
+              'searchSuggestEnabled', 'spellingServiceEnabled', 'translationServiceEnabled']),
+            websites: settingsIn('privacy.websites', ['thirdPartyCookiesAllowed', 'hyperlinkAuditingEnabled', 'referrersEnabled',
+              'doNotTrackEnabled', 'protectedContentEnabled', 'topicsEnabled', 'fledgeEnabled', 'adMeasurementEnabled',
+              'relatedWebsiteSetsEnabled', 'cookieConfig', 'trackingProtectionMode', 'firstPartyIsolate', 'resistFingerprinting']),
+            IPHandlingPolicy: {
+              DEFAULT: 'default', DEFAULT_PUBLIC_AND_PRIVATE_INTERFACES: 'default_public_and_private_interfaces',
+              DEFAULT_PUBLIC_INTERFACE_ONLY: 'default_public_interface_only', DISABLE_NON_PROXIED_UDP: 'disable_non_proxied_udp',
+            },
+          });
+          implement('proxy', {
+            settings: setting('proxy.settings'),
+            onProxyError: event('proxy.onProxyError'),
+            onError: event('proxy.onError'),
+            Mode: { DIRECT: 'direct', AUTO_DETECT: 'auto_detect', PAC_SCRIPT: 'pac_script', FIXED_SERVERS: 'fixed_servers', SYSTEM: 'system' },
+            Scheme: { HTTP: 'http', HTTPS: 'https', QUIC: 'quic', SOCKS4: 'socks4', SOCKS5: 'socks5' },
+          });
+          implement('browserSettings', settingsIn('browserSettings', ['allowPopupsForUserEvents', 'cacheEnabled',
+            'closeTabsByDoubleClick', 'contextMenuShowEvent', 'ftpProtocolEnabled', 'homepageOverride', 'imageAnimationBehavior',
+            'newTabPageOverride', 'newTabPosition', 'openBookmarksInNewTabs', 'openSearchResultsInNewTabs',
+            'openUrlbarResultsInNewTabs', 'webNotificationsDisabled', 'overrideDocumentColors', 'overrideContentColorScheme',
+            'useDocumentFonts', 'zoomFullPage', 'zoomSiteSpecific', 'tlsMinimumVersion', 'tlsMaximumVersion', 'verticalTabs']));
+
+          // chrome.fontSettings, on the same settings.
+          const families = ['standard', 'sansserif', 'serif', 'fixed', 'cursive', 'fantasy', 'math'];
+          const familyOf = (details) => (details && details.genericFamily) || 'standard';
+          const sizeAPI = (key) => ({
+            get: api(async () => {
+              const r = await call('settings', 'get', { path: 'fontSettings.' + key });
+              return { pixelSize: r.value, levelOfControl: r.levelOfControl };
+            }),
+            set: api((details) => call('settings', 'set', { path: 'fontSettings.' + key, value: (details || {}).pixelSize })),
+            clear: api(() => call('settings', 'clear', { path: 'fontSettings.' + key })),
+            onChanged: mappedEvent([[event('settings.onChange.fontSettings.' + key)]], (d) => ({ pixelSize: d.value, levelOfControl: d.levelOfControl })),
+          });
+          const defaultSize = sizeAPI('defaultFontSize'), fixedSize = sizeAPI('defaultFixedFontSize'), minimumSize = sizeAPI('minimumFontSize');
+          implement('fontSettings', {
+            getFont: api(async (details) => {
+              const r = await call('settings', 'get', { path: 'fontSettings.font.' + familyOf(details) });
+              return { fontId: r.value, levelOfControl: r.levelOfControl };
+            }),
+            setFont: api((details) => call('settings', 'set', { path: 'fontSettings.font.' + familyOf(details), value: (details || {}).fontId })),
+            clearFont: api((details) => call('settings', 'clear', { path: 'fontSettings.font.' + familyOf(details) })),
+            getFontList: api(() => call('fontSettings', 'getFontList', {})),
+            getDefaultFontSize: defaultSize.get, setDefaultFontSize: defaultSize.set, clearDefaultFontSize: defaultSize.clear,
+            getDefaultFixedFontSize: fixedSize.get, setDefaultFixedFontSize: fixedSize.set, clearDefaultFixedFontSize: fixedSize.clear,
+            getMinimumFontSize: minimumSize.get, setMinimumFontSize: minimumSize.set, clearMinimumFontSize: minimumSize.clear,
+            onFontChanged: mappedEvent(families.map((f) => [event('settings.onChange.fontSettings.font.' + f), f]),
+              (d, family) => ({ fontId: d.value, genericFamily: family, script: 'Zyyy', levelOfControl: d.levelOfControl })),
+            onDefaultFontSizeChanged: defaultSize.onChanged,
+            onDefaultFixedFontSizeChanged: fixedSize.onChanged,
+            onMinimumFontSizeChanged: minimumSize.onChanged,
+          });
+
+          // chrome.contentSettings, on Tuff's per-site settings.
+          const contentSetting = (type) => ({
+            get: api((details) => call('contentSettings', 'get', Object.assign({}, details, { type: type }))),
+            set: api((details) => call('contentSettings', 'set', Object.assign({}, details, { type: type }))),
+            clear: api((details) => call('contentSettings', 'clear', Object.assign({}, details, { type: type }))),
+            getResourceIdentifiers: api(() => undefined),
+          });
+          const contentSettings = {
+            Scope: { REGULAR: 'regular', INCOGNITO_SESSION_ONLY: 'incognito_session_only' },
+          };
+          for (const type of ['cookies', 'images', 'javascript', 'location', 'plugins', 'popups', 'notifications', 'microphone',
+            'camera', 'unsandboxedPlugins', 'automaticDownloads', 'autoVerify', 'clipboard', 'sound']) {
+            contentSettings[type] = contentSetting(type);
+          }
+          implement('contentSettings', contentSettings);
+
+          // Firefox browser.theme, on the window's tint.
+          implement('theme', {
+            getCurrent: api(() => call('theme', 'getCurrent', {})),
+            update: api((windowId, theme) => {
+              if (windowId && typeof windowId === 'object') theme = windowId;
+              return call('theme', 'update', { theme: theme || {} });
+            }),
+            reset: api(() => call('theme', 'reset', {})),
+            onUpdated: event('theme.onUpdated'),
+          });
+
+          // Firefox browser.clipboard.
+          const toBase64 = (buffer) => {
+            const bytes = new Uint8Array(buffer);
+            let text = '';
+            for (let i = 0; i < bytes.length; i += 0x8000) text += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+            return btoa(text);
+          };
+          implement('clipboard', {
+            setImageData: api((imageData, imageType) => call('clipboard', 'setImageData', { data: toBase64(imageData), imageType: imageType })),
+          });
+
+          // Firefox browser.find.
+          const withTab = async (options) => {
+            const o = Object.assign({}, options);
+            if (o.tabId !== undefined && o.tabId !== null) o.tabIndex = await indexOf(o.tabId);
+            delete o.tabId;
+            return o;
+          };
+          implement('find', {
+            find: api(async (queryphrase, options) => call('find', 'find', Object.assign(await withTab(options), { queryphrase: queryphrase }))),
+            highlightResults: api(async (options) => call('find', 'highlightResults', await withTab(options))),
+            removeHighlighting: api(async (tabId) => call('find', 'removeHighlighting', await withTab({ tabId: tabId }))),
+          });
+
+          // chrome.omnibox: the command bar sends the extension's keyword input (ExtensionOmnibox).
+          implement('omnibox', {
+            setDefaultSuggestion: api((suggestion) => call('omnibox', 'setDefaultSuggestion', { suggestion: suggestion || {} })),
+            onInputStarted: event('omnibox.onInputStarted'),
+            onInputChanged: event('omnibox.onInputChanged'),
+            onInputEntered: event('omnibox.onInputEntered'),
+            onInputCancelled: event('omnibox.onInputCancelled'),
+            onDeleteSuggestion: event('omnibox.onDeleteSuggestion'),
+            OnInputEnteredDisposition: { CURRENT_TAB: 'currentTab', NEW_FOREGROUND_TAB: 'newForegroundTab', NEW_BACKGROUND_TAB: 'newBackgroundTab' },
+            DescriptionStyleType: { URL: 'url', MATCH: 'match', DIM: 'dim' },
+          });
+
           // Scripts registered at run time with inline code (WebKit only registers files). Tuff
           // adds them to every tab as user scripts limited to the requested URLs; see
           // ExtensionContentScripts. uBlock Origin delivers its scriptlets this way.

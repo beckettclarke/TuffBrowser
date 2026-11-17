@@ -3,10 +3,10 @@
 A light, glassy macOS browser built on the system WebKit — Arc/Zen-style sidebar, spaces you
 swipe between, a themeable translucent window, and Chrome / Firefox extension support.
 
-- **Small**: the release app is ~5 MB (1 MB executable + Sparkle). No bundled engine.
+- **Small**: the release app is a few MB. No bundled engine, no third-party frameworks.
 - **Light on memory**: tabs load lazily, restored tabs stay unloaded until clicked, and
   background tabs are put to sleep after a configurable idle time.
-- **Requires** macOS 15.4+ (for WebKit's `WKWebExtension` API). Built with Xcode 27 / Swift 6.
+- **Requires** an Apple Silicon Mac with macOS 15.4+ (for WebKit's `WKWebExtension` API). Built with Xcode 27 / Swift 6.
 
 ## Build & run
 
@@ -48,7 +48,7 @@ and open it in Xcode if you prefer.
 | Media / DRM | Presents as Safari and uses WebKit's FairPlay, which is what Netflix, Spotify, Disney+ etc. use for Safari. (Widevine does not exist on WebKit.) |
 | Picture in picture | Sites' own PiP buttons and the video context menu work; `⌃⌘P` (or the tab's right-click menu) pops the page's video out or back in. A video playing with sound goes into PiP when you switch away from its tab and comes back when you return (Settings → Tabs → Video). Tabs in PiP are never unloaded |
 | Browser basics | Downloads, find in page, zoom, print, full-screen video, camera / mic / location prompts, website notifications (no push), HTTP auth, Web Inspector (`⌥⌘I`), session restore, default-browser registration |
-| Updates | Sparkle 2 — see below |
+| Updates | None built in yet — download a new build to update |
 
 ## Extension compatibility
 
@@ -80,6 +80,26 @@ and `browser.sidebarAction` (`open`, `close`, `toggle`, `isOpen`, `setPanel` / `
 context can make without a permission. One panel shows at a time. `onOpened` / `onClosed` never
 fire, `setIcon` is ignored, and a panel only ever shows the extension's own pages (links to
 websites open as tabs).
+
+**APIs Tuff supplies itself.** For namespaces WebKit lacks, the shim reaches Tuff the same way
+(a private `tuff-api:` URL, `Extensions/ExtensionAPIs.swift`) and Tuff pushes events back through a
+hidden relay page (`Extensions/ExtensionEventPush.swift`). Beyond history, downloads, notifications
+and the like, this covers:
+
+- `chrome.tabGroups` and `tabs.group` / `ungroup` on sidebar folders (grouping pins a tab into the
+  folder), and Firefox `contextualIdentities` on profiles (`Extensions/ExtensionGroups.swift`);
+- `chrome.privacy`, `chrome.proxy.settings` (HTTP / HTTPS / SOCKS5 servers, no PAC scripts),
+  Firefox `browserSettings` and `chrome.fontSettings` (`Extensions/ExtensionSettings.swift`).
+  Settings Tuff has a switch for can be changed, and go back when the extension is turned off or
+  removed; the rest report what WebKit does and can't be changed;
+- `chrome.contentSettings` on the per-site JavaScript, pop-up, camera, microphone, location and
+  notification settings; Firefox `theme` (its frame colour tints the window), `find` and
+  `clipboard.setImageData`; and `chrome.omnibox`: type an extension's keyword and a space in the
+  command bar (`Extensions/ExtensionBrowserAPIs.swift`).
+
+**DevTools extensions.** WebKit loads an extension's `devtools_page` when Web Inspector opens
+(`⌥⌘I`), with `devtools.inspectedWindow.eval`, `devtools.panels.create` and `devtools.network`.
+There is no Elements sidebar API and no `getResources`.
 
 **Unpacked extensions** get the shim too, without Tuff writing into your folder: they are loaded
 from a copy (`~/Library/Application Support/TuffBrowser/Unpacked/<id>`) that is synced from the
@@ -117,17 +137,9 @@ keychain, `make install` signs with it and copies Tuff to `/Applications`; then 
 1Password → Settings → Browser → Add Browser. Without one, the extension still works on its
 own: click its icon and sign in to your account inside the extension.
 
-## Auto-updates (Sparkle)
+## Releasing
 
-The updater stays dormant until it is configured:
-
-1. Build once, then create a signing key (stored in your Keychain):
-   `build/SourcePackages/artifacts/sparkle/Sparkle/bin/generate_keys`
-2. Put the printed public key and your appcast URL in `project.yml`
-   (`TUFF_SPARKLE_PUBLIC_KEY`, `TUFF_APPCAST_URL`).
-3. `scripts/release.sh` builds `dist/Tuff-<version>.zip` and `dist/appcast.xml`; upload both.
-
-For distribution outside your own Mac, sign and notarize:
+`scripts/release.sh` builds `dist/Tuff-<version>.zip`. For distribution outside your own Mac, sign and notarize:
 
 ```bash
 DEVELOPER_ID="Developer ID Application: Your Name (TEAMID)" TEAM_ID=TEAMID NOTARY_PROFILE=my-profile scripts/release.sh
@@ -150,7 +162,7 @@ an extension misbehaves.
 
 ```
 TuffBrowser/
-  App/         entry point, menus, Sparkle
+  App/         entry point, menus
   Model/       BrowserState (spaces, tabs, session), Tab, Space, settings, history, favicons, downloads
   Window/      window chrome, blur, traffic lights, swipe tracking, root layout, web card
   Sidebar/     sidebar UI

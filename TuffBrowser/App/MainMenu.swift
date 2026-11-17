@@ -55,7 +55,6 @@ enum MainMenu {
         NSApp.servicesMenu = services
         _ = submenu("Tuff", [
             item("About Tuff", #selector(AppDelegate.showAbout(_:))),
-            item("Check for Updates…", #selector(AppDelegate.checkForUpdates(_:))),
             sep(),
             item("Settings…", #selector(AppDelegate.showSettingsWindow(_:)), ","),
             item("Extensions…", #selector(AppDelegate.showExtensions(_:)), "e", [.command, .shift]),

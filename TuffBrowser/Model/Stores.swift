@@ -416,9 +416,25 @@ final class FaviconStore {
         if (/svg/.test(el.type || '') || /\\.svg(\\?|$)/.test(el.href)) score = 2;
         if (score > bestScore) { best = el.href; bestScore = score; }
       });
-      return best;
+      return { href: best, ua: navigator.userAgent };
     })()
     """
+
+    /// How an icon is requested: as the page that shows it, with its profile's cookies (so icons
+    /// behind a sign-in load, and one profile's cookies never go out for another's page).
+    struct RequestContext {
+        var cookieStore: WKHTTPCookieStore?
+        var userAgent: String?
+        var referrer: URL?
+
+        init(webView: WKWebView, userAgent: String? = nil) {
+            cookieStore = webView.configuration.websiteDataStore.httpCookieStore
+            self.userAgent = userAgent ?? webView.customUserAgent.flatMap { $0.isEmpty ? nil : $0 }
+            referrer = webView.url
+        }
+
+        init() {}
+    }
 
     /// Finds the page's declared icon (falling back to /favicon.ico), downloads and caches it.
     /// `persist: false` (Incognito) keeps the icon in memory only, for this run of the app.
@@ -430,10 +446,12 @@ final class FaviconStore {
         }
         // Which icon the page declares is asked every time (it's cheap); the download is what
         // the cache saves.
-        webView.evaluateJavaScript(Self.iconScript) { [weak self] result, _ in
-            guard let self else { return }
+        webView.evaluateJavaScript(Self.iconScript) { [weak self, weak webView] result, _ in
+            guard let self, let webView else { return }
+            let info = result as? [String: Any]
+            let context = RequestContext(webView: webView, userAgent: info?["ua"] as? String)
             var candidates: [URL] = []
-            if let s = result as? String, let u = URL(string: s) { candidates.append(u) }
+            if let s = info?["href"] as? String, let u = URL(string: s) { candidates.append(u) }
             if let fallback = URL(string: "/favicon.ico", relativeTo: pageURL)?.absoluteURL { candidates.append(fallback) }
             guard let first = candidates.first else { return completion(nil) }
             let iconKey = self.key(forIcon: first)
@@ -442,14 +460,14 @@ final class FaviconStore {
                 completion(image)
                 return
             }
-            self.download(candidates, key: iconKey, hostKey: hostKey, persist: persist, completion: completion)
+            self.download(candidates, key: iconKey, hostKey: hostKey, persist: persist, context: context, completion: completion)
         }
     }
 
     /// An icon a page switched to after loading (`LiveFavicon`). A data: icon is drawn by the
     /// page, often many times a second (a game, an unread count), so it's shown as it is and
     /// not cached; one at an address goes through the cache like a load-time icon.
-    func icon(at iconURL: URL, pageURL: URL, persist: Bool, completion: @escaping (NSImage?) -> Void) {
+    func icon(at iconURL: URL, pageURL: URL, persist: Bool, context: RequestContext, completion: @escaping (NSImage?) -> Void) {
         guard let hostKey = key(for: pageURL) else { return completion(nil) }
         switch iconURL.scheme?.lowercased() {
         case "data":
@@ -466,7 +484,7 @@ final class FaviconStore {
                 remember(image, as: hostKey, persist: persist)
                 return completion(image)
             }
-            download([iconURL], key: iconKey, hostKey: hostKey, persist: persist, completion: completion)
+            download([iconURL], key: iconKey, hostKey: hostKey, persist: persist, context: context, completion: completion)
         default:
             completion(nil)
         }
@@ -479,7 +497,7 @@ final class FaviconStore {
         guard !key.isEmpty, let site = URL(string: "https://" + key) else { return completion(nil) }
         if let image = cachedIcon(for: site) { return completion(image) }
         guard let url = URL(string: "https://\(key)/favicon.ico") else { return completion(nil) }
-        download([url], key: key, hostKey: nil, persist: true, completion: completion)
+        download([url], key: key, hostKey: nil, persist: true, context: RequestContext(), completion: completion)
     }
 
     /// The cached icon when it is recent enough not to fetch again: fetched earlier this run,
@@ -495,7 +513,10 @@ final class FaviconStore {
         return image(forKey: key)
     }
 
-    private func download(_ candidates: [URL], key: String, hostKey: String?, persist: Bool, completion: @escaping (NSImage?) -> Void) {
+    private func download(
+        _ candidates: [URL], key: String, hostKey: String?, persist: Bool, context: RequestContext,
+        completion: @escaping (NSImage?) -> Void
+    ) {
         guard let url = candidates.first else {
             DispatchQueue.main.async { completion(nil) }
             return
@@ -505,19 +526,71 @@ final class FaviconStore {
             if let data = try? Data(contentsOf: url), let image = NSImage(data: data), image.isValid {
                 store(image, key: key, hostKey: hostKey, persist: persist, completion: completion)
             } else {
-                download(rest, key: key, hostKey: hostKey, persist: persist, completion: completion)
+                download(rest, key: key, hostKey: hostKey, persist: persist, context: context, completion: completion)
             }
             return
         }
-        session.dataTask(with: url) { [weak self] data, response, _ in
+        request(for: url, context: context) { [weak self] request in
             guard let self else { return }
-            let ok = (response as? HTTPURLResponse).map { (200..<300).contains($0.statusCode) } ?? false
-            if ok, let data, let image = NSImage(data: data), image.isValid, image.size.width > 0 {
-                self.store(image, key: key, hostKey: hostKey, persist: persist, completion: completion)
-            } else {
-                self.download(rest, key: key, hostKey: hostKey, persist: persist, completion: completion)
+            self.session.dataTask(with: request) { [weak self] data, response, _ in
+                guard let self else { return }
+                let ok = (response as? HTTPURLResponse).map { (200..<300).contains($0.statusCode) } ?? false
+                if ok, let data, let image = NSImage(data: data), image.isValid, image.size.width > 0 {
+                    self.store(image, key: key, hostKey: hostKey, persist: persist, completion: completion)
+                } else {
+                    self.download(rest, key: key, hostKey: hostKey, persist: persist, context: context, completion: completion)
+                }
+            }.resume()
+        }
+    }
+
+    /// The icon request, carrying the cookies the page's profile holds for the icon's address.
+    /// The session itself keeps no cookies (it is ephemeral and never stores any it is sent).
+    private func request(for url: URL, context: RequestContext, completion: @escaping (URLRequest) -> Void) {
+        var request = URLRequest(url: url)
+        request.httpShouldHandleCookies = false
+        if let userAgent = context.userAgent { request.setValue(userAgent, forHTTPHeaderField: "User-Agent") }
+        // As a page would by default (strict-origin-when-cross-origin, kept to the origin here):
+        // never from https to http.
+        if let referrer = context.referrer, !(referrer.scheme == "https" && url.scheme == "http"),
+           let scheme = referrer.scheme, let host = referrer.host(percentEncoded: true) {
+            let port = referrer.port.map { ":\($0)" } ?? ""
+            request.setValue("\(scheme)://\(host)\(port)/", forHTTPHeaderField: "Referer")
+        }
+        request.setValue("image/avif,image/webp,image/png,image/svg+xml,image/*;q=0.8,*/*;q=0.5", forHTTPHeaderField: "Accept")
+        guard let store = context.cookieStore else { return completion(request) }
+        store.getAllCookies { cookies in
+            let matching = Self.cookies(cookies, for: url)
+            for (field, value) in HTTPCookie.requestHeaderFields(with: matching) {
+                request.setValue(value, forHTTPHeaderField: field)
             }
-        }.resume()
+            completion(request)
+        }
+    }
+
+    /// The cookies a browser would send with a request to `url` (RFC 6265 domain, path and
+    /// secure matching, unexpired).
+    static func cookies(_ cookies: [HTTPCookie], for url: URL, now: Date = Date()) -> [HTTPCookie] {
+        guard let host = url.host(percentEncoded: false)?.lowercased(), !host.isEmpty else { return [] }
+        let path = url.path.isEmpty ? "/" : url.path
+        let secure = url.scheme == "https"
+        return cookies.filter { cookie in
+            if let expires = cookie.expiresDate, expires < now { return false }
+            if cookie.isSecure && !secure { return false }
+            let domain = cookie.domain.lowercased()
+            let domainOK: Bool
+            if domain.hasPrefix(".") {
+                let bare = String(domain.dropFirst())
+                domainOK = host == bare || host.hasSuffix(domain)
+            } else {
+                domainOK = host == domain
+            }
+            guard domainOK else { return false }
+            let cookiePath = cookie.path.isEmpty ? "/" : cookie.path
+            if path == cookiePath { return true }
+            guard path.hasPrefix(cookiePath) else { return false }
+            return cookiePath.hasSuffix("/") || path.dropFirst(cookiePath.count).hasPrefix("/")
+        }
     }
 
     private func store(_ image: NSImage, key: String, hostKey: String?, persist: Bool, completion: @escaping (NSImage?) -> Void) {
@@ -779,9 +852,11 @@ final class DownloadManager: NSObject {
     }
 
     /// Takes everything that isn't running off the list: one kind of window's downloads, or
-    /// (nil) all of them.
-    func clearFinished(isPrivate: Bool? = nil) {
-        let gone = items.filter { $0.state != .running && (isPrivate == nil || $0.isPrivate == isPrivate) }
+    /// (nil) all of them; with `since`, only those started since then.
+    func clearFinished(isPrivate: Bool? = nil, since: Date? = nil) {
+        let gone = items.filter {
+            $0.state != .running && (isPrivate == nil || $0.isPrivate == isPrivate) && (since == nil || $0.startedAt >= since!)
+        }
         gone.forEach(Self.discardIncompleteFile)
         items.removeAll { item in gone.contains { $0 === item } }
         scheduleSave()

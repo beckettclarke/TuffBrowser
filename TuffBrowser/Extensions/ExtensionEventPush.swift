@@ -30,10 +30,11 @@ final class ExtensionEventPush {
         subscriptions[extensionID]?.remove(event)
     }
 
-    /// Sends an event to every extension listening for it.
-    func emit(_ event: String, args: [Any]) {
+    /// Sends an event to every extension listening for it. `extra` asks the shim to fill
+    /// something in first (`groupWindow`: the window id of the tab group in the first argument).
+    func emit(_ event: String, args: [Any], extra: [String: Any] = [:]) {
         for (id, events) in subscriptions where events.contains(event) {
-            relays[id]?.send(event: event, args: args)
+            relays[id]?.send(event: event, args: args, extra: extra)
         }
     }
 
@@ -64,9 +65,9 @@ final class ExtensionEventPush {
     }
 
     /// Sends an event to one extension (e.g. a notification click to its owner), if it listens.
-    func emit(_ event: String, args: [Any], to extensionID: String) {
+    func emit(_ event: String, args: [Any], extra: [String: Any] = [:], to extensionID: String) {
         guard subscriptions[extensionID]?.contains(event) == true else { return }
-        relays[extensionID]?.send(event: event, args: args)
+        relays[extensionID]?.send(event: event, args: args, extra: extra)
     }
 
     func extensionUnloaded(_ id: String) {

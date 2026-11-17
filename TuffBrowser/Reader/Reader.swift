@@ -137,6 +137,7 @@ extension Tab {
             }
             let reader = Reader(article: article, url: now, tab: self, dataStore: webView.configuration.websiteDataStore)
             withAnimation(Motion.quick) { self.reader = reader }
+            self.browser?.tabDidChange(self, properties: .readerMode)
             self.browser?.focusWebView()
         }
     }
@@ -146,6 +147,7 @@ extension Tab {
         guard let reader else { return }
         reader.close()
         withAnimation(Motion.quick) { self.reader = nil }
+        browser?.tabDidChange(self, properties: .readerMode)
         if focus, browser?.selectedTab === self { browser?.focusWebView() }
     }
 }

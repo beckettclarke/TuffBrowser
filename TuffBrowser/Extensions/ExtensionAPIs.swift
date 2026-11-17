@@ -266,6 +266,94 @@ final class ExtensionAPIBridge {
         case ("userScripts", "getScripts"):
             finish(ExtensionContentScripts.shared.userScripts(ids: args["ids"] as? [String], extensionID: context.uniqueIdentifier))
 
+        // chrome.tabGroups and tabs.group / ungroup, on folders (ExtensionGroups). Tabs come as
+        // indexes in the window; the shim converts ids.
+        case ("tabGroups", "get"):
+            finish(try ExtensionTabGroups.shared.get(args))
+        case ("tabGroups", "query"):
+            finish(ExtensionTabGroups.shared.query(args))
+        case ("tabGroups", "update"):
+            finish(try ExtensionTabGroups.shared.update(args))
+        case ("tabGroups", "move"):
+            finish(try ExtensionTabGroups.shared.move(args))
+        case ("tabs", "group"):
+            finish(try ExtensionTabGroups.shared.group(args))
+        case ("tabs", "ungroup"):
+            try ExtensionTabGroups.shared.ungroup(args)
+            finish(nil)
+        case ("tabs", "extras"):
+            // Fields WebKit's tab objects lack, per index: groupId, cookieStoreId.
+            finish([
+                "groupIds": ExtensionTabGroups.shared.groupIDs(),
+                "cookieStoreIds": ExtensionContainers.shared.cookieStoreIDs(),
+            ])
+
+        // Firefox contextualIdentities, on profiles.
+        case ("contextualIdentities", "query"):
+            finish(ExtensionContainers.shared.query(args))
+        case ("contextualIdentities", "get"):
+            finish(try ExtensionContainers.shared.get(args))
+        case ("contextualIdentities", "create"):
+            finish(try ExtensionContainers.shared.create(args))
+        case ("contextualIdentities", "update"):
+            finish(try ExtensionContainers.shared.update(args))
+        case ("contextualIdentities", "remove"):
+            ExtensionContainers.shared.remove(
+                args, extensionName: context.webExtension.displayName ?? "An extension", finish: finish, fail: fail)
+        case ("contextualIdentities", "openTab"):
+            finish(try ExtensionContainers.shared.openTab(args))
+
+        // ChromeSetting-shaped settings: chrome.privacy, chrome.proxy.settings, Firefox
+        // browserSettings, and fontSettings (ExtensionSettings).
+        case ("settings", "get"):
+            finish(try ExtensionSettings.shared.get(try Self.string(args["path"]), extensionID: context.uniqueIdentifier))
+        case ("settings", "set"):
+            try ExtensionSettings.shared.set(try Self.string(args["path"]), value: args["value"] ?? NSNull(), extensionID: context.uniqueIdentifier)
+            finish(nil)
+        case ("settings", "clear"):
+            try ExtensionSettings.shared.clear(try Self.string(args["path"]), extensionID: context.uniqueIdentifier)
+            finish(nil)
+        case ("fontSettings", "getFontList"):
+            finish(ExtensionSettings.shared.fontList())
+
+        // chrome.contentSettings
+        case ("contentSettings", "get"):
+            finish(try ExtensionContentSettings.shared.get(type: try Self.string(args["type"]), args: args))
+        case ("contentSettings", "set"):
+            try ExtensionContentSettings.shared.set(type: try Self.string(args["type"]), args: args, extensionID: context.uniqueIdentifier)
+            finish(nil)
+        case ("contentSettings", "clear"):
+            ExtensionContentSettings.shared.clear(type: try Self.string(args["type"]), extensionID: context.uniqueIdentifier)
+            finish(nil)
+
+        // Firefox theme, clipboard and find.
+        case ("theme", "getCurrent"):
+            finish(ExtensionTheme.shared.current())
+        case ("theme", "update"):
+            try ExtensionTheme.shared.update(args["theme"] as? [String: Any] ?? [:], extensionID: context.uniqueIdentifier)
+            finish(nil)
+        case ("theme", "reset"):
+            ExtensionTheme.shared.reset(extensionID: context.uniqueIdentifier)
+            finish(nil)
+        case ("clipboard", "setImageData"):
+            try ExtensionClipboard.setImageData(base64: try Self.string(args["data"]), type: try Self.string(args["imageType"]))
+            finish(nil)
+        case ("find", "find"):
+            ExtensionFind.find(args, finish: finish, fail: fail)
+        case ("find", "highlightResults"):
+            ExtensionFind.highlight(args, finish: finish, fail: fail)
+        case ("find", "removeHighlighting"):
+            ExtensionFind.removeHighlighting(args, finish: finish, fail: fail)
+
+        // chrome.omnibox (the command bar asks; see ExtensionOmnibox).
+        case ("omnibox", "setDefaultSuggestion"):
+            ExtensionOmnibox.shared.setDefaultSuggestion(
+                (args["suggestion"] as? [String: Any])?["description"] as? String ?? "", extensionID: context.uniqueIdentifier)
+            finish(nil)
+        case ("omnibox", "suggest"):
+            ExtensionOmnibox.shared.suggest(request: try Self.int(args["request"]), results: args["suggestions"] as? [[String: Any]] ?? [])
+            finish(nil)
+
         // Event subscriptions from the shim (see ExtensionEventPush).
         case ("__events", "subscribe"):
             if let event = args["event"] as? String {
@@ -288,6 +376,11 @@ final class ExtensionAPIBridge {
         return url
     }
 
+    private static func string(_ value: Any?) throws -> String {
+        guard let string = value as? String else { throw APIError("A string argument is missing.") }
+        return string
+    }
+
     private static func int(_ value: Any?) throws -> Int {
         guard let id = value as? Int else { throw APIError("id is required.") }
         return id
@@ -299,6 +392,7 @@ final class ExtensionAPIBridge {
     private static let removableDataTypes: [String: Bool] = [
         "cache": true, "cookies": true, "localStorage": true, "sessionStorage": true,
         "indexedDB": true, "webSQL": true, "serviceWorkers": true, "fileSystems": true, "history": true,
+        "downloads": true, "formData": true, "passwords": true,
     ]
 
     private func removeBrowsingData(types: [String: Any], since: Double, finish: @escaping (Any?) -> Void) {
@@ -314,6 +408,9 @@ final class ExtensionAPIBridge {
         if types["serviceWorkers"] as? Bool == true { dataTypes.insert(WKWebsiteDataTypeServiceWorkerRegistrations) }
         if types["fileSystems"] as? Bool == true { dataTypes.insert(WKWebsiteDataTypeFileSystem) }
         if types["history"] as? Bool == true { HistoryStore.shared.clear() }
+        // The downloads list (the files stay), as in Chrome.
+        if types["downloads"] as? Bool == true { DownloadManager.shared.clearFinished(isPrivate: false, since: since > 0 ? Date(timeIntervalSince1970: since / 1000) : nil) }
+        // Tuff saves no passwords or form entries, so there is nothing to remove for those.
 
         let date = since > 0 ? Date(timeIntervalSince1970: since / 1000) : .distantPast
         let stores = DataStores.all

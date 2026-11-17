@@ -1,3 +1,5 @@
+import AppKit
+import Network
 import XCTest
 @testable import Tuff
 
@@ -105,5 +107,90 @@ final class ExtensionUpdateTests: XCTestCase {
         let tag = #"<updatecheck _esbAllowlist="true" prodversion="1.2" status="ok" version="2026.1116.1650"/>"#
         XCTAssertEqual(ExtensionManager.updateCheckVersion(in: tag, installed: "1.0"), "2026.1116.1650")
         XCTAssertEqual(ExtensionManager.updateCheckVersion(in: #"<updatecheck status="noupdate"/>"#, installed: "1.0"), "1.0")
+    }
+}
+
+/// Favicon downloads carry the page profile's cookies for the icon's address, and no others.
+final class FaviconCookieTests: XCTestCase {
+    private func cookie(_ name: String, domain: String, path: String = "/", secure: Bool = false, expires: Date? = nil) -> HTTPCookie {
+        var properties: [HTTPCookiePropertyKey: Any] = [.name: name, .value: "1", .domain: domain, .path: path]
+        if secure { properties[.secure] = "TRUE" }
+        if let expires { properties[.expires] = expires }
+        return HTTPCookie(properties: properties)!
+    }
+
+    func testMatchesDomainPathSecureAndExpiry() {
+        let cookies = [
+            cookie("host", domain: "cdn.example.com"),
+            cookie("domain", domain: ".example.com"),
+            cookie("other", domain: "example.org"),
+            cookie("path", domain: ".example.com", path: "/icons"),
+            cookie("deep", domain: ".example.com", path: "/static"),
+            cookie("secure", domain: ".example.com", secure: true),
+            cookie("old", domain: ".example.com", expires: Date(timeIntervalSince1970: 1)),
+        ]
+        let names = { (url: String) in Set(FaviconStore.cookies(cookies, for: URL(string: url)!).map(\.name)) }
+        XCTAssertEqual(names("https://cdn.example.com/icons/a.png"), ["host", "domain", "path", "secure"])
+        XCTAssertEqual(names("http://example.com/favicon.ico"), ["domain"])
+        XCTAssertEqual(names("https://example.com/iconsx/a.png"), ["domain", "secure"])
+        XCTAssertEqual(names("https://notexample.com/"), [])
+    }
+}
+
+/// Parsing for the extension APIs Tuff implements itself.
+final class ExtensionAPITests: XCTestCase {
+    func testContentSettingsPatterns() throws {
+        XCTAssertNil(try ExtensionContentSettings.parse("<all_urls>"))
+        XCTAssertNil(try ExtensionContentSettings.parse("*://*/*"))
+        let site = try XCTUnwrap(try ExtensionContentSettings.parse("https://*.Example.com/*"))
+        XCTAssertEqual(site.scheme, "https")
+        XCTAssertEqual(site.host, "example.com")
+        XCTAssertEqual(try ExtensionContentSettings.parse("*://example.org:8080/")?.scheme, "https")
+        XCTAssertThrowsError(try ExtensionContentSettings.parse("file:///x"))
+    }
+
+    func testThemeColours() {
+        XCTAssertEqual(ExtensionTheme.color("#f00")?.hexString.uppercased(), "#FF0000")
+        XCTAssertEqual(ExtensionTheme.color("#00ff0080")?.hexString.uppercased(), "#00FF00")
+        XCTAssertEqual(ExtensionTheme.color("rgb(0, 0, 255)")?.hexString.uppercased(), "#0000FF")
+        XCTAssertEqual(ExtensionTheme.color([255, 255, 255])?.hexString.uppercased(), "#FFFFFF")
+        XCTAssertNil(ExtensionTheme.color("nonsense"))
+    }
+
+    func testTabGroupTitlePatterns() {
+        XCTAssertTrue(ExtensionTabGroups.titleMatches("Work stuff", pattern: "work*"))
+        XCTAssertTrue(ExtensionTabGroups.titleMatches("Work", pattern: "Work"))
+        XCTAssertFalse(ExtensionTabGroups.titleMatches("Homework", pattern: "Work"))
+        XCTAssertTrue(ExtensionTabGroups.titleMatches("a.b", pattern: "a.b"))
+        XCTAssertFalse(ExtensionTabGroups.titleMatches("axb", pattern: "a.b"))
+    }
+
+    func testContainerColours() {
+        XCTAssertEqual(ExtensionContainers.colorName(for: NSColor(hex: "#2E6BE6")), "blue")
+        XCTAssertEqual(ExtensionContainers.colorName(for: NSColor(hex: "#E53935")), "red")
+        XCTAssertEqual(ExtensionContainers.colorName(for: NSColor(hex: "#777777")), "toolbar")
+        XCTAssertEqual(ExtensionContainers.colorName(for: nil), "toolbar")
+    }
+
+    func testOmniboxDescriptionsLoseMarkup() {
+        XCTAssertEqual(ExtensionOmnibox.plain("<match>React</match> &amp; <dim>docs</dim> &lt;3"), "React & docs <3")
+    }
+
+    func testProxyConfigs() throws {
+        XCTAssertNil(try ExtensionSettings.proxyConfigurations(for: ["mode": "system"]))
+        XCTAssertNil(try ExtensionSettings.proxyConfigurations(for: ["mode": "direct"]))
+        let chrome = try ExtensionSettings.proxyConfigurations(for: [
+            "mode": "fixed_servers",
+            "rules": ["singleProxy": ["scheme": "socks5", "host": "127.0.0.1", "port": 1080], "bypassList": ["*.local", "<local>", "example.com"]],
+        ])
+        XCTAssertEqual(chrome?.count, 1)
+        var excluded: [String] = []
+        if let proxy = chrome?.first { nw_proxy_config_enumerate_excluded_domains(proxy) { excluded.append(String(cString: $0)) } }
+        XCTAssertEqual(excluded, ["local", "example.com"])
+        XCTAssertEqual(try ExtensionSettings.proxyConfigurations(for: ["proxyType": "manual", "http": "proxy.test:3128"])?.count, 1)
+        XCTAssertNil(try ExtensionSettings.proxyConfigurations(for: ["proxyType": "system"]))
+        XCTAssertThrowsError(try ExtensionSettings.proxyConfigurations(for: ["mode": "pac_script"]))
+        XCTAssertThrowsError(try ExtensionSettings.proxyConfigurations(for: ["mode": "fixed_servers", "rules": ["singleProxy": ["scheme": "socks4", "host": "x"]]]))
+        XCTAssertThrowsError(try ExtensionSettings.proxyConfigurations(for: ["proxyType": "manual", "socks": "x:1", "socksVersion": 4]))
     }
 }

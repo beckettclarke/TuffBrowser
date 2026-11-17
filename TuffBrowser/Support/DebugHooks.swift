@@ -508,6 +508,15 @@ enum DebugHooks {
             state.pasteAndGo()
         case "fsbanner":
             log("fsbanner \(FullScreenBanner.shared.debugState)")
+        case "inspect":
+            // inspect — opens Web Inspector for the selected tab (private _WKInspector.show).
+            if let inspector = state.selectedTab?.webView?.value(forKey: "_inspector") as? NSObject,
+               inspector.responds(to: NSSelectorFromString("show")) {
+                inspector.perform(NSSelectorFromString("show"))
+                log("inspect: shown")
+            } else {
+                log("inspect: no inspector")
+            }
         case "capture":
             // capture — the selected tab's camera / microphone / full-screen state.
             let tab = state.selectedTab

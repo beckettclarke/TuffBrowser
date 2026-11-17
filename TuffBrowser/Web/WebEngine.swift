@@ -150,6 +150,10 @@ enum WebEngine {
         if config.preferences.responds(to: NSSelectorFromString("_setShouldAllowUserInstalledFonts:")) {
             config.preferences.setValue(false, forKey: "shouldAllowUserInstalledFonts")
         }
+        // Fonts and a proxy set by extensions (chrome.fontSettings, chrome.proxy).
+        let extensionSettings = ExtensionSettings.shared
+        if extensionSettings.hasFontChoices { extensionSettings.applyFonts(to: config.preferences) }
+        if extensionSettings.hasProxy { extensionSettings.applyProxy(to: [dataStore]) }
         config.webExtensionController = ExtensionManager.shared.controller
         ExtensionStoreBridge.install(into: config.userContentController)
         PictureInPicture.install(into: config.userContentController)
