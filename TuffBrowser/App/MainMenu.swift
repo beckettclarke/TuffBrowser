@@ -99,6 +99,7 @@ enum MainMenu {
             item("Copy", #selector(NSText.copy(_:)), "c", own: false),
             item("Paste", #selector(NSText.paste(_:)), "v", own: false),
             item("Paste and Match Style", #selector(NSTextView.pasteAsPlainText(_:)), "v", [.command, .option, .shift], own: false),
+            item("Paste and Go", #selector(AppDelegate.pasteAndGo(_:))),
             item("Delete", #selector(NSText.delete(_:)), own: false),
             item("Select All", #selector(NSText.selectAll(_:)), "a", own: false),
             sep(),
@@ -158,8 +159,8 @@ enum MainMenu {
             item("Web Inspector", #selector(AppDelegate.showInspector(_:)), "i", [.command, .option]),
         ])
 
-        // History
-        _ = submenu("History", [
+        // History (Recently Closed and recent pages are filled in as it opens)
+        let historyMenu = submenu("History", [
             item("Back", #selector(AppDelegate.goBack(_:)), "["),
             item("Forward", #selector(AppDelegate.goForward(_:)), "]"),
             sep(),
@@ -167,6 +168,7 @@ enum MainMenu {
             item("Clear History…", #selector(AppDelegate.clearHistory(_:))),
             item("Import History & Bookmarks…", #selector(AppDelegate.showImport(_:))),
         ])
+        historyMenu.delegate = HistoryMenuFiller.shared
 
         // Tabs
         var tabItems: [NSMenuItem] = [

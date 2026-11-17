@@ -46,5 +46,7 @@
 
 - `make build` regenerates the Xcode project from `project.yml` (XcodeGen) and builds Debug.
 - `make run` builds and launches.
+- `make test` runs the unit tests (`TuffBrowserTests`). Under XCTest the host app opens no window and
+  loads no profile (`App/main.swift`), so tests must not rely on `AppDelegate.shared`.
 - Debug builds can be scripted with `TUFF_DEBUG_SCRIPT` (see `TuffBrowser/Support/DebugHooks.swift`),
   e.g. `snap` / `snapall` for screenshots and `prompt yes|no` to answer an on-screen card.

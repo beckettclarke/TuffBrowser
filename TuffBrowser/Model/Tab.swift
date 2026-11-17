@@ -14,6 +14,9 @@ final class Tab: NSObject, Identifiable {
     var favicon: NSImage?
     /// The site `favicon` came from, so moving within a site can keep it on show (`didCommit`).
     @ObservationIgnored var faviconHost: String?
+    /// Counts icon lookups, so one that finishes late can't replace a newer icon (a page that
+    /// redraws its icon, `LiveFavicon`) or land on the next page.
+    @ObservationIgnored var faviconRequest = 0
     var isLoading = false
     var progress: Double = 0
     var canGoBack = false
@@ -22,6 +25,15 @@ final class Tab: NSObject, Identifiable {
     var isMuted = false
     /// One of the page's videos is showing in a picture-in-picture window.
     var isInPictureInPicture = false
+    /// The page is using the camera / microphone (shown on the tab, with a click to stop).
+    /// Muted capture (`.muted`) still counts: the page holds the device.
+    var cameraInUse = false
+    var microphoneInUse = false
+    /// Pop-ups the page tried to open that the pop-up blocker stopped (see `PopupBlocker`).
+    /// Cleared when the page changes.
+    var blockedPopups: [URL] = []
+    /// The page is full screen (a video, the Fullscreen API).
+    var isFullScreen = false
     /// False once an https page has loaded something over plain http (mixed content).
     var hasOnlySecureContent = true
     /// Mirrors `webView != nil` so views can react to wake / sleep.
@@ -75,6 +87,9 @@ final class Tab: NSObject, Identifiable {
     /// `tabs.create({openerTabId})`). Surfaced to extensions as `openerTabId`. Weak, so it goes
     /// nil on its own if the opener is closed.
     @ObservationIgnored weak var openerTab: Tab?
+    /// The address last reported to extensions for a same-document navigation (or the page's
+    /// committed address), so WebKit's duplicate reports aren't sent twice.
+    @ObservationIgnored var lastSameDocumentURL: URL?
     /// The URL of a navigation that has started but not committed yet; what extensions read as
     /// `pendingUrl` on a tab. Cleared when the load commits, fails, or the web view goes away.
     @ObservationIgnored var pendingURL: URL?
@@ -464,6 +479,10 @@ final class Tab: NSObject, Identifiable {
         crashedWhileHidden = false
         closePDF()
         closeReader(focus: false)
+        if isFullScreen { FullScreenBanner.shared.hide(for: self) }
+        cameraInUse = false
+        microphoneInUse = false
+        isFullScreen = false
         guard let view = webView else { return }
         observations.removeAll()
         if observingAudio {
@@ -543,11 +562,71 @@ final class Tab: NSObject, Identifiable {
             view.observe(\.hasOnlySecureContent, options: [.initial, .new]) { [weak self] view, _ in
                 self?.hasOnlySecureContent = view.hasOnlySecureContent
             },
+            view.observe(\.cameraCaptureState, options: [.initial, .new]) { [weak self] view, _ in
+                let inUse = view.cameraCaptureState != .none
+                DispatchQueue.main.async { if self?.cameraInUse != inUse { self?.cameraInUse = inUse } }
+            },
+            view.observe(\.microphoneCaptureState, options: [.initial, .new]) { [weak self] view, _ in
+                let inUse = view.microphoneCaptureState != .none
+                DispatchQueue.main.async { if self?.microphoneInUse != inUse { self?.microphoneInUse = inUse } }
+            },
+            view.observe(\.fullscreenState, options: [.new]) { [weak self] view, _ in
+                let state = view.fullscreenState
+                DispatchQueue.main.async { self?.fullscreenStateChanged(state, in: view) }
+            },
         ]
         if view.responds(to: NSSelectorFromString(Self.audioKeyPath)) {
             view.addObserver(self, forKeyPath: Self.audioKeyPath, options: [.new], context: nil)
             observingAudio = true
         }
+    }
+
+    /// Shows "{site} is full screen" once the page has the screen, and takes it down when the
+    /// page leaves (or the tab goes away while full screen).
+    private func fullscreenStateChanged(_ state: WKWebView.FullscreenState, in view: WKWebView) {
+        let full = state == .inFullscreen || state == .enteringFullscreen
+        if isFullScreen != full { isFullScreen = full }
+        switch state {
+        case .inFullscreen:
+            let site = (url ?? view.url).map { $0.displayHost } ?? "This page"
+            FullScreenBanner.shared.show(for: self, site: site.isEmpty ? "This page" : site, on: view.window?.screen)
+        case .exitingFullscreen, .notInFullscreen:
+            FullScreenBanner.shared.hide(for: self)
+        default:
+            break
+        }
+    }
+
+    /// What VoiceOver reads for the tab's row or tile: its name and anything going on in it.
+    var accessibilityDescription: String {
+        var parts = [displayTitle.isEmpty ? (url?.displayHost ?? "New Tab") : displayTitle]
+        if cameraInUse || microphoneInUse { parts.append(cameraInUse ? "using camera" : "using microphone") }
+        if isMuted { parts.append("muted") } else if isPlayingAudio { parts.append("playing audio") }
+        if isLoading { parts.append("loading") }
+        if !isAwake { parts.append("unloaded") }
+        return parts.joined(separator: ", ")
+    }
+
+    /// Stops the page's camera and microphone (the indicator's click). The page sees its
+    /// tracks end, as when the user stops sharing in Chrome or Safari.
+    func stopCapture() {
+        guard let webView else { return }
+        if webView.cameraCaptureState != .none { webView.setCameraCaptureState(.none, completionHandler: nil) }
+        if webView.microphoneCaptureState != .none { webView.setMicrophoneCaptureState(.none, completionHandler: nil) }
+    }
+
+    /// Pauses or resumes the camera and microphone without ending them (WebKit's `.muted`).
+    func setCaptureMuted(_ muted: Bool) {
+        guard let webView else { return }
+        let state: WKMediaCaptureState = muted ? .muted : .active
+        if webView.cameraCaptureState != .none { webView.setCameraCaptureState(state, completionHandler: nil) }
+        if webView.microphoneCaptureState != .none { webView.setMicrophoneCaptureState(state, completionHandler: nil) }
+    }
+
+    var captureMuted: Bool {
+        guard let webView else { return false }
+        let states = [webView.cameraCaptureState, webView.microphoneCaptureState].filter { $0 != .none }
+        return !states.isEmpty && states.allSatisfy { $0 == .muted }
     }
 
     override func observeValue(
@@ -683,10 +762,17 @@ final class Tab: NSObject, Identifiable {
     }
 
     private func applyZoom(_ level: CGFloat) {
+        let old = pageZoom
         let changed = level != pageZoom
         pageZoom = level
         if let webView, webView.pageZoom != level { webView.pageZoom = level }
-        if changed { browser?.tabDidChange(self, properties: .zoomFactor) }
+        guard changed else { return }
+        browser?.tabDidChange(self, properties: .zoomFactor)
+        // WebKit has no tabs.onZoomChange; Tuff sends it (zoom is per site, automatic mode).
+        ExtensionEventPush.shared.emit("tabs.onZoomChange", details: [
+            "oldZoomFactor": Double(old), "newZoomFactor": Double(level),
+            "zoomSettings": ["mode": "automatic", "scope": "per-origin", "defaultZoomFactor": 1.0],
+        ], tabs: ["tabId": self])
     }
 
     /// Mutes or unmutes the tab. A sleeping tab remembers it and is muted again when it wakes.

@@ -27,6 +27,9 @@ targets:
       - path: TuffBrowser
     dependencies:
       - package: Sparkle
+    scheme:
+      testTargets:
+        - TuffBrowserTests
     info:
       path: TuffBrowser/Resources/Info.plist
       properties:
@@ -97,3 +100,20 @@ targets:
           COPY_PHASE_STRIP: YES
           DEPLOYMENT_POSTPROCESSING: YES
           STRIP_STYLE: non-global
+
+  TuffBrowserTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: TuffBrowserTests
+    dependencies:
+      - target: TuffBrowser
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: ca.beckettclarke.TuffBrowserTests
+        GENERATE_INFOPLIST_FILE: YES
+        CODE_SIGN_STYLE: Manual
+        CODE_SIGN_IDENTITY: "-"
+        DEVELOPMENT_TEAM: ""
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/Tuff.app/Contents/MacOS/Tuff"
+        BUNDLE_LOADER: "$(TEST_HOST)"

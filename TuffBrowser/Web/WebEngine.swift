@@ -153,6 +153,8 @@ enum WebEngine {
         config.webExtensionController = ExtensionManager.shared.controller
         ExtensionStoreBridge.install(into: config.userContentController)
         PictureInPicture.install(into: config.userContentController)
+        LiveFavicon.install(into: config.userContentController)
+        PopupBlocker.install(into: config.userContentController)
         WebNotifications.install(into: config.userContentController)
         EmbeddedSignIn.install(into: config.userContentController)
         // Scripts extensions register at run time; Incognito windows don't run extensions.

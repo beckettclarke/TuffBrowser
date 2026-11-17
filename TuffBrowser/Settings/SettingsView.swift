@@ -1060,6 +1060,18 @@ struct PrivacyPage: View {
                         group.notify(queue: .main) { refreshSiteCount() }
                     }
                 }
+                SettingsRow(title: "Remove recent data", detail: "Cookies and site data stored or changed in that time.") {
+                    Menu {
+                        ForEach(WebsiteData.Range.allCases.filter { $0 != .allTime }) { range in
+                            Button("From \(range.label)…") { removeRecentData(range) }
+                        }
+                    } label: {
+                        Text("Remove…")
+                    }
+                    .menuStyle(.button)
+                    .fixedSize()
+                }
+                WebsiteDataSitesRow(onChange: refreshSiteCount)
                 SettingsRow(title: "Cache", detail: "Copies of pages and images that make sites load faster.") {
                     ConfirmButton(title: "Empty Cache", confirmTitle: "Empty?") {
                         let types: Set<String> = [WKWebsiteDataTypeDiskCache, WKWebsiteDataTypeMemoryCache, WKWebsiteDataTypeFetchCache]
@@ -1089,6 +1101,21 @@ struct PrivacyPage: View {
             }
         }
         .onAppear(perform: refreshSiteCount)
+    }
+
+    /// Asks on a card, then removes the data from that stretch of time in every profile.
+    private func removeRecentData(_ range: WebsiteData.Range) {
+        Task { @MainActor in
+            let confirmed = await PromptPresenter.present(Prompt(
+                host: .settings,
+                symbol: "clock.arrow.circlepath", symbolColor: .red,
+                title: "Remove data from \(range.label.lowercased())?",
+                message: "Cookies and site data stored or changed since then are removed in every profile. Sites you used in that time may sign you out.",
+                confirmTitle: "Remove", destructive: true
+            ))
+            guard confirmed else { return }
+            WebsiteData.remove(range) { refreshSiteCount() }
+        }
     }
 
     private var siteCountText: String {
@@ -1168,6 +1195,8 @@ struct WebsitesPage: View {
                     }
                 }
             }
+
+            OpenInAppAnswersGroup()
 
             SettingsGroup(title: "Content", footer: "Pop-up and autoplay changes apply to tabs opened from now on.") {
                 SwitchRow(title: "Block pop-ups", detail: "Pages can open new tabs only when you click something.", isOn: $settings.privacy.blockPopups)
@@ -1624,7 +1653,7 @@ struct ExtensionRow: View {
                 if record.source == .unpacked {
                     Button("Reload") { extensions.reload(id: record.id) }
                 } else if record.storeID != nil {
-                    Button("Update from Store") { extensions.updateFromStore(id: record.id) }
+                    Button("Check for Update") { extensions.updateFromStore(id: record.id) }
                 }
                 Button("Show in Finder") {
                     NSWorkspace.shared.activateFileViewerSelecting([extensions.directory(for: record)])

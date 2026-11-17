@@ -105,6 +105,10 @@ struct URLPill: View {
             Spacer(minLength: 4)
             let showButtons = hovering || state.pageMenuVisible
             HStack(spacing: 2) {
+                if let tab, !tab.blockedPopups.isEmpty {
+                    BlockedPopupsButton(tab: tab, side: height > 32 ? 24 : 22)
+                        .transition(.opacity.combined(with: .scale(scale: 0.8)))
+                }
                 // Stays in the bar while reader mode is on, so it's plain how to leave it.
                 if let tab, tab.reader != nil {
                     PillButton(
@@ -146,12 +150,26 @@ struct URLPill: View {
         )
         .contentShape(RoundedRectangle(cornerRadius: height * 0.3, style: .continuous))
         .onTapGesture { state.openCommandBar(.editCurrent) }
+        .contextMenu {
+            Button("Paste and Go") { state.pasteAndGo() }
+                .disabled(state.pasteAndGoText == nil)
+            Button("Paste and Go in New Tab") { state.pasteAndGo(inNewTab: true) }
+                .disabled(state.pasteAndGoText == nil)
+            Divider()
+            Button("Copy Link") { state.copyCurrentURL() }
+                .disabled(url == nil)
+            Button("Edit Address") { state.openCommandBar(.editCurrent) }
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel(url.map { "Address: \($0.absoluteString)" } ?? "Search or enter address")
+        .accessibilityAddTraits(.isButton)
         .onHover { hovering = $0 }
         .animation(Motion.quick, value: hovering)
         .animation(Motion.quick, value: url)
         .animation(Motion.quick, value: tab?.isNotSecure)
         .animation(Motion.quick, value: state.pageMenuVisible)
         .animation(Motion.quick, value: tab?.reader != nil)
+        .animation(Motion.quick, value: tab?.blockedPopups.isEmpty)
         .help("Search or enter address  ⌘L")
     }
 }
@@ -184,6 +202,8 @@ struct PillButton: View {
         .animation(Motion.quick, value: hovering)
         .animation(Motion.quick, value: active)
         .help(help)
+        .accessibilityLabel(Text(IconButton.accessibleName(help: help, symbol: symbol)))
+        .accessibilityAddTraits(active ? .isSelected : [])
     }
 }
 
@@ -280,6 +300,7 @@ struct ExtensionActionButton: View {
         .animation(Motion.quick, value: hovering)
         .animation(Motion.quick, value: action.panelOpen)
         .help(action.name)
+        .accessibilityLabel(Text(action.badge.isEmpty ? action.name : "\(action.name), \(action.badge)"))
         .contextMenu {
             if action.hasPanel {
                 Button(action.panelOpen ? "Close Side Panel" : "Open Side Panel") { SidePanelManager.shared.toggle(action.id) }
@@ -405,6 +426,8 @@ struct FavoriteTile: View {
         .animation(Motion.snappy, value: selected)
         .animation(Motion.quick, value: tab.favicon)
         .help(tab.displayTitle)
+        .accessibilityLabel(Text(tab.accessibilityDescription))
+        .accessibilityAddTraits(selected ? .isSelected : [])
         .contextMenu { TabContextMenu(tab: tab, section: .favorites) }
     }
 }
@@ -676,6 +699,9 @@ private struct SplitTabHalf: View {
                         )
                     )
             }
+            if tab.cameraInUse || tab.microphoneInUse {
+                CaptureIndicator(tab: tab, size: 18)
+            }
             if tab.isMuted || tab.isPlayingAudio, !hovering {
                 Image(systemName: tab.isMuted ? "speaker.slash.fill" : "speaker.wave.2.fill")
                     .font(.system(size: 9, weight: .semibold))
@@ -721,6 +747,10 @@ private struct SplitTabHalf: View {
         .animation(Motion.quick, value: hovering)
         .animation(Motion.quick, value: focused)
         .help(tab.displayTitle)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel(Text(tab.accessibilityDescription))
+        .accessibilityAddTraits(focused ? [.isButton, .isSelected] : .isButton)
+        .accessibilityAction { state.select(tab) }
         .contextMenu { TabContextMenu(tab: tab, section: section) }
         .onDrag {
             state.draggingTab = tab
@@ -1281,6 +1311,10 @@ struct TabRow: View {
                 .transition(.scale.combined(with: .opacity))
             }
 
+            if tab.cameraInUse || tab.microphoneInUse {
+                CaptureIndicator(tab: tab)
+            }
+
             if tab.isPlayingAudio || tab.isMuted {
                 Button {
                     tab.setMuted(!tab.isMuted)
@@ -1338,9 +1372,14 @@ struct TabRow: View {
         .animation(Motion.quick, value: selected)
         .animation(Motion.quick, value: split)
         .animation(Motion.snappy, value: tab.isPlayingAudio)
+        .animation(Motion.snappy, value: tab.cameraInUse || tab.microphoneInUse)
         .animation(Motion.snappy, value: tab.isInPictureInPicture)
         .animation(Motion.quick, value: hoveringHome)
         .animation(Motion.snappy, value: away)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel(Text(tab.accessibilityDescription))
+        .accessibilityAddTraits(selected ? [.isButton, .isSelected] : .isButton)
+        .accessibilityAction { state.select(tab) }
         .contextMenu { TabContextMenu(tab: tab, section: section) }
     }
 }
@@ -1438,6 +1477,9 @@ struct TabContextMenu: View {
         }
         .disabled(tab.url == nil)
         Button(tab.isMuted ? "Unmute" : "Mute") { tab.setMuted(!tab.isMuted) }
+        if tab.cameraInUse || tab.microphoneInUse {
+            Button("Stop Camera and Microphone") { tab.stopCapture() }
+        }
         if tab.isInPictureInPicture {
             Button("Exit Picture in Picture") { tab.togglePictureInPicture() }
         } else if tab.isAwake {

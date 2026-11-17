@@ -120,6 +120,11 @@ enum DebugHooks {
             if let url = URL(string: argument) { state.selectedTab?.load(url) }
         case "snap":
             snapshot(window: state.window, to: argument)
+        case "favicon":
+            // favicon <path> — writes the selected tab's icon as a PNG (and logs whether it has one).
+            let icon = state.selectedTab?.favicon
+            if let png = icon?.pngData { try? png.write(to: URL(fileURLWithPath: argument)) }
+            log("favicon \(icon.map { "\($0.size)" } ?? "nil") -> \(argument)")
         case "pagesnap":
             // pagesnap <path> — the selected tab's page as WebKit draws it. Unlike `snap`, this
             // works while the screen is locked (window capture comes back white then).
@@ -485,6 +490,28 @@ enum DebugHooks {
                 let context = ExtensionManager.shared.contexts[record.id]
                 log("ext \(record.id) \(record.name) v\(record.version) enabled=\(record.enabled) loaded=\(context != nil) links=\(ExtensionManager.shared.linkSummary(record) ?? "all") error=\(record.lastError ?? "-") base=\(context?.baseURL.absoluteString ?? "-") errors=\(context?.errors.map(\.localizedDescription) ?? [])")
             }
+        case "popups":
+            // popups — what the pop-up blocker stopped on the selected tab.
+            let tab = state.selectedTab
+            log("popups blocked=\(tab?.blockedPopups.map(\.absoluteString) ?? []) allowed=\(tab?.popupsAllowed ?? false)")
+        case "historymenu":
+            // historymenu — fills the History menu as if it opened, and logs its items.
+            if let menu = NSApp.mainMenu?.item(withTitle: "History")?.submenu {
+                HistoryMenuFiller.shared.menuNeedsUpdate(menu)
+                let closed = menu.item(withTitle: "Recently Closed")?.submenu?.items.map(\.title) ?? []
+                log("historymenu items=\(menu.items.map { $0.isSeparatorItem ? "—" : $0.title }) closed=\(closed)")
+            }
+        case "pasteandgo":
+            // pasteandgo <text> — puts text on the clipboard and runs Paste and Go.
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(argument, forType: .string)
+            state.pasteAndGo()
+        case "fsbanner":
+            log("fsbanner \(FullScreenBanner.shared.debugState)")
+        case "capture":
+            // capture — the selected tab's camera / microphone / full-screen state.
+            let tab = state.selectedTab
+            log("capture camera=\(tab?.cameraInUse ?? false) mic=\(tab?.microphoneInUse ?? false) fullscreen=\(tab?.isFullScreen ?? false)")
         case "js":
             let rest2 = rest
             state.selectedTab?.webView?.evaluateJavaScript(argument) { result, error in

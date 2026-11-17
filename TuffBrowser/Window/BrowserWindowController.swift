@@ -22,6 +22,7 @@ final class BrowserWindow: NSWindow {
 final class BrowserWindowController: NSObject {
     let window: BrowserWindow
     private let state: BrowserState
+    private let boundsDebouncer = Debouncer(delay: 0.3)
     private let settings = AppSettings.shared
     private var hostingView: NSHostingView<AnyView>!
     private var monitors: [Any] = []
@@ -384,7 +385,17 @@ final class BrowserWindowController: NSObject {
 }
 
 extension BrowserWindowController: NSWindowDelegate {
-    func windowDidResize(_ notification: Notification) { layoutTrafficLights() }
+    func windowDidResize(_ notification: Notification) {
+        layoutTrafficLights()
+        boundsChanged()
+    }
+    func windowDidMove(_ notification: Notification) { boundsChanged() }
+
+    /// `windows.onBoundsChanged` (WebKit has no such event), sent once the window settles.
+    private func boundsChanged() {
+        guard !state.isPrivate else { return }
+        boundsDebouncer.schedule { ExtensionEventPush.shared.emitWindowEvent("windows.onBoundsChanged") }
+    }
     func windowDidBecomeKey(_ notification: Notification) { layoutTrafficLights() }
     func windowDidBecomeMain(_ notification: Notification) {
         layoutTrafficLights()

@@ -1,8 +1,9 @@
 # Known bugs
 
 Last updated 2026-11-17. Everything found in the extension / keyboard / focus sweep and the
-2026-11-16 security / bug audit is fixed (not committed yet). Two things are left over. Missing
-features from the audit are in TODOS.md (section K).
+2026-11-16 security / bug audit is fixed. The 2026-11-17 pass fixed the extension and app
+correctness bugs from TODOS.md (sections F, G, H) — listed at the end of the table below. Two
+things are left over. Missing features are in TODOS.md (section K).
 
 ## Left over
 
@@ -64,7 +65,21 @@ features from the audit are in TODOS.md (section K).
 | Zoom went in ×1.1 steps (odd percentages that drifted); ⌘+ didn't work where + is its own key. Standard steps now, and ⌘+ zooms in. | `Tab.zoomStep`, `MainMenu` |
 | Duplicate Tab copied only the address, losing back / forward history and the tab's name. | `BrowserState.duplicate` |
 | Finished downloads are given Gatekeeper's quarantine flag if WebKit didn't set one (it does today; this is a fallback). | `DownloadManager.markQuarantined` |
+| A session with no profiles or spaces (or a lookup before restore) indexed `[0]` of an empty array. | `BrowserState.currentSpace`, `profile(for:)`, `restore` |
+| A tab asked for before the session was restored was handed back orphaned and its address queued separately. | `BrowserState.newTab` (`pendingTabs`) |
+| An extension page that failed to load got a simulated error page, which can't load at an extension address. | `Tab.handleLoadFailure` |
+| Extension relay pages (sockets, events, offscreen) switched off throttling for every page of their extension: a copied configuration shares its `WKPreferences`. | `ExtensionManager.hiddenPageConfiguration` |
+| The Chrome Web Store download claimed Chrome 140 on arm64 on every Mac. | `ExtensionManager.chromeDownloadURL` |
+| A Firefox add-on installed from a .zip was treated as a Chrome extension. | `ExtensionManager.isGeckoManifest` |
+| Extensions were never updated, and "Update from Store" reinstalled without checking the version. | `Extensions/ExtensionUpdates.swift` |
+| Native messaging dropped messages silently when the host wasn't running or the message wasn't JSON; host stderr was thrown away. | `NativeMessaging.send`, `ExtensionManager` |
+| `_execute_page_action` shortcuts did nothing; two extensions with the same shortcut raced. | `ExtensionManager.handleKeyEvent` |
+| The side panel could "open" with nothing to show on any tab. | `SidePanelManager.open` |
+| Extension pages with no `<script>` tag never got the compatibility shim; module-worker shim replacement relied on fragile markers. | `ExtensionCompat.shimInsertionPoint`, `moduleStart` / `moduleEnd` |
+| A card raised with the browser window closed fell back to a native `NSAlert`. | `PromptPresenter.showNext` |
 
 New debug-script commands (debug builds only): `press [cmd+][shift+][opt+][ctrl+]<key|tab>` sends
 a real key event, and `responder` logs what has keyboard focus. `move x y` and `middleclick x y` post
-pointer events through the event queue (window points, origin bottom-left).
+pointer events through the event queue (window points, origin bottom-left). Added 2026-11-17:
+`popups` (what the pop-up blocker stopped), `historymenu` (fills and logs the History menu),
+`pasteandgo <text>`, `capture` (camera / mic / full-screen state) and `fsbanner`.

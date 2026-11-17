@@ -151,7 +151,11 @@ final class SidePanelManager {
 
     @discardableResult
     func open(_ id: String) -> Bool {
-        guard url(for: id, tab: browser.selectedTab) != nil || tabOptions[id]?.isEmpty == false else { return false }
+        // Available on this tab, or set for some other open tab (Chrome lets a tab-specific panel
+        // be opened; it shows when that tab is selected). Options left over for tabs that no
+        // longer resolve to a page don't count.
+        let elsewhere = browser.allTabs.contains { tabOptions[id]?[$0.id] != nil && url(for: id, tab: $0) != nil }
+        guard url(for: id, tab: browser.selectedTab) != nil || elsewhere else { return false }
         if openID != id { host?.tearDown(); host = nil }
         openID = id
         lastOpenedID = id

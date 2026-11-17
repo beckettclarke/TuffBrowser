@@ -30,7 +30,7 @@ enum ExtensionCompat {
     /// whenever `patch` learns to hook the shim in somewhere new, so extensions installed by
     /// an older build are brought up to date the next time they load.
     private static let markerName = "__tuff_compat.level"
-    private static let level = "2"
+    private static let level = "3"
 
     /// The hidden page that opens WebSockets for an extension's service worker (see the shim).
     static let socketRelayPage = "__tuff_socket.html"
@@ -140,8 +140,8 @@ enum ExtensionCompat {
                     // WebKit refuses a wrapper module that imports the real worker, so the shim is
                     // placed at the top of the worker itself (modules are always strict, so this
                     // cannot change how the rest of the file is parsed).
-                    if let original = try? Data(contentsOf: workerURL), !original.starts(with: Data(shim.utf8.prefix(40))) {
-                        var patched = Data(shim.utf8)
+                    if let original = try? Data(contentsOf: workerURL), !hasModuleShim(original) {
+                        var patched = Data(moduleShim.utf8)
                         #if DEBUG
                         if ProcessInfo.processInfo.environment["TUFF_EXT_DEBUG"] != nil {
                             patched.append(Data(("\n" + debugShim).utf8))
@@ -195,9 +195,8 @@ enum ExtensionCompat {
         if let files = fm.enumerator(at: root, includingPropertiesForKeys: [.fileSizeKey], options: [.skipsHiddenFiles]) {
             for case let file as URL in files where ["html", "htm"].contains(file.pathExtension.lowercased()) {
                 guard let size = try? file.resourceValues(forKeys: [.fileSizeKey]).fileSize, size < 4_000_000,
-                      var html = try? String(contentsOf: file, encoding: .utf8), !html.contains(shimName),
-                      let first = html.range(of: "<script", options: .caseInsensitive) else { continue }
-                html.insert(contentsOf: tag, at: first.lowerBound)
+                      var html = try? String(contentsOf: file, encoding: .utf8), !html.contains(shimName) else { continue }
+                html.insert(contentsOf: tag, at: shimInsertionPoint(in: html))
                 try? html.write(to: file, atomically: true, encoding: .utf8)
             }
         }
@@ -210,6 +209,17 @@ enum ExtensionCompat {
                   (try? output.write(to: manifestURL, options: .atomic)) != nil else { return }
         }
         try? level.write(to: root.appendingPathComponent(markerName), atomically: true, encoding: .utf8)
+    }
+
+    /// Where the shim's script tag goes in an extension page: ahead of its first script, or —
+    /// for a page with none written in (its scripts may be added later, or it is only framed
+    /// by another page) — at the end of `<head>`, the start of `<body>`, or the top.
+    static func shimInsertionPoint(in html: String) -> String.Index {
+        if let first = html.range(of: "<script", options: .caseInsensitive) { return first.lowerBound }
+        if let head = html.range(of: "</head", options: .caseInsensitive) { return head.lowerBound }
+        if let body = html.range(of: "<body", options: .caseInsensitive) { return body.lowerBound }
+        if let doctype = html.range(of: "<!doctype[^>]*>", options: [.caseInsensitive, .regularExpression]) { return doctype.upperBound }
+        return html.startIndex
     }
 
     /// Brings an already-installed extension up to the current shim. Extensions are patched
@@ -244,13 +254,29 @@ enum ExtensionCompat {
               let worker = background["service_worker"] as? String else { return }
         let workerURL = root.appendingPathComponent(worker)
         guard let source = try? Data(contentsOf: workerURL),
-              source.starts(with: Data(shim.utf8.prefix(40))),   // has a shim…
-              !source.starts(with: Data(shim.utf8)),              // …but not this one
-              let end = source.range(of: Data("\n})();\n".utf8)) else { return }
-        var patched = Data(shim.utf8)
+              hasModuleShim(source),                         // has a shim…
+              !source.starts(with: Data(moduleShim.utf8)) else { return }   // …but not this one
+        // The shim ends at the end sentinel. Workers patched before there was one end at the
+        // shim's last line, the first that reads exactly `})();`.
+        let end = source.range(of: Data(moduleEnd.utf8)) ?? source.range(of: Data("\n})();\n".utf8))
+        guard let end else { return }
+        var patched = Data(moduleShim.utf8)
+        var rest = source[end.upperBound...]
+        if rest.first == UInt8(ascii: "\n") { rest = rest.dropFirst() }
         patched.append(Data("\n".utf8))
-        patched.append(source[end.upperBound...])
+        patched.append(rest)
         try? patched.write(to: workerURL, options: .atomic)
+    }
+
+    /// Markers around the copy of the shim at the top of a module worker, so it can be found
+    /// and replaced exactly when the shim changes (whatever the shim's text looks like).
+    private static let moduleStart = "// __tuff_compat_start__ (added by Tuff; replaced on update)\n"
+    private static let moduleEnd = "\n// __tuff_compat_end__\n"
+    private static var moduleShim: String { moduleStart + shim + moduleEnd }
+
+    /// Whether a module worker already starts with a copy of the shim (any version).
+    private static func hasModuleShim(_ source: Data) -> Bool {
+        source.starts(with: Data(moduleStart.utf8)) || source.starts(with: Data(shim.utf8.prefix(40)))
     }
 
     #if DEBUG
@@ -288,8 +314,9 @@ enum ExtensionCompat {
     """
     #endif
 
-    /// Note for editors: the first 40 bytes identify the shim inside module workers, and the
-    /// only line that may read exactly `})();` is the last one — `refresh` relies on both.
+    /// Note for editors: module workers find their copy of the shim by `moduleStart` /
+    /// `moduleEnd`. (Workers patched by older builds are found by the first 40 bytes and the
+    /// first line reading exactly `})();`, so keep the opening line and that rule as they are.)
     private static let shim = """
     // Added by Tuff: inert stand-ins for extension APIs that WebKit does not provide,
     // plus fixes for a few places where WebKit behaves differently from Chrome and Firefox.
@@ -373,6 +400,7 @@ enum ExtensionCompat {
         if (typeof done === 'function') { done(value); return undefined; }
         return Promise.resolve(value);
       };
+      const constant = (value) => () => value;
       const objects = {
         storage: {
           managed: (path) => ({
@@ -381,6 +409,30 @@ enum ExtensionCompat {
             getKeys: answer([]),
             onChanged: stub(path + '.onChanged', true),
           }),
+        },
+        // Chrome's published limits, for extensions that size their rule sets by them (WebKit
+        // leaves them undefined, and `n < undefined` is always false).
+        declarativeNetRequest: {
+          MAX_NUMBER_OF_DYNAMIC_RULES: constant(30000),
+          MAX_NUMBER_OF_UNSAFE_DYNAMIC_RULES: constant(5000),
+          MAX_NUMBER_OF_DYNAMIC_AND_SESSION_RULES: constant(5000),
+          MAX_NUMBER_OF_SESSION_RULES: constant(5000),
+          MAX_NUMBER_OF_UNSAFE_SESSION_RULES: constant(5000),
+          MAX_NUMBER_OF_REGEX_RULES: constant(1000),
+          MAX_NUMBER_OF_STATIC_RULESETS: constant(100),
+          MAX_NUMBER_OF_ENABLED_STATIC_RULESETS: constant(50),
+          GUARANTEED_MINIMUM_STATIC_RULES: constant(30000),
+          GETMATCHEDRULES_QUOTA_INTERVAL: constant(10),
+          MAX_GETMATCHEDRULES_CALLS_PER_INTERVAL: constant(20),
+          DYNAMIC_RULESET_ID: constant('_dynamic'),
+          SESSION_RULESET_ID: constant('_session'),
+          // Rule testers call this; WebKit can't say which rules would match, so: none.
+          testMatchOutcome: () => answer({ matchedRules: [] }),
+        },
+        // Legacy (MV2) and synchronous: the extension's own open pages. Never more than none
+        // that the caller could script directly in WebKit, so an empty list.
+        extension: {
+          getExtensionTabs: () => () => [],
         },
       };
 
@@ -823,15 +875,16 @@ enum ExtensionCompat {
           // Real events for the native APIs. Tuff pushes them through a relay page's
           // runtime.sendMessage (a wake event for the worker); dispatch to listeners here. Adding the
           // first listener subscribes with Tuff so it only wakes extensions that actually listen.
+          // listener -> its filter (webNavigation's `{ url: [UrlFilter] }`), per event name.
           const nativeEvents = {};
           const event = (name) => {
-            const listeners = new Set();
+            const listeners = new Map();
             nativeEvents[name] = listeners;
             return {
-              addListener: (fn) => {
+              addListener: (fn, filter) => {
                 if (typeof fn !== 'function') return;
                 const first = listeners.size === 0;
-                listeners.add(fn);
+                listeners.set(fn, filter);
                 if (first) call('__events', 'subscribe', { event: name }).catch(() => {});
               },
               removeListener: (fn) => {
@@ -842,13 +895,78 @@ enum ExtensionCompat {
               hasListeners: () => listeners.size > 0,
             };
           };
+          // Chrome's events.UrlFilter, for listeners added with `{ url: [...] }`.
+          const urlMatches = (url, f) => {
+            let u; try { u = new URL(url); } catch (e) { return false; }
+            const host = u.hostname, path = u.pathname, query = u.search.slice(u.search.startsWith('?') ? 1 : 0);
+            const plain = u.href.replace(/#.*$/, '');
+            const checks = [
+              ['hostContains', (v) => ('.' + host).includes(v)], ['hostEquals', (v) => host === v],
+              ['hostPrefix', (v) => host.startsWith(v)], ['hostSuffix', (v) => host.endsWith(v)],
+              ['pathContains', (v) => path.includes(v)], ['pathEquals', (v) => path === v],
+              ['pathPrefix', (v) => path.startsWith(v)], ['pathSuffix', (v) => path.endsWith(v)],
+              ['queryContains', (v) => query.includes(v)], ['queryEquals', (v) => query === v],
+              ['queryPrefix', (v) => query.startsWith(v)], ['querySuffix', (v) => query.endsWith(v)],
+              ['urlContains', (v) => plain.includes(v)], ['urlEquals', (v) => plain === v],
+              ['urlPrefix', (v) => plain.startsWith(v)], ['urlSuffix', (v) => plain.endsWith(v)],
+              ['urlMatches', (v) => { try { return new RegExp(v).test(plain); } catch (e) { return false; } }],
+              ['originAndPathMatches', (v) => { try { return new RegExp(v).test(u.origin + path); } catch (e) { return false; } }],
+              ['schemes', (v) => Array.isArray(v) && v.includes(u.protocol.replace(/:$/, ''))],
+              ['ports', (v) => Array.isArray(v) && v.some((p) => {
+                const port = Number(u.port || (u.protocol === 'https:' ? 443 : u.protocol === 'http:' ? 80 : 0));
+                return Array.isArray(p) ? port >= p[0] && port <= p[1] : port === p;
+              })],
+            ];
+            return checks.every(([key, test]) => f[key] === undefined || test(f[key]));
+          };
+          const passes = (filter, args) => {
+            if (!filter || !Array.isArray(filter.url) || !filter.url.length) return true;
+            const details = args[0];
+            if (!details || typeof details.url !== 'string') return true;
+            return filter.url.some((f) => f && typeof f === 'object' && urlMatches(details.url, f));
+          };
+          // Tuff names tabs by their index (it can't know WebKit's tab ids); swap in the ids.
+          const resolve = async (msg) => {
+            const args = Array.isArray(msg.args) ? msg.args : [];
+            if (msg.tabs && args[0] && typeof args[0] === 'object') {
+              let all = [];
+              try { all = await root.tabs.query({}); } catch (e) {}
+              for (const field of Object.keys(msg.tabs)) {
+                const tab = all.find((t) => t.index === msg.tabs[field]);
+                args[0][field] = tab ? tab.id : -1;
+              }
+            }
+            if (msg.window) {
+              try { args[0] = await root.windows.getLastFocused(); } catch (e) {}
+            }
+            return args;
+          };
           try {
             root.runtime.onMessage.addListener((msg) => {
               if (msg && typeof msg === 'object' && msg.__tuffEvent && nativeEvents[msg.__tuffEvent]) {
-                for (const fn of [...nativeEvents[msg.__tuffEvent]]) { try { fn(...(msg.args || [])); } catch (e) {} }
+                const listeners = nativeEvents[msg.__tuffEvent];
+                resolve(msg).then((args) => {
+                  for (const [fn, filter] of [...listeners]) {
+                    if (!passes(filter, args)) continue;
+                    try { fn(...args); } catch (e) {}
+                  }
+                });
               }
             });
           } catch (e) {}
+          // Events inside namespaces WebKit has, which Tuff drives itself.
+          const nativeEventsIn = (namespace, names) => {
+            let object;
+            try { object = root[namespace]; } catch (e) { return; }
+            if (!object || typeof object !== 'object') return;
+            for (const name of names) {
+              if (absent(object, name)) add(object, name, event(namespace + '.' + name));
+            }
+            pins.push(object);
+          };
+          nativeEventsIn('webNavigation', ['onHistoryStateUpdated', 'onReferenceFragmentUpdated', 'onCreatedNavigationTarget']);
+          nativeEventsIn('tabs', ['onZoomChange']);
+          nativeEventsIn('windows', ['onBoundsChanged']);
           const implement = (name, methods) => {
             if (absent(root, name)) { add(root, name, methods); pins.push(methods); }
           };

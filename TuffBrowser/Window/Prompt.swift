@@ -114,9 +114,18 @@ enum PromptPresenter {
         case .browser: state.window
         case .settings: AppDelegate.shared?.visibleSettingsWindow ?? state.window
         }
-        guard let window = host else {
+        // The browser window was closed (it comes back from the Dock): bring it back to hold
+        // the card, rather than falling back to a native alert. An Incognito window that has
+        // gone away can't come back, so its question is answered "no" — the safe answer.
+        var window = host
+        if window == nil, !state.isPrivate {
+            AppDelegate.shared?.showMainWindow()
+            window = state.window
+        }
+        guard let window else {
+            NSLog("Tuff: no window to show “\(prompt.title)” in; answered no")
             continuation.resume(returning: PromptResult(
-                confirmed: fallbackAlert(prompt), fields: prompt.fields.map(\.text), checked: prompt.checked
+                confirmed: false, fields: prompt.fields.map(\.text), checked: prompt.checked
             ))
             showNext()
             return
@@ -127,20 +136,6 @@ enum PromptPresenter {
         // Keep Return / Esc away from the page so they reach the card's buttons.
         window.makeFirstResponder(nil)
         withAnimation(Motion.snappy) { state.prompt = prompt }
-    }
-
-    /// Only used if the host window isn't open, so there is nowhere to draw the card.
-    private static func fallbackAlert(_ prompt: Prompt) -> Bool {
-        let alert = NSAlert()
-        alert.messageText = prompt.title
-        var text = [prompt.subtitle, prompt.message].compactMap { $0 }
-        if !prompt.items.isEmpty { text.append(prompt.items.map { "• " + $0.text }.joined(separator: "\n")) }
-        if let note = prompt.note { text.append(note) }
-        alert.informativeText = text.joined(separator: "\n\n")
-        if let icon = prompt.icon { alert.icon = icon }
-        alert.addButton(withTitle: prompt.confirmTitle)
-        if let cancel = prompt.cancelTitle { alert.addButton(withTitle: cancel) }
-        return alert.runModal() == .alertFirstButtonReturn
     }
 }
 

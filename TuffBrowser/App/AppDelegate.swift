@@ -70,7 +70,7 @@ final class AppDelegate: NSObject {
     }
 
     /// Brings a browser window forward if none is: the main one.
-    private func ensureBrowserWindow() {
+    func ensureBrowserWindow() {
         if BrowserState.active === mainState { showMainWindow() }
     }
 

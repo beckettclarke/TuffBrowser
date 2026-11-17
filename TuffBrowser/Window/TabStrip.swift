@@ -171,6 +171,10 @@ struct StripTab: View {
                     )
             }
 
+            if tab.cameraInUse || tab.microphoneInUse {
+                CaptureIndicator(tab: tab, size: 18)
+            }
+
             if tab.isPlayingAudio || tab.isMuted {
                 Button {
                     tab.setMuted(!tab.isMuted)
@@ -220,6 +224,10 @@ struct StripTab: View {
         .animation(Motion.quick, value: selected)
         .animation(Motion.snappy, value: tab.isPlayingAudio)
         .help(tab.displayTitle)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel(Text(tab.accessibilityDescription))
+        .accessibilityAddTraits(selected ? [.isButton, .isSelected] : .isButton)
+        .accessibilityAction { state.select(tab) }
         .contextMenu { TabContextMenu(tab: tab, section: .tabs) }
         .onDrag {
             state.draggingTab = tab
@@ -256,6 +264,10 @@ struct CompactStripTab: View {
             .animation(Motion.quick, value: hovering)
             .animation(Motion.quick, value: selected)
             .help(tab.displayTitle)
+            .accessibilityElement(children: .contain)
+            .accessibilityLabel(Text(tab.accessibilityDescription))
+            .accessibilityAddTraits(selected ? [.isButton, .isSelected] : .isButton)
+            .accessibilityAction { state.select(tab) }
             .contextMenu { TabContextMenu(tab: tab, section: section) }
             .onDrag {
                 state.draggingTab = tab
@@ -505,4 +517,39 @@ struct IncognitoBadge: View {
         .background(Capsule().fill(.primary.opacity(0.1)))
         .help("Pages you see in this window aren’t saved to history, and cookies and site data are forgotten when it closes.")
     }
+}
+
+/// The camera / microphone in-use indicator on a tab (sidebar rows and horizontal tabs). Red
+/// while the page is capturing, grey while paused; its menu pauses, resumes or stops it.
+struct CaptureIndicator: View {
+    let tab: Tab
+    var size: CGFloat = 20
+
+    var body: some View {
+        let muted = tab.captureMuted
+        let symbol = tab.cameraInUse ? (muted ? "video.slash.fill" : "video.fill") : (muted ? "mic.slash.fill" : "mic.fill")
+        let what = tab.cameraInUse && tab.microphoneInUse ? "camera and microphone" : (tab.cameraInUse ? "camera" : "microphone")
+        Menu {
+            Button(muted ? "Resume \(what.capitalizedFirst)" : "Pause \(what.capitalizedFirst)") { tab.setCaptureMuted(!muted) }
+            Button("Stop Using \(what.capitalizedFirst)") { tab.stopCapture() }
+        } label: {
+            Image(systemName: symbol)
+                .font(.system(size: size * 0.5, weight: .semibold))
+                .foregroundStyle(muted ? AnyShapeStyle(.primary.opacity(0.55)) : AnyShapeStyle(Color.red))
+                .frame(width: size, height: size)
+                .contentShape(Rectangle())
+        }
+        .menuStyle(.button)
+        .buttonStyle(.plain)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .help(muted ? "This page’s \(what) is paused" : "This page is using your \(what)")
+        .accessibilityLabel(muted ? "\(what.capitalizedFirst) paused" : "Using \(what)")
+        .transition(.scale.combined(with: .opacity))
+    }
+}
+
+extension String {
+    /// "camera and microphone" → "Camera and microphone".
+    var capitalizedFirst: String { prefix(1).uppercased() + dropFirst() }
 }

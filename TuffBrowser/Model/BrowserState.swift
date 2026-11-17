@@ -98,7 +98,10 @@ final class BrowserState {
     @ObservationIgnored private weak var pipHandoffFrom: Tab?
     @ObservationIgnored private var pipHandoffPending = false
     @ObservationIgnored private var restored = false
-    @ObservationIgnored private var pendingURLs: [URL] = []
+    /// Tabs asked for before the session was restored (a link opened at launch, an extension
+    /// that started early). They are real tabs, owned by this window, and go into the current
+    /// space as soon as `restore` finishes.
+    @ObservationIgnored private var pendingTabs: [(tab: Tab, select: Bool)] = []
 
     private let sessionFile = Paths.appSupport.appendingPathComponent("session.json")
     /// The last session that read back fine at launch, for when `sessionFile` can't be read.
@@ -168,13 +171,22 @@ final class BrowserState {
     // MARK: Lookups
 
     var currentSpace: Space {
-        spaces[max(0, min(currentSpaceIndex, spaces.count - 1))]
+        guard !spaces.isEmpty else { return placeholderSpace }
+        return spaces[max(0, min(currentSpaceIndex, spaces.count - 1))]
     }
 
     /// The profile a space belongs to (the first one if its profile has gone missing).
     func profile(for space: Space) -> Profile {
-        profiles.first { $0.id == space.profileID } ?? profiles[0]
+        profiles.first { $0.id == space.profileID } ?? profiles.first ?? placeholderProfile
     }
+
+    /// Stand-ins handed out if something asks for the current space or profile before the
+    /// session is restored (or after a damaged session left none), so lookups never index an
+    /// empty array. `restore` always leaves at least one real space and profile.
+    @ObservationIgnored private lazy var placeholderProfile = Profile(name: "Personal", icon: "person.fill", usesSharedStore: true)
+    @ObservationIgnored private lazy var placeholderSpace = Space(
+        name: "Home", icon: "bookmark.fill", colorHex: Space.palette[0], profileID: placeholderProfile.id
+    )
 
     var currentProfile: Profile { profile(for: currentSpace) }
 
@@ -267,8 +279,10 @@ final class BrowserState {
         sessionState: Data? = nil
     ) -> Tab {
         guard restored else {
-            if let url { pendingURLs.append(url) }
-            return Tab(url: url)
+            let tab = Tab(url: url, sessionState: sessionState)
+            tab.browser = self
+            pendingTabs.append((tab, select))
+            return tab
         }
         let space = targetSpace ?? opener.flatMap { self.space(containing: $0) } ?? (beside.flatMap { self.space(containing: $0) }) ?? currentSpace
         let tab = Tab(url: url, sessionState: sessionState)
@@ -481,6 +495,14 @@ final class BrowserState {
         }
     }
 
+    /// The recently closed tabs for the History menu, newest first.
+    func recentlyClosedForMenu(limit: Int) -> [(id: String, title: String, url: URL)] {
+        ensureClosedTabIDs()
+        return closedTabs.reversed().prefix(limit).compactMap { closed in
+            closed.id.map { ($0.uuidString, closed.title, closed.url) }
+        }
+    }
+
     /// Reopens a closed tab by its session id (nil = the most recent), with its history. Returns the
     /// restored session in Chrome's shape, or nil if there is nothing to restore.
     func restoreSession(id: String?) -> [String: Any]? {
@@ -488,7 +510,7 @@ final class BrowserState {
         let index: Int? = id.flatMap { id in closedTabs.firstIndex { $0.id?.uuidString == id } } ?? closedTabs.indices.last
         guard let index else { return nil }
         let closed = closedTabs.remove(at: index)
-        ExtensionEventPush.shared.emit("sessions.onChanged", args: [])
+        if !isPrivate { ExtensionEventPush.shared.emit("sessions.onChanged", args: []) }
         let space = spaces.first { $0.id == closed.spaceID } ?? currentSpace
         if space !== currentSpace, let i = spaces.firstIndex(where: { $0 === space }) { switchSpace(to: i) }
         let tab = Tab(url: closed.url, title: closed.title, sessionState: closed.sessionState)
@@ -798,6 +820,21 @@ final class BrowserState {
         focusWebView()
     }
 
+    /// What Paste and Go would open: the text on the clipboard, if there is any.
+    var pasteAndGoText: String? {
+        guard let text = NSPasteboard.general.string(forType: .string)?.trimmed, !text.isEmpty else { return nil }
+        // A long block of text isn't something to go to; keep it to what fits an address bar.
+        return text.count <= 2048 ? text.replacingOccurrences(of: "\n", with: " ") : nil
+    }
+
+    /// Paste and Go: opens the clipboard's address (or searches for its text) in this tab, or
+    /// in a new tab when there is none or `inNewTab`.
+    func pasteAndGo(inNewTab: Bool = false) {
+        guard let text = pasteAndGoText else { return }
+        closeCommandBar()
+        open(input: text, mode: inNewTab || selectedTab == nil ? .newTab : .editCurrent)
+    }
+
     func open(input: String, mode: CommandBarMode) {
         let text = input.trimmed
         guard !text.isEmpty else { return }
@@ -923,7 +960,7 @@ final class BrowserState {
         let color = Space.palette.first { !used.contains($0) } ?? Space.palette[spaces.count % Space.palette.count]
         let usedIcons = Set(spaces.map(\.icon))
         let icon = Space.icons.first { !usedIcons.contains($0) } ?? "sparkles"
-        let profileID = spaces.isEmpty ? profiles[0].id : currentSpace.profileID
+        let profileID = spaces.isEmpty ? (profiles.first ?? placeholderProfile).id : currentSpace.profileID
         let space = Space(name: "New Space", icon: icon, colorHex: color, profileID: profileID)
         animate { spaces.append(space) }
         if select {
@@ -1565,9 +1602,11 @@ final class BrowserState {
                 profile.favorites = (snapshot.favorites ?? []).map(make)
                 profiles = [profile]
             }
+            if profiles.isEmpty { profiles = [Profile(name: "Personal", icon: "person.fill", usesSharedStore: true)] }
             let known = Set(profiles.map(\.id))
+            let fallbackProfileID = profiles[0].id
             spaces = snapshot.spaces.map { s in
-                let profileID = s.profile.flatMap { known.contains($0) ? $0 : nil } ?? profiles[0].id
+                let profileID = s.profile.flatMap { known.contains($0) ? $0 : nil } ?? fallbackProfileID
                 let space = Space(id: s.id, name: s.name, icon: s.icon, colorHex: s.colorHex, profileID: profileID)
                 if let items = s.pinnedItems {
                     space.pinnedItems = items.compactMap { item in
@@ -1585,6 +1624,9 @@ final class BrowserState {
                 if let id = s.selected, tab(withID: id, in: space) == nil { space.selectedTabID = nil }
                 space.split = s.split
                 return space
+            }
+            if spaces.isEmpty {
+                spaces = [Space(name: "Home", icon: "bookmark.fill", colorHex: Space.palette[0], profileID: fallbackProfileID)]
             }
             pruneSplits()
             currentSpaceIndex = max(0, min(snapshot.currentSpace, spaces.count - 1))
@@ -1604,8 +1646,17 @@ final class BrowserState {
         selectedTab?.lastActive = Date()
         selectedTab?.wake()
         splitPartner?.wake()
-        pendingURLs.forEach { newTab(url: $0) }
-        pendingURLs.removeAll()
+        let pending = pendingTabs
+        pendingTabs.removeAll()
+        for (tab, select) in pending {
+            let space = currentSpace
+            let index = settings.tabs.newTabPosition == .top ? 0 : space.tabs.count
+            space.tabs.insert(tab, at: index)
+            if tab.url != nil { tab.wake() }
+            ext?.didOpen(tab)
+            if select { self.select(tab) }
+        }
+        if !pending.isEmpty { scheduleSave() }
         startSleepTimer()
         ext?.applyLinks()
     }

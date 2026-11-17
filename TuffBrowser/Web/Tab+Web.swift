@@ -170,10 +170,12 @@ extension Tab: WKNavigationDelegate {
 
     func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
         pendingURL = nil
+        lastSameDocumentURL = webView.url
         mediaFrame = nil
         // The certificate error page commits at the address that failed; anything else ends it.
         if let failure = certificateFailure, webView.url != failure.url { certificateFailure = nil }
-        // A new page gets to show dialogs again.
+        // A new page gets to show dialogs again, and starts with no blocked pop-ups.
+        if !blockedPopups.isEmpty { blockedPopups.removeAll() }
         pageDialogCount = 0
         pageDialogsBlocked = false
         if hoveredLink != nil { hoveredLink = nil }
@@ -201,6 +203,7 @@ extension Tab: WKNavigationDelegate {
             favicon = InternalPage.icon(for: u) ?? ExtensionManager.shared.icon(forPage: u)
                 ?? (sameSite ? favicon : nil) ?? FaviconStore.shared.cachedIcon(for: u) ?? favicon
             faviconHost = host
+            faviconRequest += 1
             pdfDidCommit(u)
         }
         browser?.tabDidNavigate(self)
@@ -233,8 +236,10 @@ extension Tab: WKNavigationDelegate {
         // Late styles (a header painted by script, a banner slid in) can change it again.
         refreshHeaderColor(after: 0.8)
         refreshHeaderColor(after: 2.5)
+        faviconRequest += 1
+        let request = faviconRequest
         FaviconStore.shared.fetchIcon(from: webView, persist: !incognito) { [weak self] image in
-            guard let self, let image else { return }
+            guard let self, let image, request == self.faviconRequest else { return }
             self.favicon = image
             self.faviconHost = u.host(percentEncoded: false)?.lowercased()
         }
@@ -250,8 +255,37 @@ extension Tab: WKNavigationDelegate {
         // _WKSameDocumentNavigationType: 0 anchor, 1 push, 2 replace, 3 pop.
         // A single-page app moving to another page leaves the article reader mode showed.
         if type != 0, let reader, let u = webView.url, !Self.samePage(u, reader.url) { closeReader() }
+        if let u = webView.url, !ExtensionManager.isExtensionPage(u) {
+            reportSameDocumentNavigation(to: u, type: type)
+        }
         guard type == 1 || type == 3, !(browser?.isPrivate ?? false), pdf == nil, let u = webView.url else { return }
         HistoryStore.shared.record(url: u, title: webView.title ?? "")
+    }
+
+    /// webNavigation has these in Chrome and Firefox but not in WebKit: a single-page app
+    /// changing its address (pushState / replaceState / back between them) is
+    /// `onHistoryStateUpdated`; only the #fragment changing is `onReferenceFragmentUpdated`.
+    /// WebKit reports a fragment change twice (as an anchor navigation, then a history pop),
+    /// so an address already reported is skipped.
+    private func reportSameDocumentNavigation(to url: URL, type: Int) {
+        let previous = lastSameDocumentURL ?? self.url
+        lastSameDocumentURL = url
+        if url == previous, type != 2 { return }
+        func withoutFragment(_ u: URL?) -> String? {
+            guard let u, var parts = URLComponents(url: u, resolvingAgainstBaseURL: false) else { return nil }
+            parts.fragment = nil
+            return parts.string
+        }
+        let fragmentOnly = type == 0 || (previous != nil && withoutFragment(previous) == withoutFragment(url))
+        let details: [String: Any] = [
+            "url": url.absoluteString, "frameId": 0, "parentFrameId": -1, "processId": -1,
+            "timeStamp": Date().timeIntervalSince1970 * 1000,
+            "transitionType": "link", "transitionQualifiers": type == 3 ? ["forward_back"] : [],
+        ]
+        ExtensionEventPush.shared.emit(
+            fragmentOnly ? "webNavigation.onReferenceFragmentUpdated" : "webNavigation.onHistoryStateUpdated",
+            details: details, tabs: ["tabId": self], allowed: { $0.hasPermission(.webNavigation) }
+        )
     }
 
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
@@ -271,6 +305,13 @@ extension Tab: WKNavigationDelegate {
         if ns.domain == "WebKitErrorDomain", [102, 204].contains(ns.code) { return }
         let failingURL = (ns.userInfo[NSURLErrorFailingURLErrorKey] as? URL) ?? url
         guard let failingURL else { return }
+        // An extension's own page that fails to load (a missing file, a page the extension
+        // removed) can't be covered by a simulated page: WebKit's extension scheme handler owns
+        // that address, so the simulated load would fail too. Leave whatever is there.
+        if ExtensionManager.isExtensionPage(failingURL) || ExtensionManager.isExtensionPage(webView.url) {
+            NSLog("Tuff: extension page failed to load: \(failingURL) — \(ns.localizedDescription)")
+            return
+        }
         // An untrusted certificate gets its own page, which can show it and let you through.
         if let failure = CertificateFailure(error: ns, url: failingURL) {
             certificateFailure = failure
@@ -382,6 +423,14 @@ extension Tab: WKUIDelegate {
         let shift = navigationAction.modifierFlags.contains(.shift)
         let background = commandClick && (shift == AppSettings.shared.tabs.foregroundLinks)
         let tab = browser.newTab(url: nil, select: !background, configuration: configuration, after: self)
+        // webNavigation.onCreatedNavigationTarget, which WebKit doesn't send: a link with a
+        // target or window.open made a new tab.
+        if let target = navigationAction.request.url {
+            ExtensionEventPush.shared.emit("webNavigation.onCreatedNavigationTarget", details: [
+                "url": target.absoluteString, "sourceFrameId": navigationAction.sourceFrame.isMainFrame ? 0 : -1,
+                "sourceProcessId": -1, "timeStamp": Date().timeIntervalSince1970 * 1000,
+            ], tabs: ["sourceTabId": self, "tabId": tab], allowed: { $0.hasPermission(.webNavigation) })
+        }
         return tab.webView
     }
 

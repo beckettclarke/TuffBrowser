@@ -446,6 +446,32 @@ final class FaviconStore {
         }
     }
 
+    /// An icon a page switched to after loading (`LiveFavicon`). A data: icon is drawn by the
+    /// page, often many times a second (a game, an unread count), so it's shown as it is and
+    /// not cached; one at an address goes through the cache like a load-time icon.
+    func icon(at iconURL: URL, pageURL: URL, persist: Bool, completion: @escaping (NSImage?) -> Void) {
+        guard let hostKey = key(for: pageURL) else { return completion(nil) }
+        switch iconURL.scheme?.lowercased() {
+        case "data":
+            guard let data = try? Data(contentsOf: iconURL), let image = NSImage(data: data),
+                  image.isValid, image.size.width > 0 else { return completion(nil) }
+            // Pixel art (a 16×16 canvas) stays crisp instead of being smoothed into a blur.
+            let pixels = image.representations.first.map { CGFloat($0.pixelsWide) } ?? image.size.width
+            let small = image.resized(to: 64, smooth: pixels <= 0 || pixels >= 64)
+            small.size = NSSize(width: 32, height: 32)
+            completion(small)
+        case "http", "https":
+            let iconKey = key(forIcon: iconURL)
+            if let image = freshIcon(for: iconKey, persist: persist) {
+                remember(image, as: hostKey, persist: persist)
+                return completion(image)
+            }
+            download([iconURL], key: iconKey, hostKey: hostKey, persist: persist, completion: completion)
+        default:
+            completion(nil)
+        }
+    }
+
     /// The cached icon for a site not open in any tab, else its /favicon.ico, downloaded and
     /// cached (the command bar's bang chip uses it).
     func icon(forHost host: String, completion: @escaping (NSImage?) -> Void) {

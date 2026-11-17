@@ -8,7 +8,7 @@ RELEASE_APP := $(BUILD_DIR)/Build/Products/Release/$(APP_NAME).app
 SIGNING := $(shell scripts/signing-args.sh)
 XCODEBUILD := xcodebuild -project TuffBrowser.xcodeproj -scheme $(SCHEME) -derivedDataPath $(BUILD_DIR) $(SIGNING)
 
-.PHONY: gen build run release install size icon clean
+.PHONY: gen build test run release install size icon clean
 
 ## Generate the Xcode project from project.yml (needs `brew install xcodegen`)
 gen:
@@ -17,6 +17,10 @@ gen:
 ## Debug build
 build: gen
 	$(XCODEBUILD) -configuration Debug build | grep -E "error:|warning: |BUILD" || true
+
+## Unit tests (TuffBrowserTests). Hosted in a Tuff that opens no windows and loads no profile.
+test: gen
+	$(XCODEBUILD) -configuration Debug test 2>&1 | grep -E "error:|Test Case .* failed|Executed|TEST (SUCCEEDED|FAILED)" || true
 
 ## Build and launch
 run: build

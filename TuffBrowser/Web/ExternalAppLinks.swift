@@ -29,6 +29,27 @@ enum ExternalAppLinks {
         }
     }
 
+    /// The saved "always allow" answers, for Settings → Websites: the site and the kind of link.
+    static var savedAnswers: [(origin: String, scheme: String)] {
+        allowed.sorted().compactMap { key in
+            guard let bar = key.lastIndex(of: "|") else { return nil }
+            return (String(key[..<bar]), String(key[key.index(after: bar)...]))
+        }
+    }
+
+    /// Forgets one saved answer.
+    static func remove(origin: String, scheme: String) {
+        allowed.remove("\(origin)|\(scheme)")
+        UserDefaults.standard.set(allowed.sorted(), forKey: defaultsKey)
+    }
+
+    /// The app that opens a kind of link now, for showing next to an answer ("Zoom").
+    static func appName(for scheme: String) -> String? {
+        guard let url = URL(string: scheme + ":"),
+              let app = NSWorkspace.shared.urlForApplication(toOpen: url) else { return nil }
+        return FileManager.default.displayName(atPath: app.path).replacingOccurrences(of: ".app", with: "")
+    }
+
     /// Forgets every "always allow" (Settings, or with the other site permissions).
     static func removeAll() {
         allowed.removeAll()

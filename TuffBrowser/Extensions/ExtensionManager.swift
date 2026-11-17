@@ -70,6 +70,8 @@ final class ExtensionManager: NSObject {
     @ObservationIgnored private var loading: Set<String> = []
     @ObservationIgnored private let linkDebouncer = Debouncer(delay: 0.25)
     @ObservationIgnored private var iconCache: [String: NSImage] = [:]
+    /// Drives the periodic store update check (`ExtensionUpdates.swift`).
+    @ObservationIgnored var updateTimer: Timer?
 
     private let recordsFile = Paths.appSupport.appendingPathComponent("extensions.json")
     let extensionsDirectory = Paths.appSupport.appendingPathComponent("Extensions", isDirectory: true)
@@ -108,6 +110,7 @@ final class ExtensionManager: NSObject {
         for record in records where shouldRun(record) {
             Task { @MainActor in await self.load(record) }
         }
+        scheduleUpdateChecks()
     }
 
     // MARK: Profiles and spaces
@@ -442,10 +445,34 @@ final class ExtensionManager: NSObject {
         }
     }
 
+    /// The Chrome version Tuff claims to the Web Store. It must be at least an extension's
+    /// `minimum_chrome_version` or the store refuses to serve it, so it follows Chrome's
+    /// four-weekly releases (the same count the Chrome user agent uses).
+    static var chromeProdVersion: String {
+        "\(AdvancedSettings.currentMajorVersion(known: 142, releasedOn: (2025, 10, 28))).0.0.0"
+    }
+
+    /// This Mac's architecture as the Chrome update service names it.
+    static var chromeArch: String {
+        #if arch(arm64)
+        "arm64"
+        #else
+        "x86-64"
+        #endif
+    }
+
     static func chromeDownloadURL(id: String) -> URL {
-        // prodversion must be at least the extension's minimum_chrome_version, so claim a recent Chrome.
         let x = "id%3D\(id)%26installsource%3Dondemand%26uc"
-        return URL(string: "https://clients2.google.com/service/update2/crx?response=redirect&os=mac&arch=arm64&os_arch=arm64&prod=chromecrx&prodchannel=stable&prodversion=140.0.0.0&lang=en-US&acceptformat=crx2,crx3&x=\(x)")!
+        return URL(string: "https://clients2.google.com/service/update2/crx?response=redirect&os=mac&arch=\(chromeArch)&os_arch=\(chromeArch)&prod=chromecrx&prodchannel=stable&prodversion=\(chromeProdVersion)&lang=en-US&acceptformat=crx2,crx3&x=\(x)")!
+    }
+
+    /// Whether a manifest was written for Firefox: it names a Gecko ID (or the older
+    /// `applications.gecko`), which Chrome extensions never do.
+    static func isGeckoManifest(_ manifest: [String: Any]) -> Bool {
+        for key in ["browser_specific_settings", "applications"] {
+            if (manifest[key] as? [String: Any])?["gecko"] != nil { return true }
+        }
+        return false
     }
 
     static func firefoxDownloadURL(slug: String) -> URL? {
@@ -536,7 +563,7 @@ final class ExtensionManager: NSObject {
 
         // 1. Get the package.
         let package: Data
-        let recordSource: ExtensionRecord.Source
+        var recordSource: ExtensionRecord.Source
         let storeID: String?
         let id: String
         let origin: String
@@ -578,6 +605,9 @@ final class ExtensionManager: NSObject {
         }
         let manifest = try Self.readManifest(in: root)
         if manifest["theme"] != nil { throw InstallError.theme }
+        // A Firefox add-on handed over as a .zip (how AMO's source downloads and most build
+        // tools name them) is still a Firefox add-on: it gets Firefox's origin and APIs.
+        if case .archive = source, recordSource == .chrome, Self.isGeckoManifest(manifest) { recordSource = .firefox }
 
         // 3. Ask, then move into place.
         status = nil
@@ -621,15 +651,6 @@ final class ExtensionManager: NSObject {
             }
             let name = self.records.first { $0.id == record.id }?.name ?? record.name
             self.browser.show(Toast(symbol: "puzzlepiece.extension.fill", text: isUpdate ? "Updated \(name)" : "Added \(name)"))
-        }
-    }
-
-    func updateFromStore(id: String) {
-        guard let record = records.first(where: { $0.id == id }), let storeID = record.storeID else { return }
-        switch record.source {
-        case .chrome: install(.chrome(id: storeID), confirm: false)
-        case .firefox: install(.firefox(slug: storeID), confirm: false)
-        case .unpacked: reload(id: id)
         }
     }
 
@@ -736,7 +757,7 @@ final class ExtensionManager: NSObject {
 
     private static func download(_ url: URL) async throws -> Data {
         var request = URLRequest(url: url)
-        request.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36", forHTTPHeaderField: "User-Agent")
+        request.setValue(AdvancedSettings.chromeUserAgent, forHTTPHeaderField: "User-Agent")
         let (data, response) = try await URLSession.shared.data(for: request)
         guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode), data.count > 64 else {
             throw InstallError.badResponse
@@ -882,18 +903,33 @@ final class ExtensionManager: NSObject {
     }
 
     /// Gives extensions a chance to handle a keyboard shortcut they registered.
+    ///
+    /// When several extensions claim the same keys, the one installed first wins (Chrome keeps
+    /// the first registration too), so the outcome doesn't depend on dictionary order.
     func handleKeyEvent(_ event: NSEvent) -> Bool {
-        for (id, context) in contexts {
+        let order = records.map(\.id)
+        let ranked = contexts.sorted { a, b in
+            (order.firstIndex(of: a.key) ?? .max, a.key) < (order.firstIndex(of: b.key) ?? .max, b.key)
+        }
+        for (id, context) in ranked {
             guard let command = context.command(for: event) else { continue }
             // WebKit would run the action itself, skipping the side panel; send it the same
             // way a click on the toolbar button goes.
             let panels = SidePanelManager.shared
-            if ["_execute_action", "_execute_browser_action"].contains(command.id), panels.actionTogglesPanel(id) {
+            // MV2 page actions are toolbar actions in Tuff, so `_execute_page_action` works like
+            // the other two.
+            let isAction = ["_execute_action", "_execute_browser_action", "_execute_page_action"].contains(command.id)
+            if isAction, panels.actionTogglesPanel(id) {
                 panels.toggle(id)
                 return true
             }
             if command.id == "_execute_sidebar_action", panels.hasPanel(id) {
                 panels.toggle(id)
+                return true
+            }
+            if isAction, command.id == "_execute_page_action" {
+                // WebKit may not know this MV2 name; run the action the same way a click does.
+                context.performAction(for: browser.selectedTab)
                 return true
             }
             context.performCommand(command)
@@ -932,6 +968,29 @@ extension ExtensionManager {
     }
 }
 
+extension ExtensionManager {
+    /// A configuration for a hidden, never-throttled extension page (socket relay, event relay,
+    /// offscreen document). A copied `WKWebViewConfiguration` still shares its `WKPreferences`
+    /// with the original, so setting the scheduling policy on it would also stop WebKit from
+    /// throttling every other page of the extension (its popups, side panel, options tab).
+    /// The relay gets preferences of its own instead.
+    static func hiddenPageConfiguration(_ base: WKWebViewConfiguration) -> WKWebViewConfiguration {
+        let configuration = (base.copy() as? WKWebViewConfiguration) ?? base
+        let shared = configuration.preferences
+        let own: WKPreferences
+        if shared.responds(to: #selector(NSCopying.copy(with:))), let copy = shared.copy() as? WKPreferences, copy !== shared {
+            own = copy
+        } else {
+            own = WKPreferences()
+            own.javaScriptCanOpenWindowsAutomatically = shared.javaScriptCanOpenWindowsAutomatically
+            own.isFraudulentWebsiteWarningEnabled = shared.isFraudulentWebsiteWarningEnabled
+        }
+        own.inactiveSchedulingPolicy = .none
+        configuration.preferences = own
+        return configuration
+    }
+}
+
 /// An off-screen web view showing an extension's socket relay page. It never sleeps, and comes
 /// back if its web content process dies, since the extension's open sockets live in it.
 final class SocketRelay: NSObject, WKNavigationDelegate {
@@ -941,8 +1000,7 @@ final class SocketRelay: NSObject, WKNavigationDelegate {
     init(configuration: WKWebViewConfiguration?, url: URL) {
         self.url = url
         super.init()
-        guard let configuration else { return }
-        configuration.preferences.inactiveSchedulingPolicy = .none
+        guard let configuration = configuration.map(ExtensionManager.hiddenPageConfiguration) else { return }
         let view = WKWebView(frame: NSRect(x: 0, y: 0, width: 10, height: 10), configuration: configuration)
         view.navigationDelegate = self
         webView = view
@@ -1121,13 +1179,20 @@ extension ExtensionManager: WKWebExtensionControllerDelegate {
             replyHandler(reply, nil)
             host.stop()
         }
-        host.onExit = {
+        host.onExit = { error in
             guard !finished else { return }
             finished = true
-            replyHandler(nil, NativeMessagingHost.notFound(name))
+            replyHandler(nil, error ?? NativeMessagingHost.error(3, "Native host has exited."))
         }
         host.start()
-        host.send(message)
+        do {
+            try host.send(message)
+        } catch {
+            guard !finished else { return }
+            finished = true
+            host.stop()
+            replyHandler(nil, error)
+        }
     }
 
     func webExtensionController(
@@ -1143,12 +1208,19 @@ extension ExtensionManager: WKWebExtensionControllerDelegate {
         let key = ObjectIdentifier(port)
         nativePorts[key] = host
         host.onMessage = { [weak port] message in port?.sendMessage(message, completionHandler: nil) }
-        host.onExit = { [weak self, weak port] in
-            port?.disconnect()
+        host.onExit = { [weak self, weak port] error in
+            port?.disconnect(throwing: error)
             self?.nativePorts[key] = nil
         }
-        port.messageHandler = { [weak host] message, _ in
-            if let message { host?.send(message) }
+        port.messageHandler = { [weak self, weak host, weak port] message, _ in
+            guard let message, let host else { return }
+            do {
+                try host.send(message)
+            } catch {
+                host.stop()
+                port?.disconnect(throwing: error)
+                self?.nativePorts[key] = nil
+            }
         }
         port.disconnectHandler = { [weak self, weak host] _ in
             host?.stop()

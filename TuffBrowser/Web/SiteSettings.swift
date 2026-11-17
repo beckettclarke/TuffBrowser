@@ -191,12 +191,49 @@ struct SiteSettingsPanel: View {
                 change(url, tab) { $0.autoplay = value }
             }
 
+            if !incognito, SiteSettings.key(for: url) != nil {
+                Button {
+                    clearData(for: url, tab: tab)
+                } label: {
+                    Label("Clear Website Data…", systemImage: "trash")
+                        .font(.system(size: 12, weight: .medium))
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(Color.red.opacity(0.85))
+                .padding(.leading, 2)
+            }
+
             Text(incognito ? "Kept until you close Incognito." : "Default follows Settings → Privacy.")
                 .font(.system(size: 11))
                 .foregroundStyle(.primary.opacity(0.45))
                 .padding(.leading, 2)
         }
         .disabled(SiteSettings.key(for: url) == nil)
+    }
+
+    /// Removes this site's cookies and storage in every profile (after asking), then reloads.
+    private func clearData(for url: URL?, tab: Tab?) {
+        state.pageMenuVisible = false
+        WebsiteData.siteName(for: url) { name in
+            let site = name ?? SiteSettings.key(for: url) ?? "this site"
+            Task { @MainActor in
+                guard name != nil else {
+                    state.show(Toast(symbol: "checkmark", text: "\(site) has no data stored"))
+                    return
+                }
+                let confirmed = await PromptPresenter.present(Prompt(
+                    browser: state, icon: tab?.favicon, symbol: "trash.fill", symbolColor: .red,
+                    title: "Clear \(site)’s website data?",
+                    message: "Its cookies and site storage are removed in every profile, and the page reloads. You may be signed out of \(site).",
+                    confirmTitle: "Clear", destructive: true
+                ))
+                guard confirmed, let name else { return }
+                WebsiteData.remove(site: name) {
+                    tab?.reload()
+                    state.show(Toast(symbol: "trash", text: "Cleared \(site)’s data"))
+                }
+            }
+        }
     }
 
     private func change(_ url: URL?, _ tab: Tab?, _ edit: (inout SiteSettings.Entry) -> Void) {

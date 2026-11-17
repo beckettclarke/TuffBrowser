@@ -1,5 +1,13 @@
 # Tuff — Extension & App TODO list
 
+> **Consider replacing the Sparkle framework.** Tuff uses Sparkle only for app updates
+> (`UpdateController` in `App/AppDelegate.swift`, package in `project.yml`). Its update windows
+> are native AppKit (clashing with the custom-dialog rule in AGENTS.md), ad-hoc builds can't load
+> it under the hardened runtime, and it adds a framework plus XPC helpers to the bundle. Weigh a
+> small in-house updater (signed appcast or GitHub Releases check → download → verify signature
+> → swap and relaunch, with `Prompt` cards) against keeping Sparkle with a custom user driver
+> (`SPUUserDriver`) so at least the UI matches.
+
 Generated from a full-source audit (every Swift file + the compat shim + the install pipeline),
 cross-checked against the WebKit SDK headers (`WKWebExtensionTab.h`, `WKWebExtensionWindow.h`,
 `WKWebExtensionControllerDelegate.h`, `WKWebExtensionPermission.h`) and the WebKit binary on this
@@ -169,20 +177,28 @@ underlying data/capability to make it real. Implement natively, then remove the 
 ## E. [P3] Missing methods/events that throw or never fire
 
 ### Undefined → calling throws (NOT covered by the shim)
-- [ ] **[P3]** `declarativeNetRequest.testMatchOutcome` — absent from WebKit, not stubbed. Add a shim
+- [x] **[P3]** `declarativeNetRequest.testMatchOutcome` — absent from WebKit, not stubbed. Add a shim
       stand-in (or implement against the DNR engine) so rule-tester extensions don't crash.
-- [ ] **[P3]** `extension.getExtensionTabs` — absent, not stubbed (legacy). Add inert stand-in.
-- [ ] **[P3]** `declarativeNetRequest` constants (`MAX_NUMBER_OF_DYNAMIC_RULES`, `MAX_NUMBER_OF_REGEX_RULES`,
+      Done (2026-11-17): resolves `{ matchedRules: [] }` (WebKit can't say which rules match).
+- [x] **[P3]** `extension.getExtensionTabs` — absent, not stubbed (legacy). Add inert stand-in.
+      Done (2026-11-17): returns `[]` synchronously.
+- [x] **[P3]** `declarativeNetRequest` constants (`MAX_NUMBER_OF_DYNAMIC_RULES`, `MAX_NUMBER_OF_REGEX_RULES`,
       `MAX_NUMBER_OF_SESSION_RULES`, …) — define sensible values in the shim.
+      Done (2026-11-17): Chrome's published values, plus `DYNAMIC_RULESET_ID` / `SESSION_RULESET_ID`. Runtime-verified.
 
 ### Inert events (WebKit lacks them; shim stand-ins never fire)
-- [ ] **[P2]** `webNavigation.onHistoryStateUpdated` + `onReferenceFragmentUpdated` — SPA / hash navigation.
+- [x] **[P2]** `webNavigation.onHistoryStateUpdated` + `onReferenceFragmentUpdated` — SPA / hash navigation.
       Drive from `WKNavigationDelegate` (same-document navigations) in Tab+Web.swift.
-- [ ] **[P2]** `webNavigation.onCreatedNavigationTarget` — window.open / target=_blank. Drive from
+      Done (2026-11-17): from `didSameDocumentNavigation` via event push; WebKit's duplicate report for a hash change is
+      dropped; `{ url: [UrlFilter] }` listener filters honoured. Runtime-verified (pushState, hash, back ×2).
+- [x] **[P2]** `webNavigation.onCreatedNavigationTarget` — window.open / target=_blank. Drive from
       `createWebViewWith` (Tab+Web.swift) / `openNewTabUsing`.
+      Done (2026-11-17): from `createWebViewWith`, with `sourceTabId` and `tabId`. Runtime-verified.
 - [ ] **[P3]** `webNavigation.onTabReplaced` — rare; inert acceptable.
-- [ ] **[P3]** `tabs.onZoomChange` — fire from `Tab.setZoom` (Tab.swift:380).
-- [ ] **[P3]** `windows.onBoundsChanged` — fire from `windowDidResize` (BrowserWindowController.swift).
+- [x] **[P3]** `tabs.onZoomChange` — fire from `Tab.setZoom` (Tab.swift:380).
+      Done (2026-11-17): from `applyZoom` (also when a site's saved zoom is applied). Runtime-verified.
+- [x] **[P3]** `windows.onBoundsChanged` — fire from `windowDidResize` (BrowserWindowController.swift).
+      Done (2026-11-17): resize / move, debounced 0.3 s; listeners get `windows.getLastFocused()`.
 - [ ] **[P3]** `runtime.onSuspendCanceled` / `onUpdateAvailable` / `onRestartRequired` /
       `onBrowserUpdateAvailable` / `onUserScriptMessage` / `onUserScriptConnect` / `onConnectNative` — mostly
       lifecycle/debug; wire the ones that become relevant (e.g. onUpdateAvailable once auto-update lands).
@@ -197,37 +213,56 @@ underlying data/capability to make it real. Implement natively, then remove the 
       `isMuted`. Re-apply mute on wake and after navigation (`_setPageMuted:` is per-page). Also
       `setMuted` (Tab.swift:386) sets `isMuted` then returns early when `webView == nil` without firing
       `tabDidChange` — keep state consistent.
-- [ ] **[BUG]** **No extension auto-update** — `updateFromStore` (ExtensionManager.swift:603) always
+- [x] **[BUG]** **No extension auto-update** — `updateFromStore` (ExtensionManager.swift:603) always
       re-downloads with no version check. Add version comparison + a periodic update check; fire
       `runtime.onUpdateAvailable` when relevant.
-- [ ] **[BUG]** `chromeDownloadURL` (ExtensionManager.swift:424) hardcodes `prodversion=140.0.0.0` and
+      Done (2026-11-17): `Extensions/ExtensionUpdates.swift` asks the Chrome update service (`updatecheck`) / AMO API for the
+      latest version, compares numerically, and reinstalls only when newer; checks a minute after launch, then every 5 h.
+      The row's menu item is now "Check for Update" (toast when up to date). `onUpdateAvailable` not fired (updates install directly).
+- [x] **[BUG]** `chromeDownloadURL` (ExtensionManager.swift:424) hardcodes `prodversion=140.0.0.0` and
       `arch=arm64`. Use a current prodversion and the host's real arch; honour `minimum_chrome_version`.
-- [ ] **[BUG]** `.zip` Firefox add-ons misdetected — `performInstall` (ExtensionManager.swift:534) keys
+      Done (2026-11-17): prodversion follows Chrome's four-weekly releases (`chromeProdVersion`), arch is `arm64` / `x86-64`;
+      the store download uses the current Chrome UA too.
+- [x] **[BUG]** `.zip` Firefox add-ons misdetected — `performInstall` (ExtensionManager.swift:534) keys
       off `.xpi` only. Sniff the manifest (`browser_specific_settings.gecko`) to pick the source/origin.
-- [ ] **[BUG]** Shim skips HTML pages with no `<script>` tag — `ExtensionCompat.patch`
+      Done (2026-11-17): `isGeckoManifest` (also old `applications.gecko`) switches a .zip to the Firefox source.
+- [x] **[BUG]** Shim skips HTML pages with no `<script>` tag — `ExtensionCompat.patch`
       (ExtensionCompat.swift:176). Inject before `</head>`/`<body>` as a fallback so every page gets it.
-- [ ] **[BUG]** `SidePanelManager.open` (SidePanels.swift:154) guard `url(...) != nil || tabOptions[id]?.isEmpty == false`
+      Done (2026-11-17): `shimInsertionPoint` falls back to `</head>`, `<body`, after the doctype, or the top. Shim level bumped to 3
+      so installed extensions are re-patched.
+- [x] **[BUG]** `SidePanelManager.open` (SidePanels.swift:154) guard `url(...) != nil || tabOptions[id]?.isEmpty == false`
       can open a panel with no resolvable URL on the current tab. Tighten the condition.
+      Done (2026-11-17): only opens if this tab resolves a panel URL, or another open tab has options that resolve one.
 - [ ] **[BUG]** `finishInstall` (ExtensionManager.swift:595) hardcoded 800 ms teardown sleep — replace with
       a deterministic wait (completion/callback) to avoid the race on slow machines.
-- [ ] **[BUG]** Native messaging (NativeMessaging.swift): `send()` silently drops when the process isn't
+      Looked at 2026-11-17: WebKit has no public signal for the old background worker going away
+      (`unload` returns at once; `isLoaded` flips immediately), so there is nothing to wait on yet.
+- [x] **[BUG]** Native messaging (NativeMessaging.swift): `send()` silently drops when the process isn't
       running / JSON invalid — surface an error to the extension. Capture stderr for diagnostics.
       Add system-wide Chromium dir to `searchDirectories`.
-- [ ] **[BUG]** `handleKeyEvent` (ExtensionManager.swift:847): handle `_execute_page_action`; define
+      Done (2026-11-17): `send` throws (not running / not JSON / too big / write failed); `sendNativeMessage` rejects and ports
+      disconnect with the error. Exit status + last stderr line reach the extension; stderr tail is logged. Added
+      `/Library/Application Support/Chromium/NativeMessagingHosts`.
+- [x] **[BUG]** `handleKeyEvent` (ExtensionManager.swift:847): handle `_execute_page_action`; define
       deterministic precedence when multiple extensions register the same shortcut.
+      Done (2026-11-17): `_execute_page_action` runs the action (or toggles the panel); first-installed extension wins.
 - [x] **[BUG]** `BrowserState.close` for pinned/favorites (BrowserState.swift:219) resets to `homeURL`
       without notifying extensions — fire a URL change so `tabs.onUpdated` isn't stale.
-- [ ] **[BUG]** `SocketRelay` (ExtensionManager.swift:907) mutates the extension's *shared* configuration
+- [x] **[BUG]** `SocketRelay` (ExtensionManager.swift:907) mutates the extension's *shared* configuration
       preferences (`inactiveSchedulingPolicy`) — copy the configuration so other web views aren't affected.
-- [ ] **[BUG]** Fragile shim markers — module-worker re-patch (`refresh`, ExtensionCompat.swift:214)
+      Done (2026-11-17): `ExtensionManager.hiddenPageConfiguration` gives socket relay, event relay and offscreen pages
+      their own `WKPreferences` (a copied configuration still shares them).
+- [x] **[BUG]** Fragile shim markers — module-worker re-patch (`refresh`, ExtensionCompat.swift:214)
       depends on the first 40 bytes + a unique `})();` line. Make the boundary robust (explicit sentinel).
+      Done (2026-11-17): module workers carry `// __tuff_compat_start__` / `// __tuff_compat_end__`; old workers still found the old way.
 
 ---
 
 ## G. [BUG] General app correctness
 
-- [ ] **[BUG]** Latent crash — `BrowserState.currentSpace` (BrowserState.swift:81) and `profile(for:)` (:86)
+- [x] **[BUG]** Latent crash — `BrowserState.currentSpace` (BrowserState.swift:81) and `profile(for:)` (:86)
       index `[0]` without an empty guard. Add safe fallbacks.
+      Done (2026-11-17): placeholder space/profile before restore; `restore` always leaves at least one profile and space.
 - [x] **[BUG]** `closeIdleTabs` (BrowserState.swift:837) doesn't check `tab.isLoading` (unlike
       `sleepIdleTabs`) — a stuck loading tab can be auto-closed. Add the check.
 - [x] **[BUG]** `DownloadManager.uniqueDestination` (Stores.swift:273) check-then-use race for concurrent
@@ -236,10 +271,12 @@ underlying data/capability to make it real. Implement natively, then remove the 
       tab's profile store — auth-gated favicons fail and per-profile isolation is bypassed. Fetch in-context.
 - [x] **[BUG]** `WebEngine` sets `developerExtrasEnabled` via KVC without a `responds` guard
       (WebEngine.swift:90, :131) — guard it like the other private prefs to avoid `NSUndefinedKeyException`.
-- [ ] **[BUG]** `BrowserState.newTab` before restore (BrowserState.swift:172) returns an orphaned `Tab`
+- [x] **[BUG]** `BrowserState.newTab` before restore (BrowserState.swift:172) returns an orphaned `Tab`
       (`browser == nil`, in no space). Queue properly or document the contract.
-- [ ] **[BUG]** `Tab.handleLoadFailure` (Tab+Web.swift:135) loads a simulated error page even in extension
+      Done (2026-11-17): the real tab is returned (owned by the window) and inserted into the current space when `restore` finishes.
+- [x] **[BUG]** `Tab.handleLoadFailure` (Tab+Web.swift:135) loads a simulated error page even in extension
       web views where it may not render. Skip/branch for extension pages.
+      Done (2026-11-17): extension pages log the failure and keep what's showing.
 
 ---
 
@@ -247,8 +284,9 @@ underlying data/capability to make it real. Implement natively, then remove the 
 
 - [x] **[POLICY]** `UpdateController.checkForUpdates` (AppDelegate.swift:284) shows a native `NSAlert`
       ("Updates aren't set up for this build") — user-visible via the menu. Replace with a `Prompt` card.
-- [ ] **[POLICY]** `PromptPresenter.fallbackAlert` (Prompt.swift:126) uses `NSAlert` when no host window
+- [x] **[POLICY]** `PromptPresenter.fallbackAlert` (Prompt.swift:126) uses `NSAlert` when no host window
       exists. Rare, but still user-visible — replace or justify per the "developer-only" exception.
+      Done (2026-11-17): `NSAlert` removed. The main window is brought back to hold the card; a gone Incognito window answers "no".
 
 ---
 
@@ -286,17 +324,21 @@ Things Safari / Chrome / Arc users expect that Tuff doesn't have yet. The bugs a
 problems from the same audit are fixed (see BUGS.md).
 
 ### Calls, media and full screen
-- [ ] **[P1]** **"{site} is in full screen" banner.** When a page goes full screen (a YouTube or
+- [x] **[P1]** **"{site} is in full screen" banner.** When a page goes full screen (a YouTube or
       Netflix video), show a small card at the top: the site's name and "Press Esc to exit full
       screen", fading after a few seconds, as Chrome and Safari do. Drive it from KVO on
       `WKWebView.fullscreenState`; reuse the toast/card look (no `.shadow`, see AGENTS.md).
+      Done (2026-11-17): `Window/FullScreenBanner.swift` — a click-through panel over WebKit's full-screen window (the
+      browser window isn't visible then), 3.5 s. Runtime-verified via `fsbanner` (shown, then faded).
 - [ ] **[P1]** **Screen sharing (`getDisplayMedia`).** Nothing handles it, so "Present" in Meet,
       Zoom and Teams fails. Needs WebKit's display-capture permission delegate (private
       `_webView:requestDisplayCapturePermissionForOrigin:…` and the screen-capture preference)
       plus a `SitePermissionKind.screen` and a card.
-- [ ] **[P1]** **Camera / microphone in-use indicator** on the tab row (and horizontal tab), with a
+- [x] **[P1]** **Camera / microphone in-use indicator** on the tab row (and horizontal tab), with a
       click to stop: observe `cameraCaptureState` / `microphoneCaptureState`, stop with
       `setCameraCaptureState(.none)` / `setMicrophoneCaptureState(.none)`.
+      Done (2026-11-17): `CaptureIndicator` (sidebar rows, split halves, horizontal tabs); its menu pauses / resumes / stops;
+      also in the tab's context menu. Not exercised with a real camera here.
 
 ### Sign-in and passwords
 - [ ] **[P1]** **Passkeys / WebAuthn.** Third-party WKWebView browsers need Apple's
@@ -307,14 +349,19 @@ problems from the same audit are fixed (see BUGS.md).
       save card and fill-on-focus, or document the extension route in onboarding.
 
 ### Privacy and site controls
-- [ ] **[P1]** **"Pop-up blocked" indicator.** With Block pop-ups on, blocked `window.open`s vanish
+- [x] **[P1]** **"Pop-up blocked" indicator.** With Block pop-ups on, blocked `window.open`s vanish
       silently. Show an icon in the address pill with "Allow pop-ups from {site}" (per-site
       setting already exists in `SiteSettings`).
-- [ ] **[P2]** **Per-site website data.** Remove one site's cookies and storage (Settings → Websites
+      Done (2026-11-17): `Web/PopupBlocker.swift` notices `window.open` returning null; the pill shows a button listing
+      them (open one, "Always Allow Pop-ups from {site}", Dismiss). Cleared on navigation. Runtime-verified.
+- [x] **[P2]** **Per-site website data.** Remove one site's cookies and storage (Settings → Websites
       and the page menu), and clear by time range (last hour / today / all). Today it's "Remove
       All" only.
-- [ ] **[P2]** **List "open in app" answers** ("Always allow {site} to open {App} links",
+      Done (2026-11-17): Settings → Privacy → Website data has "Remove recent data" (hour / today / 7 days / 4 weeks) and a
+      searchable "Data by site" list; page menu → Site Settings has "Clear Website Data…". All behind Prompt cards.
+- [x] **[P2]** **List "open in app" answers** ("Always allow {site} to open {App} links",
       `ExternalAppLinks`) in Settings → Websites, each removable. Today only "Forget All" clears them.
+      Done (2026-11-17): "Links that open apps" group, with the app's name.
 - [ ] **[P2]** **HTTPS-first mode:** try https for every site, with a warning page before falling
       back to http. `upgradeKnownHostsToHTTPS` only covers sites WebKit knows support it.
 - [ ] **[P3]** Web Push (notifications only arrive while Tuff is running).
@@ -323,18 +370,25 @@ problems from the same audit are fixed (see BUGS.md).
 - [ ] **[P2]** **History keeps one entry per page** (last visit only), so a page seen yesterday and
       today shows under today only. Keep a per-visit log.
 - [ ] **[P2]** **History per profile.** School's command bar suggests Home's history today.
-- [ ] **[P2]** History menu: **Recently Closed** and **recent pages** submenus.
+- [x] **[P2]** History menu: **Recently Closed** and **recent pages** submenus.
+      Done (2026-11-17): `App/HistoryMenu.swift` fills them as the menu opens (⌘-choose opens in a new tab). Runtime-verified.
 - [ ] **[P2]** Command bar **zero state** (⌘T on an empty field: top sites, recent tabs) and
       **Paste and Go** in the address pill's menu.
+      Paste and Go done (2026-11-17) (address bar's right-click menu, plus Edit → Paste and Go). Zero state still to do.
 - [ ] **[P2]** **Translate page** (Apple's Translation framework).
 - [ ] **[P3]** Per-site user agent; ⌥-click a link to download it; text-only zoom.
 - [ ] **[P3]** A quick "save for later" / bookmarks manager (favourites and pinned tabs cover most of it).
 
 ### Quality
-- [ ] **[P2]** **Accessibility.** One `accessibilityLabel` in the whole UI; the 42 `IconButton`s
+- [x] **[P2]** **Accessibility.** One `accessibilityLabel` in the whole UI; the 42 `IconButton`s
       only have tooltips, so VoiceOver reads symbol names. Label icon buttons, tab rows, tiles.
-- [ ] **[P2]** **Unit tests.** No test target. Start with `BrowserState.resolve`, `Tab.samePage`,
+      Done (2026-11-17): `IconButton` / `PillButton` read their tooltip (minus the shortcut); tab rows, split halves,
+      horizontal tabs and favourite tiles read title + state (playing, muted, camera, loading, unloaded) and are selectable.
+- [x] **[P2]** **Unit tests.** No test target. Start with `BrowserState.resolve`, `Tab.samePage`,
       `Tab.zoomStep`, `AdvancedSettings.currentMajorVersion`, `SitePermissions.decision`.
+      Done (2026-11-17): `TuffBrowserTests` target, `make test` (12 tests: resolve, samePage, zoomStep, version maths,
+      extension version compare, Gecko detection, store URL, shim insertion, update-check parsing). The host app
+      opens no window and loads no profile under XCTest. `SitePermissions.decision` not covered yet.
 - [ ] **[P3]** Localization (no strings are localizable yet).
 
 ---

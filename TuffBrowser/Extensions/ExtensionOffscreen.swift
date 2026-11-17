@@ -60,8 +60,7 @@ private final class OffscreenDocument: NSObject, WKNavigationDelegate {
     init(configuration: WKWebViewConfiguration?, url: URL) {
         self.url = url
         super.init()
-        guard let configuration else { return }
-        configuration.preferences.inactiveSchedulingPolicy = .none
+        guard let configuration = configuration.map(ExtensionManager.hiddenPageConfiguration) else { return }
         let view = WKWebView(frame: NSRect(x: 0, y: 0, width: 10, height: 10), configuration: configuration)
         view.navigationDelegate = self
         webView = view

@@ -92,6 +92,12 @@ extension AppDelegate {
         state.downloadsVisible.toggle()
     }
 
+    /// Edit → Paste and Go: opens what's on the clipboard in the current tab.
+    @objc func pasteAndGo(_ sender: Any?) {
+        ensureBrowserWindow()
+        state.pasteAndGo()
+    }
+
     // MARK: History
 
     /// History → Clear History…: every page in History and the recently closed tabs. Cookies and
@@ -163,6 +169,8 @@ extension AppDelegate {
             return isWebPage && ["http", "https"].contains(tab?.url?.scheme?.lowercased() ?? "")
         case #selector(findNext(_:)), #selector(findPrevious(_:)):
             return tab != nil
+        case #selector(pasteAndGo(_:)):
+            return state.pasteAndGoText != nil
         case #selector(clearHistory(_:)):
             return HistoryStore.shared.count > 0 || state.hasClosedTabs
         default:

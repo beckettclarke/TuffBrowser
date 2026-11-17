@@ -37,6 +37,32 @@ final class ExtensionEventPush {
         }
     }
 
+    /// Sends an event about a tab to the extensions that listen and that `allowed` lets see it.
+    /// Extensions name tabs by WebKit's ids, which Tuff doesn't know, so the tabs are passed by
+    /// their index in the window (`tabs`: field of the first argument → tab) and the shim fills
+    /// in the matching ids. Incognito tabs never reach extensions.
+    func emit(_ event: String, details: [String: Any], tabs: [String: Tab], allowed: (WKWebExtensionContext) -> Bool = { _ in true }) {
+        guard tabs.values.allSatisfy({ $0.browser === BrowserState.shared && !($0.browser?.isPrivate ?? true) }) else { return }
+        let all = BrowserState.shared.allTabs
+        var indexes: [String: Int] = [:]
+        for (field, tab) in tabs {
+            guard let index = all.firstIndex(where: { $0 === tab }) else { return }
+            indexes[field] = index
+        }
+        for (id, events) in subscriptions where events.contains(event) {
+            guard let context = ExtensionManager.shared.contexts[id], allowed(context) else { continue }
+            relays[id]?.send(event: event, args: [details], extra: ["tabs": indexes])
+        }
+    }
+
+    /// Sends a window event; the shim passes the listener the window as `windows.getLastFocused`
+    /// reports it (Tuff has the one).
+    func emitWindowEvent(_ event: String) {
+        for (id, events) in subscriptions where events.contains(event) {
+            relays[id]?.send(event: event, args: [], extra: ["window": true])
+        }
+    }
+
     /// Sends an event to one extension (e.g. a notification click to its owner), if it listens.
     func emit(_ event: String, args: [Any], to extensionID: String) {
         guard subscriptions[extensionID]?.contains(event) == true else { return }
@@ -57,16 +83,16 @@ private final class EventRelay: NSObject, WKNavigationDelegate {
     init(configuration: WKWebViewConfiguration?, url: URL) {
         self.url = url
         super.init()
-        guard let configuration else { return }
-        configuration.preferences.inactiveSchedulingPolicy = .none
+        guard let configuration = configuration.map(ExtensionManager.hiddenPageConfiguration) else { return }
         let view = WKWebView(frame: NSRect(x: 0, y: 0, width: 10, height: 10), configuration: configuration)
         view.navigationDelegate = self
         webView = view
         view.load(URLRequest(url: url))
     }
 
-    func send(event: String, args: [Any]) {
-        let message: [String: Any] = ["__tuffEvent": event, "args": args]
+    func send(event: String, args: [Any], extra: [String: Any] = [:]) {
+        var message: [String: Any] = ["__tuffEvent": event, "args": args]
+        message.merge(extra) { a, _ in a }
         guard let data = try? JSONSerialization.data(withJSONObject: message),
               let json = String(data: data, encoding: .utf8) else { return }
         webView?.evaluateJavaScript("try { chrome.runtime.sendMessage(\(json)); } catch (e) {}", completionHandler: nil)

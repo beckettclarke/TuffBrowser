@@ -66,11 +66,12 @@ extension Color {
 // MARK: - Images
 
 extension NSImage {
-    func resized(to side: CGFloat) -> NSImage {
+    /// `smooth: false` scales with nearest-neighbour, for pixel art.
+    func resized(to side: CGFloat, smooth: Bool = true) -> NSImage {
         let size = NSSize(width: side, height: side)
         let image = NSImage(size: size)
         image.lockFocus()
-        NSGraphicsContext.current?.imageInterpolation = .high
+        NSGraphicsContext.current?.imageInterpolation = smooth ? .high : .none
         draw(in: NSRect(origin: .zero, size: size), from: .zero, operation: .copy, fraction: 1)
         image.unlockFocus()
         return image
@@ -422,6 +423,16 @@ struct IconButton: View {
         .onHover { hovering = $0 }
         .animation(.easeOut(duration: 0.15), value: hovering)
         .help(help)
+        .accessibilityLabel(Text(Self.accessibleName(help: help, symbol: symbol)))
+    }
+
+    /// What VoiceOver reads for an icon-only button: its tooltip without the shortcut
+    /// ("Copy Link  ⇧⌘C" → "Copy Link"), or failing that, a name made from its symbol.
+    static func accessibleName(help: String, symbol: String) -> String {
+        let name = help.components(separatedBy: "  ").first?.trimmed ?? ""
+        if !name.isEmpty { return name }
+        let words = symbol.split(separator: ".").filter { !["fill", "circle", "square", "badge"].contains($0) }
+        return words.joined(separator: " ").capitalizedFirst
     }
 }
 
