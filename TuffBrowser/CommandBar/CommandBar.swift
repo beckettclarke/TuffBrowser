@@ -257,6 +257,17 @@ struct CommandBarView: View {
         .onDisappear { fetchTask?.cancel() }
     }
 
+    /// Fetches search suggestions with no cookies and nothing kept on disk. `URLSession.shared`
+    /// keeps a cookie jar of its own, outside every profile's website data, that "Remove All"
+    /// never cleared and that Incognito windows shared with normal ones.
+    private static let suggestionSession: URLSession = {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.httpCookieAcceptPolicy = .never
+        configuration.httpShouldSetCookies = false
+        configuration.urlCache = nil
+        return URLSession(configuration: configuration)
+    }()
+
     // MARK: Behaviour
 
     private func move(_ delta: Int, count: Int) {
@@ -408,7 +419,7 @@ struct CommandBarView: View {
             guard !Task.isCancelled else { return }
             var request = URLRequest(url: url)
             request.timeoutInterval = 4
-            guard let (data, _) = try? await URLSession.shared.data(for: request), !Task.isCancelled else { return }
+            guard let (data, _) = try? await Self.suggestionSession.data(for: request), !Task.isCancelled else { return }
             // OpenSearch JSON: ["query", ["suggestion", …], …]. Some engines answer in Latin-1.
             let json = (try? JSONSerialization.jsonObject(with: data))
                 ?? String(data: data, encoding: .isoLatin1).flatMap { try? JSONSerialization.jsonObject(with: Data($0.utf8)) }

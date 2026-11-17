@@ -436,8 +436,8 @@ struct SquishButtonStyle: ButtonStyle {
 
 extension View {
     /// Runs `action` when the middle mouse button is pressed and released over this view.
-    /// SwiftUI has no gesture for it, so this watches the app's events, and only while the
-    /// pointer is over the view: one row at a time has a monitor, not every row.
+    /// SwiftUI has no gesture for it, so one app-wide event monitor (`MiddleClickRouter`) finds
+    /// the view under the pointer by its real frame in the window.
     func onMiddleClick(perform action: @escaping () -> Void) -> some View {
         modifier(MiddleClickModifier(action: action))
     }
@@ -445,44 +445,123 @@ extension View {
 
 private struct MiddleClickModifier: ViewModifier {
     let action: () -> Void
-    @State private var watcher = MiddleClickWatcher()
+    @State private var target = MiddleClickTarget()
 
     func body(content: Content) -> some View {
         content
-            .onHover { inside in
-                if inside { watcher.start(action) } else { watcher.stop() }
+            .background(MiddleClickAnchor(target: target, action: action))
+            .onHover { target.hovered = $0 }
+            .onAppear { MiddleClickRouter.shared.add(target) }
+            .onDisappear {
+                target.hovered = false
+                MiddleClickRouter.shared.remove(target)
             }
-            .onDisappear { watcher.stop() }
     }
 }
 
-private final class MiddleClickWatcher {
-    private var monitor: Any?
-    /// The button went down over the view, so a release over it is a click.
-    private var pressed = false
+/// One view that takes middle clicks: what it does, and an AppKit view filling it, which says
+/// where it is in its window (clipped by any scroll view it is in).
+private final class MiddleClickTarget {
+    var action: (() -> Void)?
+    var hovered = false
+    weak var anchor: NSView?
 
-    func start(_ action: @escaping () -> Void) {
-        stop()
+    /// Whether a mouse event's point is on the visible part of the view.
+    func contains(_ event: NSEvent) -> Bool {
+        guard let anchor, let inWindow = point(of: event) else { return false }
+        // `visibleRect` can reach past the bounds (views don't clip to them by default), so
+        // it only trims the bounds to what an enclosing scroll view shows.
+        return anchor.bounds.intersection(anchor.visibleRect).contains(anchor.convert(inWindow, from: nil))
+    }
+
+    /// Whether nothing of the window's covers the view at the event's point (the command bar's
+    /// dimmed backdrop, a card): the window's own hit test there lands in the scroll view the
+    /// view is in. A view outside any scroll view can't be checked this way.
+    func isUncovered(at event: NSEvent) -> Bool {
+        guard let anchor, let scrollView = anchor.enclosingScrollView, let window = anchor.window,
+              let inWindow = point(of: event), let root = window.contentView?.superview ?? window.contentView,
+              let hit = root.hitTest(root.convert(inWindow, from: nil)) else { return false }
+        return hit === scrollView || hit.isDescendant(of: scrollView)
+    }
+
+    /// The event's point in the view's window, or nil when it happened in another window.
+    private func point(of event: NSEvent) -> NSPoint? {
+        guard let window = anchor?.window else { return nil }
+        if let eventWindow = event.window { return eventWindow === window ? event.locationInWindow : nil }
+        // An event with no window (posted from a CGEvent) is in screen coordinates.
+        return window.convertPoint(fromScreen: event.locationInWindow)
+    }
+}
+
+private struct MiddleClickAnchor: NSViewRepresentable {
+    let target: MiddleClickTarget
+    let action: () -> Void
+
+    /// Takes no clicks of its own; it is only there to be measured.
+    final class AnchorView: NSView {
+        override func hitTest(_ point: NSPoint) -> NSView? { nil }
+    }
+
+    func makeNSView(context: Context) -> AnchorView {
+        let view = AnchorView()
+        target.anchor = view
+        target.action = action
+        return view
+    }
+
+    func updateNSView(_ view: AnchorView, context: Context) {
+        target.anchor = view
+        target.action = action
+    }
+}
+
+/// Routes middle clicks to the `onMiddleClick` view under the pointer.
+///
+/// SwiftUI's hover alone isn't enough to say which that is: it only changes when the mouse
+/// moves. After a middle click closes a tab, the row below slides up under a still pointer
+/// without being told, so the next middle click (closing tabs one after another, as in Chrome)
+/// went nowhere; and a row that slid away from the pointer still thought it was hovered. So a
+/// view counts only when the pointer is on its visible frame, and either SwiftUI says it is
+/// hovered or nothing else of the window's is drawn over it there.
+private final class MiddleClickRouter {
+    static let shared = MiddleClickRouter()
+    private struct Entry { weak var target: MiddleClickTarget? }
+    private var targets: [ObjectIdentifier: Entry] = [:]
+    private var monitor: Any?
+    /// The view the button went down on; a release over the same view is a click.
+    private weak var pressed: MiddleClickTarget?
+
+    func add(_ target: MiddleClickTarget) {
+        targets[ObjectIdentifier(target)] = Entry(target: target)
+        guard monitor == nil else { return }
         monitor = NSEvent.addLocalMonitorForEvents(matching: [.otherMouseDown, .otherMouseUp]) { [weak self] event in
-            guard let self, event.buttonNumber == 2 else { return event }
-            if event.type == .otherMouseDown {
-                pressed = true
-                return nil
-            }
-            guard pressed else { return event }
-            pressed = false
-            action()
-            return nil
+            self?.handle(event) ?? event
         }
     }
 
-    func stop() {
-        if let monitor { NSEvent.removeMonitor(monitor) }
-        monitor = nil
-        pressed = false
+    func remove(_ target: MiddleClickTarget) {
+        targets[ObjectIdentifier(target)] = nil
+        targets = targets.filter { $0.value.target != nil }
     }
 
-    deinit { stop() }
+    /// Returns nil to swallow the event.
+    private func handle(_ event: NSEvent) -> NSEvent? {
+        guard event.buttonNumber == 2 else { return event }
+        if event.type == .otherMouseDown {
+            pressed = target(at: event)
+            return pressed == nil ? event : nil
+        }
+        guard let down = pressed else { return event }
+        pressed = nil
+        guard target(at: event) === down else { return nil }
+        down.action?()
+        return nil
+    }
+
+    private func target(at event: NSEvent) -> MiddleClickTarget? {
+        let live = targets.values.compactMap(\.target).filter { $0.contains(event) }
+        return live.first(where: \.hovered) ?? live.first { $0.isUncovered(at: event) }
+    }
 }
 
 enum Motion {

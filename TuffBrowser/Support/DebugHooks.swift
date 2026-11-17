@@ -873,6 +873,26 @@ enum DebugHooks {
                     }
                 }
             }
+        case "move", "middleclick":
+            // move x y — the pointer moves to a window point (origin bottom-left);
+            // middleclick x y — a middle-button click there. Both go through the event queue,
+            // so the app's event monitors see them (`onMiddleClick`).
+            let xy = argument.split(separator: " ").compactMap { Double($0) }
+            if xy.count == 2, let window = state.window {
+                let types: [NSEvent.EventType] = name == "move" ? [.mouseMoved] : [.otherMouseDown, .otherMouseUp]
+                for type in types {
+                    guard let cg = CGEvent(
+                        mouseEventSource: nil,
+                        mouseType: type == .mouseMoved ? .mouseMoved : type == .otherMouseDown ? .otherMouseDown : .otherMouseUp,
+                        mouseCursorPosition: .zero, mouseButton: .center
+                    ) else { continue }
+                    cg.setIntegerValueField(.mouseEventButtonNumber, value: 2)
+                    cg.setIntegerValueField(.mouseEventWindowUnderMousePointer, value: Int64(window.windowNumber))
+                    let screen = window.convertPoint(toScreen: NSPoint(x: xy[0], y: xy[1]))
+                    cg.location = CGPoint(x: screen.x, y: (NSScreen.screens.first?.frame.height ?? 0) - screen.y)
+                    if let event = NSEvent(cgEvent: cg) { NSApp.postEvent(event, atStart: false) }
+                }
+            }
         case "scroll":
             // scroll x y dy — a pixel-precise wheel event at a window point.
             let v = argument.split(separator: " ").compactMap { Double($0) }

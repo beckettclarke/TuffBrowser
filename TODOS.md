@@ -280,6 +280,65 @@ underlying data/capability to make it real. Implement natively, then remove the 
 
 ---
 
+## K. [FEATURE] Missing browser features (2026-11-16 audit)
+
+Things Safari / Chrome / Arc users expect that Tuff doesn't have yet. The bugs and security
+problems from the same audit are fixed (see BUGS.md).
+
+### Calls, media and full screen
+- [ ] **[P1]** **"{site} is in full screen" banner.** When a page goes full screen (a YouTube or
+      Netflix video), show a small card at the top: the site's name and "Press Esc to exit full
+      screen", fading after a few seconds, as Chrome and Safari do. Drive it from KVO on
+      `WKWebView.fullscreenState`; reuse the toast/card look (no `.shadow`, see AGENTS.md).
+- [ ] **[P1]** **Screen sharing (`getDisplayMedia`).** Nothing handles it, so "Present" in Meet,
+      Zoom and Teams fails. Needs WebKit's display-capture permission delegate (private
+      `_webView:requestDisplayCapturePermissionForOrigin:…` and the screen-capture preference)
+      plus a `SitePermissionKind.screen` and a card.
+- [ ] **[P1]** **Camera / microphone in-use indicator** on the tab row (and horizontal tab), with a
+      click to stop: observe `cameraCaptureState` / `microphoneCaptureState`, stop with
+      `setCameraCaptureState(.none)` / `setMicrophoneCaptureState(.none)`.
+
+### Sign-in and passwords
+- [ ] **[P1]** **Passkeys / WebAuthn.** Third-party WKWebView browsers need Apple's
+      `com.apple.developer.web-browser.public-key-credential` entitlement (Developer ID + a request
+      to Apple). Without it passkeys and security keys fail on most sites. Test on webauthn.io.
+- [ ] **[P1]** **Password saving and autofill.** Nothing built in (HTTP sign-in is `.forSession`
+      only); today it's extensions (1Password, Bitwarden). Either a Keychain-backed store with a
+      save card and fill-on-focus, or document the extension route in onboarding.
+
+### Privacy and site controls
+- [ ] **[P1]** **"Pop-up blocked" indicator.** With Block pop-ups on, blocked `window.open`s vanish
+      silently. Show an icon in the address pill with "Allow pop-ups from {site}" (per-site
+      setting already exists in `SiteSettings`).
+- [ ] **[P2]** **Per-site website data.** Remove one site's cookies and storage (Settings → Websites
+      and the page menu), and clear by time range (last hour / today / all). Today it's "Remove
+      All" only.
+- [ ] **[P2]** **List "open in app" answers** ("Always allow {site} to open {App} links",
+      `ExternalAppLinks`) in Settings → Websites, each removable. Today only "Forget All" clears them.
+- [ ] **[P2]** **HTTPS-first mode:** try https for every site, with a warning page before falling
+      back to http. `upgradeKnownHostsToHTTPS` only covers sites WebKit knows support it.
+- [ ] **[P3]** Web Push (notifications only arrive while Tuff is running).
+
+### History, search and tabs
+- [ ] **[P2]** **History keeps one entry per page** (last visit only), so a page seen yesterday and
+      today shows under today only. Keep a per-visit log.
+- [ ] **[P2]** **History per profile.** School's command bar suggests Home's history today.
+- [ ] **[P2]** History menu: **Recently Closed** and **recent pages** submenus.
+- [ ] **[P2]** Command bar **zero state** (⌘T on an empty field: top sites, recent tabs) and
+      **Paste and Go** in the address pill's menu.
+- [ ] **[P2]** **Translate page** (Apple's Translation framework).
+- [ ] **[P3]** Per-site user agent; ⌥-click a link to download it; text-only zoom.
+- [ ] **[P3]** A quick "save for later" / bookmarks manager (favourites and pinned tabs cover most of it).
+
+### Quality
+- [ ] **[P2]** **Accessibility.** One `accessibilityLabel` in the whole UI; the 42 `IconButton`s
+      only have tooltips, so VoiceOver reads symbol names. Label icon buttons, tab rows, tiles.
+- [ ] **[P2]** **Unit tests.** No test target. Start with `BrowserState.resolve`, `Tab.samePage`,
+      `Tab.zoomStep`, `AdvancedSettings.currentMajorVersion`, `SitePermissions.decision`.
+- [ ] **[P3]** Localization (no strings are localizable yet).
+
+---
+
 ### Suggested order of attack
 1. **Section A** (P0 host-adapter methods) — small, self-contained, immediately fixes real APIs.
 2. **Section F mute bug + Section H policy** — quick correctness/rule wins.

@@ -1160,7 +1160,11 @@ struct WebsitesPage: View {
                         }
                     }
                     SettingsRow(title: "Forget all saved choices") {
-                        ConfirmButton(title: "Forget All") { withAnimation(Motion.snappy) { permissions.removeAll() } }
+                        ConfirmButton(title: "Forget All") {
+                            withAnimation(Motion.snappy) { permissions.removeAll() }
+                            // "Always allow … to open … links" answers go too.
+                            ExternalAppLinks.removeAll()
+                        }
                     }
                 }
             }
@@ -1247,12 +1251,14 @@ struct DownloadsPage: View {
             }
 
             SettingsGroup(title: "This session") {
-                let finished = downloads.items.filter { $0.state != .running }.count
+                // Settings belongs to the normal windows: Incognito downloads aren't counted here.
+                let list = downloads.items(isPrivate: false)
+                let finished = list.filter { $0.state != .running }.count
                 SettingsRow(
                     title: "Downloads list",
-                    detail: downloads.items.isEmpty ? "Nothing downloaded yet." : "\(downloads.activeCount) in progress, \(finished) finished"
+                    detail: list.isEmpty ? "Nothing downloaded yet." : "\(downloads.activeCount(isPrivate: false)) in progress, \(finished) finished"
                 ) {
-                    Button("Clear Finished") { withAnimation(Motion.snappy) { downloads.clearFinished() } }
+                    Button("Clear Finished") { withAnimation(Motion.snappy) { downloads.clearFinished(isPrivate: false) } }
                         .buttonStyle(TuffButtonStyle())
                         .disabled(finished == 0)
                 }

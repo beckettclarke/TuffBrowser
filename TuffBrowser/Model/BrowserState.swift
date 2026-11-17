@@ -101,6 +101,10 @@ final class BrowserState {
     @ObservationIgnored private var pendingURLs: [URL] = []
 
     private let sessionFile = Paths.appSupport.appendingPathComponent("session.json")
+    /// The last session that read back fine at launch, for when `sessionFile` can't be read.
+    private let sessionBackupFile = Paths.appSupport.appendingPathComponent("session.backup.json")
+    /// Session writes happen off the main thread, in order (see `saveNow`).
+    private static let sessionWriter = DispatchQueue(label: "tuff.session-save", qos: .utility)
     private var settings: AppSettings { .shared }
 
     /// An Incognito window's state: nothing it does is saved, its pages use website data that
@@ -259,14 +263,15 @@ final class BrowserState {
     @discardableResult
     func newTab(
         url: URL?, select: Bool = true, in targetSpace: Space? = nil,
-        configuration: WKWebViewConfiguration? = nil, after opener: Tab? = nil, beside: Tab? = nil
+        configuration: WKWebViewConfiguration? = nil, after opener: Tab? = nil, beside: Tab? = nil,
+        sessionState: Data? = nil
     ) -> Tab {
         guard restored else {
             if let url { pendingURLs.append(url) }
             return Tab(url: url)
         }
-        let space = targetSpace ?? opener.flatMap { self.space(containing: $0) } ?? currentSpace
-        let tab = Tab(url: url)
+        let space = targetSpace ?? opener.flatMap { self.space(containing: $0) } ?? (beside.flatMap { self.space(containing: $0) }) ?? currentSpace
+        let tab = Tab(url: url, sessionState: sessionState)
         tab.browser = self
         tab.openerTab = opener
         var index = settings.tabs.newTabPosition == .top ? 0 : space.tabs.count
@@ -347,7 +352,7 @@ final class BrowserState {
                     id: UUID(), closedAt: Date()
                 ))
                 if closedTabs.count > Self.closedTabLimit { closedTabs.removeFirst(closedTabs.count - Self.closedTabLimit) }
-                ExtensionEventPush.shared.emit("sessions.onChanged", args: [])
+                if !isPrivate { ExtensionEventPush.shared.emit("sessions.onChanged", args: []) }
             }
             ext?.didClose(tab)
             animate { spaces.forEach { $0.tabs.removeAll { $0 === tab } } }
@@ -403,7 +408,7 @@ final class BrowserState {
     /// Brings back the last closed tab in its old space and place, with its back / forward history.
     func reopenClosedTab() {
         guard restored, let last = closedTabs.popLast() else { return }
-        ExtensionEventPush.shared.emit("sessions.onChanged", args: [])
+        if !isPrivate { ExtensionEventPush.shared.emit("sessions.onChanged", args: []) }
         let space = spaces.first { $0.id == last.spaceID } ?? currentSpace
         if space !== currentSpace, let index = spaces.firstIndex(where: { $0 === space }) { switchSpace(to: index) }
         let tab = Tab(url: last.url, title: last.title, sessionState: last.sessionState)
@@ -521,9 +526,14 @@ final class BrowserState {
         focusWebView()
     }
 
+    /// A copy of the tab beside it, with its back / forward history and its name, as in
+    /// Safari and Chrome.
     func duplicate(_ tab: Tab) {
         guard let url = tab.url else { return }
-        newTab(url: url, after: tab)
+        let copy = newTab(url: url, select: false, beside: tab, sessionState: tab.sessionState)
+        copy.customTitle = tab.customTitle
+        copy.title = tab.title
+        select(copy)
     }
 
     func selectAdjacentTab(offset: Int) {
@@ -1339,10 +1349,13 @@ final class BrowserState {
         let minutes = settings.general.sleepAfterMinutes
         guard minutes > 0 else { return }
         let cutoff = Date().addingTimeInterval(-Double(minutes) * 60)
-        for tab in allTabs where tab.isAwake && !isOnScreen(tab) {
-            if tab.isPlayingAudio || tab.isLoading || tab.isInPictureInPicture { continue }
-            if spaces.contains(where: { isShowing(tab, in: $0) }) && tab.lastActive > cutoff { continue }
-            if tab.lastActive < cutoff { tab.sleep() }
+        for tab in allTabs where tab.isAwake && !isOnScreen(tab) && !tab.isBusy && tab.lastActive < cutoff {
+            // Text typed into the page and not sent yet would be lost; such a tab stays awake.
+            tab.checkUnsavedInput { [weak self, weak tab] unsaved in
+                guard let self, let tab, !unsaved, tab.isAwake, !self.isOnScreen(tab), !tab.isBusy,
+                      tab.lastActive < cutoff else { return }
+                tab.sleep()
+            }
         }
     }
 
@@ -1351,10 +1364,14 @@ final class BrowserState {
         guard hours > 0 else { return }
         let cutoff = Date().addingTimeInterval(-Double(hours) * 3600)
         let stale = spaces.flatMap(\.tabs).filter { tab in
-            !isOnScreen(tab) && !spaces.contains(where: { $0.split?.contains(tab.id) == true }) && tab.lastActive < cutoff && !tab.isPlayingAudio && !tab.isInPictureInPicture
-                && !tab.isLoading && tab.permissionRequest == nil
+            !isOnScreen(tab) && !spaces.contains(where: { $0.split?.contains(tab.id) == true }) && tab.lastActive < cutoff && !tab.isBusy
         }
-        stale.forEach { close($0, force: true) }
+        for tab in stale {
+            tab.checkUnsavedInput { [weak self, weak tab] unsaved in
+                guard let self, let tab, !unsaved, !self.isOnScreen(tab), !tab.isBusy, tab.lastActive < cutoff else { return }
+                self.close(tab, force: true)
+            }
+        }
     }
 
     // MARK: Persistence
@@ -1428,7 +1445,10 @@ final class BrowserState {
         saver.schedule { [weak self] in self?.saveNow() }
     }
 
-    func saveNow() {
+    /// Writes the session. Gathering it (each tab's back / forward history) happens here; the
+    /// encoding and the write, which can be megabytes with many tabs, happen off the main
+    /// thread. `synchronously` waits for the write, for quitting.
+    func saveNow(synchronously: Bool = false) {
         guard restored, !isPrivate else { return }
         // With "Clear history when Tuff quits" on, tabs' history and closed tabs stay off disk.
         let keepHistory = !settings.privacy.clearHistoryOnQuit
@@ -1466,8 +1486,42 @@ final class BrowserState {
             sidebarVisible: sidebarVisible,
             closedTabs: keepHistory ? closedTabs : nil
         )
-        guard let data = try? JSONEncoder().encode(snapshot) else { return }
-        try? data.write(to: sessionFile, options: .atomic)
+        let file = sessionFile
+        let write = {
+            guard let data = try? JSONEncoder().encode(snapshot) else { return }
+            try? data.write(to: file, options: .atomic)
+        }
+        if synchronously { Self.sessionWriter.sync(execute: write) } else { Self.sessionWriter.async(execute: write) }
+    }
+
+    /// Reads the saved session. A file that is there but can't be read (cut short, or written
+    /// by a newer Tuff) is set aside rather than overwritten by the next save, and the copy kept
+    /// from the last launch that read fine is used instead. Without this, an unreadable file
+    /// meant starting over with one empty space, and losing every space, pinned tab, folder and
+    /// favourite on the first save.
+    private func readSession() -> SessionSnapshot? {
+        func decode(_ url: URL) -> SessionSnapshot? {
+            (try? Data(contentsOf: url)).flatMap { try? JSONDecoder().decode(SessionSnapshot.self, from: $0) }
+        }
+        let files = FileManager.default
+        guard files.fileExists(atPath: sessionFile.path) else { return nil }
+        if let snapshot = decode(sessionFile) {
+            try? files.removeItem(at: sessionBackupFile)
+            try? files.copyItem(at: sessionFile, to: sessionBackupFile)
+            return snapshot
+        }
+        let stamp = ISO8601DateFormatter.string(from: Date(), timeZone: .current, formatOptions: [.withFullDate, .withTime])
+        let aside = Paths.appSupport.appendingPathComponent("session-unreadable-\(stamp).json")
+        try? files.copyItem(at: sessionFile, to: aside)
+        NSLog("Tuff: session.json couldn’t be read; kept it as \(aside.lastPathComponent)")
+        let backup = decode(sessionBackupFile)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
+            self?.show(Toast(
+                symbol: "exclamationmark.triangle",
+                text: backup == nil ? "Couldn’t read your last session" : "Restored your session from an earlier copy"
+            ))
+        }
+        return backup
     }
 
     func restore() {
@@ -1490,7 +1544,7 @@ final class BrowserState {
             return tab
         }
 
-        let saved = (try? Data(contentsOf: sessionFile)).flatMap { try? JSONDecoder().decode(SessionSnapshot.self, from: $0) }
+        let saved = readSession()
         // Closed tabs come back even when the session doesn't, so ⇧⌘T can reopen last time's tabs.
         if !settings.privacy.clearHistoryOnQuit {
             closedTabs = Array((saved?.closedTabs ?? []).suffix(Self.closedTabLimit))

@@ -19,6 +19,8 @@ final class AppDelegate: NSObject {
     private var quitPromptID: UUID?
     /// Set once the user has said yes, so the follow-up `terminate` goes straight through.
     private var quitConfirmed = false
+    /// Running downloads have been stopped for quitting (`pauseDownloadsThenQuit`).
+    private var downloadsPausedForQuit = false
     /// Debug scripts run with a test profile, which normally skips the quit card.
     static var confirmQuitInTests = false
     /// Set when another copy was already running; this one hands over and quits.
@@ -51,6 +53,9 @@ final class AppDelegate: NSObject {
             if self?.incognitoControllers.isEmpty ?? true {
                 SitePermissions.shared.forgetIncognito()
                 SiteSettings.shared.forgetIncognito()
+                ExternalAppLinks.forgetIncognito()
+                // Incognito downloads leave the list with the last Incognito window.
+                DownloadManager.shared.forgetPrivateItems()
             }
         }
         incognitoControllers.append(controller)
@@ -170,14 +175,14 @@ final class AppDelegate: NSObject {
         guard let tab = state.selectedTab else { return }
         if tab.reader != nil { ReaderSettings.shared.grow(); return }
         if let pdf = tab.pdf, pdf.isReady { pdf.zoomIn(); return }
-        tab.setZoom(tab.pageZoom * 1.1)
+        tab.setZoom(Tab.zoomStep(from: tab.pageZoom, up: true))
     }
 
     @objc func zoomOut(_ sender: Any?) {
         guard let tab = state.selectedTab else { return }
         if tab.reader != nil { ReaderSettings.shared.shrink(); return }
         if let pdf = tab.pdf, pdf.isReady { pdf.zoomOut(); return }
-        tab.setZoom(tab.pageZoom / 1.1)
+        tab.setZoom(Tab.zoomStep(from: tab.pageZoom, up: false))
     }
 
     @objc func zoomReset(_ sender: Any?) {
@@ -336,9 +341,12 @@ extension AppDelegate: NSApplicationDelegate {
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        if quitConfirmed { return .terminateNow }
+        if quitConfirmed { return pauseDownloadsThenQuit() }
         let testing = Paths.testDataDirectory != nil && !Self.confirmQuitInTests
-        guard runningCopy == nil, !testing, AppSettings.shared.behavior.confirmQuit, !Self.isSystemQuit else { return .terminateNow }
+        let downloading = runningCopy == nil ? DownloadManager.shared.activeCount : 0
+        // Downloads in progress are worth a card even with "confirm before quitting" off.
+        guard runningCopy == nil, !testing, AppSettings.shared.behavior.confirmQuit || downloading > 0, !Self.isSystemQuit
+        else { return pauseDownloadsThenQuit() }
 
         // ⌘Q again while the card is up confirms it.
         if let id = quitPromptID {
@@ -347,15 +355,21 @@ extension AppDelegate: NSApplicationDelegate {
         }
 
         let tabCount = BrowserState.all.flatMap(\.allTabs).filter { $0.url != nil }.count
+        let tabsMessage = AppSettings.shared.general.restoreSession
+            ? "Your tabs will be back next time you open Tuff."
+            : "Your open tabs won’t be restored next time. Spaces, pinned tabs and favourites stay."
         let prompt = Prompt(
             icon: NSApp.applicationIconImage,
             title: "Quit Tuff?",
-            subtitle: tabCount == 1 ? "1 tab open" : "\(tabCount) tabs open",
-            message: AppSettings.shared.general.restoreSession
-                ? "Your tabs will be back next time you open Tuff."
-                : "Your open tabs won’t be restored next time. Spaces, pinned tabs and favourites stay.",
+            subtitle: downloading > 0
+                ? (downloading == 1 ? "1 download in progress" : "\(downloading) downloads in progress")
+                : (tabCount == 1 ? "1 tab open" : "\(tabCount) tabs open"),
+            message: downloading > 0
+                ? "Downloads stop when Tuff quits. Next time, Resume in the downloads list carries on where each left off, if the site allows it."
+                : tabsMessage,
             confirmTitle: "Quit",
-            checkbox: "Don’t ask again",
+            // "Don't ask again" is about the everyday quit card; downloads always ask.
+            checkbox: downloading > 0 ? nil : "Don’t ask again",
             confirmKey: (KeyboardShortcut("q", modifiers: .command), "⌘Q")
         )
         quitPromptID = prompt.id
@@ -371,6 +385,22 @@ extension AppDelegate: NSApplicationDelegate {
         return .terminateCancel
     }
 
+    /// Quits now, or once running downloads have stopped and handed back what they need to
+    /// carry on later (`pauseAllForQuit`): this quit is called off, and a new one made then.
+    /// (`.terminateLater` can't be used: when the quit comes from a block on the main queue,
+    /// as the quit card's does, the stop callbacks queue up behind it and the app hangs.)
+    /// Logout and shutdown aren't held up; their downloads just stop.
+    private func pauseDownloadsThenQuit() -> NSApplication.TerminateReply {
+        guard runningCopy == nil, !downloadsPausedForQuit, !Self.isSystemQuit,
+              DownloadManager.shared.activeCount > 0 else { return .terminateNow }
+        DownloadManager.shared.pauseAllForQuit { [weak self] in
+            self?.downloadsPausedForQuit = true
+            self?.quitConfirmed = true
+            NSApp.terminate(nil)
+        }
+        return .terminateCancel
+    }
+
     /// Logout, restart and shutdown carry a quit reason; those shouldn't stop to ask.
     private static var isSystemQuit: Bool {
         guard let event = NSAppleEventManager.shared().currentAppleEvent,
@@ -379,7 +409,7 @@ extension AppDelegate: NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        mainState.saveNow()
+        mainState.saveNow(synchronously: true)
         AppSettings.shared.saveNow()
         if AppSettings.shared.privacy.clearHistoryOnQuit {
             HistoryStore.shared.clear(synchronously: true)

@@ -81,6 +81,13 @@ final class InternalPageHandler: NSObject, WKURLSchemeHandler, WKScriptMessageHa
             urlSchemeTask.didFailWithError(URLError(.badURL))
             return
         }
+        // Only Tuff's own pages load from tuff://. A website embedding tuff://favicon as an image
+        // could otherwise tell which sites are in History, and one framing tuff://source could
+        // make a signed-in request to another site.
+        if let main = urlSchemeTask.request.mainDocumentURL, !InternalPage.isInternal(main) {
+            urlSchemeTask.didFailWithError(URLError(.noPermissionsToReadFile))
+            return
+        }
         active.insert(ObjectIdentifier(urlSchemeTask))
         let host = url.host(percentEncoded: false)?.lowercased() ?? ""
         if host == "favicon" {

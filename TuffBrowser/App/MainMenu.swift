@@ -42,6 +42,12 @@ enum MainMenu {
         newTabOnCommandN.isHidden = true
         newTabOnCommandN.allowsKeyEquivalentWhenHidden = true
 
+        /// ⌘+ zooms in too: on keyboards where + is a key of its own (German, Nordic…), ⌘= is
+        /// a different key altogether.
+        let zoomInOnCommandPlus = item("Zoom In", #selector(AppDelegate.zoomIn(_:)), "+")
+        zoomInOnCommandPlus.isHidden = true
+        zoomInOnCommandPlus.allowsKeyEquivalentWhenHidden = true
+
         // App
         let services = NSMenu(title: "Services")
         let servicesItem = NSMenuItem(title: "Services", action: nil, keyEquivalent: "")
@@ -143,6 +149,7 @@ enum MainMenu {
             item("Actual Size", #selector(AppDelegate.zoomReset(_:)), "0"),
             item("Zoom In", #selector(AppDelegate.zoomIn(_:)), "="),
             item("Zoom Out", #selector(AppDelegate.zoomOut(_:)), "-"),
+            zoomInOnCommandPlus,
             sep(),
             item("Enter Reader Mode", #selector(AppDelegate.toggleReader(_:)), "r", [.command, .option]),
             item("Enter Full Screen", #selector(NSWindow.toggleFullScreen(_:)), "f", [.command, .control], own: false),

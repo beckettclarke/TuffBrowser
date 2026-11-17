@@ -525,7 +525,7 @@ final class PDFViewer: NSObject {
     /// Saves the PDF to the downloads folder, copied from the file already on disk.
     func saveCopy() {
         guard let fileURL else { return }
-        DownloadManager.shared.addLocalCopy(of: fileURL, filename: filename, sourceURL: url)
+        DownloadManager.shared.addLocalCopy(of: fileURL, filename: filename, sourceURL: url, isPrivate: tab?.browser?.isPrivate ?? false)
     }
 
     func copyLinkToPage() {
@@ -1019,11 +1019,13 @@ struct PDFCanvas: NSViewRepresentable {
 extension DownloadManager {
     /// Adds a copy of a file that is already on disk (a PDF the viewer downloaded) to the
     /// downloads folder and the downloads list.
-    func addLocalCopy(of file: URL, filename: String, sourceURL: URL?) {
+    func addLocalCopy(of file: URL, filename: String, sourceURL: URL?, isPrivate: Bool = false) {
         let destination = Self.uniqueDestination(for: filename)
         let item = DownloadItem(filename: destination.lastPathComponent)
         item.url = sourceURL
-        item.chromeID = reserveChromeID()
+        item.isPrivate = isPrivate
+        // Extensions (`chrome.downloads`) never see an Incognito window's downloads.
+        item.chromeID = isPrivate ? nil : reserveChromeID()
         do {
             try FileManager.default.copyItem(at: file, to: destination)
         } catch {
@@ -1039,9 +1041,9 @@ extension DownloadManager {
         item.finishedAt = Date()
         item.state = .finished
         items.insert(item, at: 0)
-        pulse += 1
+        bumpPulse(isPrivate: isPrivate)
         DistributedNotificationCenter.default().post(name: Notification.Name("com.apple.DownloadFileFinished"), object: destination.path)
-        let state = BrowserState.active
+        let state = Self.window(isPrivate: isPrivate)
         if AppSettings.shared.downloads.showPanelOnStart, state.downloadsButtonShowing {
             state.downloadsVisible = true
         } else {

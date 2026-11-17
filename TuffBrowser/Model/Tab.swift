@@ -12,6 +12,8 @@ final class Tab: NSObject, Identifiable {
     /// A name the user gave the tab in the sidebar; shown instead of the page's title.
     var customTitle: String?
     var favicon: NSImage?
+    /// The site `favicon` came from, so moving within a site can keep it on show (`didCommit`).
+    @ObservationIgnored var faviconHost: String?
     var isLoading = false
     var progress: Double = 0
     var canGoBack = false
@@ -113,6 +115,15 @@ final class Tab: NSObject, Identifiable {
     /// The certificate problem the tab's error page is about (see `CertificateErrorHandler`).
     @ObservationIgnored var certificateFailure: CertificateFailure?
     @ObservationIgnored var beforeUnloadShowing = false
+    /// The address an error page of Tuff's is being put up for (`showErrorPage`), until it commits.
+    @ObservationIgnored var errorPageURL: URL?
+    /// The page on show is one of Tuff's error pages (can't connect, bad certificate, crashed):
+    /// it stays out of History, and its title doesn't replace the real page's there.
+    @ObservationIgnored var showingErrorPage = false
+    /// A `tuff://` page Tuff itself is opening in this tab (see `start(_:in:)`).
+    @ObservationIgnored var internalPageLoad: URL?
+    /// The "Open in another app?" card is up (see `openInOtherApp`).
+    @ObservationIgnored var externalAppPromptShowing = false
     /// "Save Image As…" / "Save Linked File As…" was just picked from the page's context menu:
     /// the download WebKit creates next asks where to save.
     @ObservationIgnored var contextSaveAsRequested: Date?
@@ -128,7 +139,10 @@ final class Tab: NSObject, Identifiable {
         self.homeURL = homeURL
         self.savedInteractionState = sessionState
         super.init()
-        if let url { favicon = InternalPage.icon(for: url) ?? FaviconStore.shared.cachedIcon(for: url) }
+        if let url {
+            favicon = InternalPage.icon(for: url) ?? FaviconStore.shared.cachedIcon(for: url)
+            faviconHost = url.host(percentEncoded: false)?.lowercased()
+        }
     }
 
     /// What the address pill shows: an extension's name for its own pages, else the URL's host.
@@ -229,13 +243,13 @@ final class Tab: NSObject, Identifiable {
                 savedInteractionState = nil
                 // History that WebKit couldn't read back (from an older version, say) leaves
                 // the view empty; fall back to the page itself.
-                if view.backForwardList.currentItem == nil, let url { view.load(URLRequest(url: url)) }
+                if view.backForwardList.currentItem == nil, let url { start(URLRequest(url: url), in: view) }
             } else if let url {
                 // Tuff's own pages (tuff://history) are built fresh each time rather than put
                 // back from saved history: a restored copy could come back blank.
                 savedInteractionState = nil
                 loadingHome = homeURL.map { Self.samePage(url, $0) } ?? false
-                view.load(URLRequest(url: url))
+                start(URLRequest(url: url), in: view)
             }
         }
         return view
@@ -302,7 +316,7 @@ final class Tab: NSObject, Identifiable {
         let view = wake()
         // `wake` starts a plain GET; replace it when the request carries more than that.
         if request.httpMethod.map({ $0.uppercased() != "GET" }) ?? false || request.httpBody != nil {
-            view.load(request)
+            start(request, in: view)
         }
         canGoBack = view.canGoBack || historyBeforeMove != nil
         browser?.tabDidChange(self, properties: .URL)
@@ -355,6 +369,42 @@ final class Tab: NSObject, Identifiable {
         PDFFiles.remove(pdfFiles.values)
         pdfFiles = [:]
     }
+
+    /// Doing something that unloading or closing it in the background would cut short:
+    /// playing sound, loading, in picture in picture, using the camera or microphone (a call
+    /// with its sound off), or waiting on the user (a permission card, a page dialog, "Leave
+    /// this page?").
+    var isBusy: Bool {
+        if isPlayingAudio || isLoading || isInPictureInPicture || permissionRequest != nil
+            || !dialogWaiters.isEmpty || beforeUnloadShowing || pendingClose != nil { return true }
+        if let webView, webView.cameraCaptureState != .none || webView.microphoneCaptureState != .none { return true }
+        return false
+    }
+
+    /// Whether the page has text typed into a field that hasn't been sent: a field whose value
+    /// differs from what the page put there. Read in a world of Tuff's own, so the page can't
+    /// change the answer. A page that never answers (hung) never calls back, so it isn't
+    /// unloaded behind the user's back either.
+    func checkUnsavedInput(_ completion: @escaping (Bool) -> Void) {
+        guard let webView, !awaitingExtension else { completion(false); return }
+        webView.evaluateJavaScript(Self.unsavedInputScript, in: nil, in: .defaultClient) { result in
+            switch result {
+            case .success(let value): completion((value as? Bool) ?? false)
+            case .failure: completion(false)
+            }
+        }
+    }
+
+    private static let unsavedInputScript = """
+    (() => {
+      const skip = new Set(['hidden', 'submit', 'button', 'reset', 'image', 'file', 'checkbox', 'radio', 'range', 'color']);
+      for (const el of document.querySelectorAll('textarea, input')) {
+        if (skip.has((el.type || '').toLowerCase()) || el.disabled || el.readOnly) continue;
+        if (el.value && el.value !== el.defaultValue) return true;
+      }
+      return false;
+    })()
+    """
 
     /// Answers the pending permission request.
     func resolvePermission(granted: Bool?, remember: Bool = false) {
@@ -450,8 +500,11 @@ final class Tab: NSObject, Identifiable {
                     self.title = t
                     self.browser?.tabDidChange(self, properties: .title)
                     if let u = self.url, let scheme = u.scheme, scheme == "http" || scheme == "https" {
-                        if self.browser?.isPrivate == false { HistoryStore.shared.updateTitle(url: u, title: t) }
-                        ExtensionEventPush.shared.emit("history.onTitleChanged", args: [["url": u.absoluteString, "title": t]])
+                        // Incognito pages stay out of History, and extensions never hear of them.
+                        if self.browser?.isPrivate == false, !self.showingErrorPage {
+                            HistoryStore.shared.updateTitle(url: u, title: t)
+                            ExtensionEventPush.shared.emit("history.onTitleChanged", args: [["url": u.absoluteString, "title": t]])
+                        }
                     }
                 }
             },
@@ -521,10 +574,17 @@ final class Tab: NSObject, Identifiable {
         savedInteractionState = nil
         loadingHome = homeURL.map { Self.samePage(url, $0) } ?? false
         if let webView {
-            webView.load(URLRequest(url: url))
+            start(URLRequest(url: url), in: webView)
         } else {
             wake()
         }
+    }
+
+    /// Loads a request Tuff itself asked for. Tuff's own pages (`tuff://`) only open this way:
+    /// the navigation policy turns away a website that sends a tab or pop-up to one.
+    private func start(_ request: URLRequest, in view: WKWebView) {
+        internalPageLoad = InternalPage.isInternal(request.url) ? request.url : nil
+        view.load(request)
     }
 
     func reload(fromOrigin: Bool = false) {
@@ -535,7 +595,7 @@ final class Tab: NSObject, Identifiable {
             return
         }
         if webView.url == nil, let url {
-            webView.load(URLRequest(url: url))
+            start(URLRequest(url: url), in: webView)
         } else if fromOrigin {
             webView.reloadFromOrigin()
         } else {
@@ -589,6 +649,16 @@ final class Tab: NSObject, Identifiable {
             return
         }
         webView.goForward()
+    }
+
+    /// The page zoom levels ⌘+ / ⌘- step through, as in Safari and Chrome.
+    static let zoomSteps: [CGFloat] = [0.3, 0.5, 0.67, 0.75, 0.8, 0.9, 1, 1.1, 1.25, 1.5, 1.75, 2, 2.5, 3, 4]
+
+    /// The next zoom level up or down from `zoom`. A level between steps (set by an extension,
+    /// or saved by an older Tuff that multiplied by 1.1) goes to the nearest step that way.
+    static func zoomStep(from zoom: CGFloat, up: Bool) -> CGFloat {
+        if up { return zoomSteps.first { $0 > zoom + 0.005 } ?? zoomSteps[zoomSteps.count - 1] }
+        return zoomSteps.last { $0 < zoom - 0.005 } ?? zoomSteps[0]
     }
 
     /// Zooms the page and remembers it for the site: other open tabs on the same site follow.

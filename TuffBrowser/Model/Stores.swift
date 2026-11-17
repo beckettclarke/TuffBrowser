@@ -1,4 +1,5 @@
 import AppKit
+import CryptoKit
 import Observation
 import WebKit
 
@@ -334,11 +335,17 @@ final class HistoryStore {
 
 // MARK: - Favicons
 
+/// Site icons, cached in memory and on disk.
+///
+/// An icon is kept under the address it was downloaded from, since one host can serve pages
+/// with different icons (Google Docs, Sheets and Slides all live on docs.google.com), and also
+/// under its host, as the site's most recent icon: that one is what shows before a page has
+/// loaded (a restored tab, a History row, a suggestion).
 final class FaviconStore {
     static let shared = FaviconStore()
 
     private let memory = NSCache<NSString, NSImage>()
-    /// When each host's icon was last fetched this run, so every page load on a site doesn't
+    /// When each icon was last fetched this run, so every page load on a site doesn't
     /// download its icon again.
     private var fetched: [String: Date] = [:]
     /// How long an icon is trusted before a page load checks for a new one.
@@ -360,7 +367,15 @@ final class FaviconStore {
         return host.lowercased()
     }
 
+    /// The cache key for one icon file, by its address.
+    private func key(forIcon url: URL) -> String { "icon:" + url.absoluteString }
+
     private func file(for key: String) -> URL {
+        // Icon addresses can be long and full of query strings: named by their hash.
+        if key.hasPrefix("icon:") {
+            let digest = SHA256.hash(data: Data(key.utf8)).map { String(format: "%02x", $0) }.joined()
+            return dir.appendingPathComponent("icon-" + digest + ".png")
+        }
         let safe = key.replacingOccurrences(of: "/", with: "_").replacingOccurrences(of: ":", with: "_")
         return dir.appendingPathComponent(safe + ".png")
     }
@@ -373,9 +388,12 @@ final class FaviconStore {
         return FileManager.default.fileExists(atPath: file.path) ? file : nil
     }
 
-    /// Synchronous lookup in the memory and disk caches only.
+    /// Synchronous lookup in the memory and disk caches only: the host's latest icon.
     func cachedIcon(for url: URL) -> NSImage? {
-        guard let key = key(for: url) else { return nil }
+        key(for: url).flatMap(image(forKey:))
+    }
+
+    private func image(forKey key: String) -> NSImage? {
         if let image = memory.object(forKey: key as NSString) { return image }
         if let image = NSImage(contentsOf: file(for: key)) {
             memory.setObject(image, forKey: key as NSString)
@@ -405,21 +423,26 @@ final class FaviconStore {
     /// Finds the page's declared icon (falling back to /favicon.ico), downloads and caches it.
     /// `persist: false` (Incognito) keeps the icon in memory only, for this run of the app.
     func fetchIcon(from webView: WKWebView, persist: Bool = true, completion: @escaping (NSImage?) -> Void) {
-        guard let pageURL = webView.url, let key = key(for: pageURL),
+        guard let pageURL = webView.url, let hostKey = key(for: pageURL),
               pageURL.scheme == "http" || pageURL.scheme == "https" else {
             completion(nil)
             return
         }
-        if let image = freshIcon(for: key, persist: persist) {
-            completion(image)
-            return
-        }
+        // Which icon the page declares is asked every time (it's cheap); the download is what
+        // the cache saves.
         webView.evaluateJavaScript(Self.iconScript) { [weak self] result, _ in
             guard let self else { return }
             var candidates: [URL] = []
             if let s = result as? String, let u = URL(string: s) { candidates.append(u) }
             if let fallback = URL(string: "/favicon.ico", relativeTo: pageURL)?.absoluteURL { candidates.append(fallback) }
-            self.download(candidates, key: key, persist: persist, completion: completion)
+            guard let first = candidates.first else { return completion(nil) }
+            let iconKey = self.key(forIcon: first)
+            if let image = self.freshIcon(for: iconKey, persist: persist) {
+                self.remember(image, as: hostKey, persist: persist)
+                completion(image)
+                return
+            }
+            self.download(candidates, key: iconKey, hostKey: hostKey, persist: persist, completion: completion)
         }
     }
 
@@ -430,11 +453,11 @@ final class FaviconStore {
         guard !key.isEmpty, let site = URL(string: "https://" + key) else { return completion(nil) }
         if let image = cachedIcon(for: site) { return completion(image) }
         guard let url = URL(string: "https://\(key)/favicon.ico") else { return completion(nil) }
-        download([url], key: key, persist: true, completion: completion)
+        download([url], key: key, hostKey: nil, persist: true, completion: completion)
     }
 
-    /// The cached icon for a host when it is recent enough not to fetch again: fetched earlier
-    /// this run, or (outside Incognito) saved to disk within `refreshAfter`.
+    /// The cached icon when it is recent enough not to fetch again: fetched earlier this run,
+    /// or (outside Incognito) saved to disk within `refreshAfter`.
     private func freshIcon(for key: String, persist: Bool) -> NSImage? {
         let now = Date()
         if let date = fetched[key], now.timeIntervalSince(date) < Self.refreshAfter {
@@ -442,12 +465,11 @@ final class FaviconStore {
         }
         guard persist,
               let modified = try? file(for: key).resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate,
-              now.timeIntervalSince(modified) < Self.refreshAfter,
-              let image = cachedIcon(for: URL(string: "https://" + key) ?? file(for: key)) else { return nil }
-        return image
+              now.timeIntervalSince(modified) < Self.refreshAfter else { return nil }
+        return image(forKey: key)
     }
 
-    private func download(_ candidates: [URL], key: String, persist: Bool, completion: @escaping (NSImage?) -> Void) {
+    private func download(_ candidates: [URL], key: String, hostKey: String?, persist: Bool, completion: @escaping (NSImage?) -> Void) {
         guard let url = candidates.first else {
             DispatchQueue.main.async { completion(nil) }
             return
@@ -455,9 +477,9 @@ final class FaviconStore {
         let rest = Array(candidates.dropFirst())
         if url.scheme == "data" {
             if let data = try? Data(contentsOf: url), let image = NSImage(data: data), image.isValid {
-                store(image, key: key, persist: persist, completion: completion)
+                store(image, key: key, hostKey: hostKey, persist: persist, completion: completion)
             } else {
-                download(rest, key: key, persist: persist, completion: completion)
+                download(rest, key: key, hostKey: hostKey, persist: persist, completion: completion)
             }
             return
         }
@@ -465,22 +487,30 @@ final class FaviconStore {
             guard let self else { return }
             let ok = (response as? HTTPURLResponse).map { (200..<300).contains($0.statusCode) } ?? false
             if ok, let data, let image = NSImage(data: data), image.isValid, image.size.width > 0 {
-                self.store(image, key: key, persist: persist, completion: completion)
+                self.store(image, key: key, hostKey: hostKey, persist: persist, completion: completion)
             } else {
-                self.download(rest, key: key, persist: persist, completion: completion)
+                self.download(rest, key: key, hostKey: hostKey, persist: persist, completion: completion)
             }
         }.resume()
     }
 
-    private func store(_ image: NSImage, key: String, persist: Bool, completion: @escaping (NSImage?) -> Void) {
+    private func store(_ image: NSImage, key: String, hostKey: String?, persist: Bool, completion: @escaping (NSImage?) -> Void) {
         DispatchQueue.main.async {
             let small = image.resized(to: 64)
             small.size = NSSize(width: 32, height: 32)
             self.memory.setObject(small, forKey: key as NSString)
             self.fetched[key] = Date()
             if persist, let png = small.pngData { try? png.write(to: self.file(for: key), options: .atomic) }
+            if let hostKey { self.remember(small, as: hostKey, persist: persist) }
             completion(small)
         }
+    }
+
+    /// Makes an icon its host's latest, unless it already is.
+    private func remember(_ image: NSImage, as hostKey: String, persist: Bool) {
+        if memory.object(forKey: hostKey as NSString) === image { return }
+        memory.setObject(image, forKey: hostKey as NSString)
+        if persist, let png = image.pngData { try? png.write(to: file(for: hostKey), options: .atomic) }
     }
 }
 
@@ -529,8 +559,10 @@ final class DownloadManager: NSObject {
     static let shared = DownloadManager()
 
     var items: [DownloadItem] = []
-    /// Bumped whenever a download starts, so the sidebar button can pulse.
+    /// Bumped whenever a download starts, so the sidebar button can pulse. Incognito windows
+    /// have their own, so a normal window's button doesn't react to an Incognito download.
     var pulse = 0
+    var privatePulse = 0
     /// chrome.downloads ids — every download gets one, page- or extension-initiated.
     private var nextChromeID = 1
     func reserveChromeID() -> Int { let id = nextChromeID; nextChromeID += 1; return id }
@@ -547,6 +579,47 @@ final class DownloadManager: NSObject {
     var totalBytesPerSecond: Double? {
         let speeds = items.filter { $0.state == .running }.compactMap(\.bytesPerSecond)
         return speeds.isEmpty ? nil : speeds.reduce(0, +)
+    }
+
+    // MARK: Per window
+
+    /// What one kind of window lists: a normal window its own downloads, an Incognito window
+    /// only Incognito ones (which never show in a normal window).
+    func items(isPrivate: Bool) -> [DownloadItem] { items.filter { $0.isPrivate == isPrivate } }
+
+    func activeCount(isPrivate: Bool) -> Int {
+        items.filter { $0.isPrivate == isPrivate && $0.state == .running }.count
+    }
+
+    func overallFraction(isPrivate: Bool) -> Double {
+        let running = items.filter { $0.isPrivate == isPrivate && $0.state == .running }
+        guard !running.isEmpty else { return 0 }
+        return running.map(\.fraction).reduce(0, +) / Double(running.count)
+    }
+
+    func totalBytesPerSecond(isPrivate: Bool) -> Double? {
+        let speeds = items.filter { $0.isPrivate == isPrivate && $0.state == .running }.compactMap(\.bytesPerSecond)
+        return speeds.isEmpty ? nil : speeds.reduce(0, +)
+    }
+
+    func pulse(isPrivate: Bool) -> Int { isPrivate ? privatePulse : pulse }
+
+    func bumpPulse(isPrivate: Bool) {
+        if isPrivate { privatePulse += 1 } else { pulse += 1 }
+    }
+
+    /// The browser window a download of this kind belongs to: the one in front if it is of
+    /// that kind, else the main window (or, for Incognito, the front window anyway).
+    static func window(isPrivate: Bool) -> BrowserState {
+        let front = BrowserState.active
+        if front.isPrivate == isPrivate { return front }
+        return isPrivate ? (BrowserState.all.last { $0.isPrivate } ?? front) : .shared
+    }
+
+    /// Takes finished Incognito downloads off the list once the last Incognito window has
+    /// closed (the files stay where they were saved). Ones still running stay until they end.
+    func forgetPrivateItems() {
+        items.removeAll { $0.isPrivate && $0.state != .running }
     }
 
     /// Samples every running download once a second. Runs only while something is downloading.
@@ -602,22 +675,26 @@ final class DownloadManager: NSObject {
     ) {
         let item = DownloadItem(filename: download.originalRequest?.url?.lastPathComponent ?? "Download")
         item.saveLocation = saveLocation
-        item.chromeID = chromeID ?? reserveChromeID()
+        // Extensions (`chrome.downloads`, its events) never see an Incognito window's downloads:
+        // without an id an item is left out of both.
+        item.chromeID = isPrivate ? nil : (chromeID ?? reserveChromeID())
         item.url = url ?? download.originalRequest?.url
         item.isPrivate = isPrivate
         attach(download, to: item)
         items.insert(item, at: 0)
-        ExtensionEventPush.shared.emit("downloads.onCreated", args: [[
-            "id": item.chromeID ?? 0,
-            "url": item.url?.absoluteString ?? "",
-            "filename": item.filename,
-            "state": "in_progress",
-            "bytesReceived": 0,
-            "totalBytes": -1,
-            "paused": false,
-        ]])
-        pulse += 1
-        let state = BrowserState.active
+        if let id = item.chromeID {
+            ExtensionEventPush.shared.emit("downloads.onCreated", args: [[
+                "id": id,
+                "url": item.url?.absoluteString ?? "",
+                "filename": item.filename,
+                "state": "in_progress",
+                "bytesReceived": 0,
+                "totalBytes": -1,
+                "paused": false,
+            ]])
+        }
+        bumpPulse(isPrivate: isPrivate)
+        let state = Self.window(isPrivate: isPrivate)
         if AppSettings.shared.downloads.showPanelOnStart, state.downloadsButtonShowing {
             state.downloadsVisible = true
         }
@@ -675,10 +752,12 @@ final class DownloadManager: NSObject {
         }
     }
 
-    func clearFinished() {
-        let gone = items.filter { $0.state != .running }
+    /// Takes everything that isn't running off the list: one kind of window's downloads, or
+    /// (nil) all of them.
+    func clearFinished(isPrivate: Bool? = nil) {
+        let gone = items.filter { $0.state != .running && (isPrivate == nil || $0.isPrivate == isPrivate) }
         gone.forEach(Self.discardIncompleteFile)
-        items.removeAll { $0.state != .running }
+        items.removeAll { item in gone.contains { $0 === item } }
         scheduleSave()
     }
 
@@ -692,6 +771,29 @@ final class DownloadManager: NSObject {
         guard let temp = item.partialFile else { return }
         item.partialFile = nil
         try? FileManager.default.removeItem(at: temp)
+    }
+
+    /// Gives a finished download Gatekeeper's "downloaded from the internet" flag, so macOS
+    /// checks an app, installer or disk image from it before it first opens, as with Safari.
+    /// Tuff isn't sandboxed, so nothing adds the flag for it; one WebKit already set is kept.
+    static func markQuarantined(_ file: URL, source: URL?) {
+        var url = file
+        if let existing = try? url.resourceValues(forKeys: [.quarantinePropertiesKey]).quarantineProperties,
+           !existing.isEmpty { return }
+        var properties: [String: Any] = [
+            kLSQuarantineTypeKey as String: kLSQuarantineTypeWebDownload as String,
+            kLSQuarantineAgentNameKey as String: "Tuff",
+        ]
+        if let source, ["http", "https"].contains(source.scheme?.lowercased() ?? "") {
+            properties[kLSQuarantineDataURLKey as String] = source
+        }
+        var values = URLResourceValues()
+        values.quarantineProperties = properties
+        do {
+            try url.setResourceValues(values)
+        } catch {
+            NSLog("Tuff: couldn’t mark \(file.lastPathComponent) as downloaded: \(error.localizedDescription)")
+        }
     }
 
     static func uniqueDestination(for filename: String) -> URL {
@@ -788,6 +890,7 @@ extension DownloadManager: WKDownloadDelegate {
                 return
             }
         }
+        if let destination = item.destination { Self.markQuarantined(destination, source: item.url) }
         item.fraction = 1
         item.finishedAt = Date()
         // The file on disk is the truth; fall back to what the progress counted.

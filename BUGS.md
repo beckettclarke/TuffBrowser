@@ -1,7 +1,8 @@
 # Known bugs
 
-Last updated 2026-11-12. Everything found in the extension / keyboard / focus sweep is fixed (not
-committed yet). Two things are left over.
+Last updated 2026-11-17. Everything found in the extension / keyboard / focus sweep and the
+2026-11-16 security / bug audit is fixed (not committed yet). Two things are left over. Missing
+features from the audit are in TODOS.md (section K).
 
 ## Left over
 
@@ -46,6 +47,24 @@ committed yet). Two things are left over.
 | Find bar, command bar, prompt and permission cards used `.shadow` over a blurred backdrop. | `CardShadow(hollow:)` |
 | "index.html" / "node.js" opened as websites; IPv6 addresses were searched. | `BrowserState.resolve` |
 | "Closing" an unloaded pinned tab kept its old history (it woke on the page it had left), and extensions weren't told. | `Tab.sleep(resetToHome:)` |
+| Any page could launch other apps (`zoommtg:`, `vscode:`, `x-apple.systempreferences:`…) without asking, even from a redirect. A card now asks ("Always allow" per site and app); typed addresses and clicked mail / phone links still open straight away. | `Web/ExternalAppLinks.swift` |
+| Websites could reach `tuff://` pages: send a tab or pop-up to `tuff://source` (a fetch with all the tab's cookies, past SameSite), or load `tuff://favicon` as an image to probe History. Only Tuff opens them now, and only Tuff's pages load from them. | `Tab+Web` (`mayOpenInternalPage`), `InternalPageHandler` |
+| Incognito leaked to extensions: `history.onTitleChanged` for Incognito pages, Incognito downloads in `downloads.*` and its events, `sessions.onChanged`. | `Tab.observe`, `DownloadManager.track`, `BrowserState` |
+| Incognito downloads showed in the normal window's downloads list (and stayed after the Incognito window closed). Each kind of window lists its own; Incognito's leave with the last Incognito window. | `DownloadManager` (`items(isPrivate:)`, `forgetPrivateItems`) |
+| Search suggestions used `URLSession.shared`, whose cookie jar sat outside every profile (never cleared, shared with Incognito). | `CommandBarView.suggestionSession` |
+| An unreadable `session.json` started a fresh session and the next save overwrote it, losing every space, pinned tab, folder and favourite. It is kept aside and the copy from the last good launch is used. | `BrowserState.readSession` |
+| Session saves encoded every tab's history on the main thread. Encoding and writing now happen on a background queue. | `BrowserState.saveNow` |
+| Error pages (offline, can't find host, bad certificate) were recorded in History: typos became command-bar completions and real pages got titles like "You're offline". | `Tab.showErrorPage`, `showingErrorPage` |
+| Favicons were cached per host, so Google Docs, Sheets and Slides (all docs.google.com) showed one icon. Icons are cached by their own address now. | `FaviconStore` |
+| Quitting during a download dropped it with no warning and no way to resume. The quit card warns, and downloads pause with resume data for next time. | `AppDelegate.pauseDownloadsThenQuit`, `DownloadManager.pauseAllForQuit` |
+| A tab opened on a download link kept the file's address, so waking it or relaunching downloaded the file again. It goes back to its page, or closes if it was opened just for the download. | `Tab.mainFrameBecameDownload` |
+| Tab sleeping and closing idle tabs ignored calls with the sound off (camera / mic in use), waiting dialogs, and text typed into a form. | `Tab.isBusy`, `Tab.checkUnsavedInput` |
+| Middle-click close relied on SwiftUI hover, which doesn't update when rows slide under a still pointer, so closing several tabs in a row missed. Now hit-tested against each row's real frame; favourites tiles take middle clicks too. | `onMiddleClick` (`MiddleClickRouter`) |
+| Chrome / Firefox user agents were fixed at versions a year old. They now count up with the browsers' four-weekly releases. | `AdvancedSettings.currentMajorVersion` |
+| Zoom went in ×1.1 steps (odd percentages that drifted); ⌘+ didn't work where + is its own key. Standard steps now, and ⌘+ zooms in. | `Tab.zoomStep`, `MainMenu` |
+| Duplicate Tab copied only the address, losing back / forward history and the tab's name. | `BrowserState.duplicate` |
+| Finished downloads are given Gatekeeper's quarantine flag if WebKit didn't set one (it does today; this is a fallback). | `DownloadManager.markQuarantined` |
 
 New debug-script commands (debug builds only): `press [cmd+][shift+][opt+][ctrl+]<key|tab>` sends
-a real key event, and `responder` logs what has keyboard focus.
+a real key event, and `responder` logs what has keyboard focus. `move x y` and `middleclick x y` post
+pointer events through the event queue (window points, origin bottom-left).

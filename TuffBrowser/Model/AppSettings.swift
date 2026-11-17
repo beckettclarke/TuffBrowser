@@ -257,8 +257,25 @@ struct AdvancedSettings: Codable, Equatable {
     var linkPreviews = true
     var webInspector = true
 
-    static let chromeUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36"
-    static let firefoxUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:144.0) Gecko/20100101 Firefox/144.0"
+    static var chromeUserAgent: String {
+        let major = currentMajorVersion(known: 142, releasedOn: (2025, 10, 28))
+        return "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/\(major).0.0.0 Safari/537.36"
+    }
+
+    static var firefoxUserAgent: String {
+        let major = currentMajorVersion(known: 144, releasedOn: (2025, 10, 14))
+        return "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:\(major).0) Gecko/20100101 Firefox/\(major).0"
+    }
+
+    /// Chrome and Firefox ship a new major version every four weeks. Counting on from a known
+    /// release keeps the user agents current; a fixed version a year old gets "please update
+    /// your browser" banners and old-browser fallbacks from sites.
+    static func currentMajorVersion(known: Int, releasedOn date: (year: Int, month: Int, day: Int), now: Date = Date()) -> Int {
+        let calendar = Calendar(identifier: .gregorian)
+        guard let released = calendar.date(from: DateComponents(year: date.year, month: date.month, day: date.day)),
+              let days = calendar.dateComponents([.day], from: released, to: now).day, days > 0 else { return known }
+        return known + days / 28
+    }
 
     /// nil = WebKit's own (Safari) user agent.
     var resolvedUserAgent: String? {

@@ -399,6 +399,8 @@ struct FavoriteTile: View {
         }
         .buttonStyle(SquishButtonStyle(scale: 0.94))
         .onHover { hovering = $0 }
+        // As with the rows: unloads the favourite (its "Unload Tab").
+        .onMiddleClick { state.close(tab) }
         .animation(Motion.quick, value: hovering)
         .animation(Motion.snappy, value: selected)
         .animation(Motion.quick, value: tab.favicon)
@@ -1739,23 +1741,24 @@ struct DownloadsButton: View {
     @State private var bounce = false
 
     var body: some View {
-        let active = downloads.activeCount > 0
+        let active = downloads.activeCount(isPrivate: state.isPrivate) > 0
+        let fraction = downloads.overallFraction(isPrivate: state.isPrivate)
         ZStack {
             IconButton(symbol: "arrow.down.to.line", size: 13, weight: .semibold, help: "Downloads") {
                 state.downloadsVisible.toggle()
             }
             if active {
                 Circle()
-                    .trim(from: 0, to: max(0.04, downloads.overallFraction))
+                    .trim(from: 0, to: max(0.04, fraction))
                     .stroke(accent, style: StrokeStyle(lineWidth: 2, lineCap: .round))
                     .rotationEffect(.degrees(-90))
                     .frame(width: 24, height: 24)
-                    .animation(.easeOut(duration: 0.3), value: downloads.overallFraction)
+                    .animation(.easeOut(duration: 0.3), value: fraction)
                     .allowsHitTesting(false)
             }
         }
         .scaleEffect(bounce ? 1.22 : 1)
-        .onChange(of: downloads.pulse) { _, _ in
+        .onChange(of: downloads.pulse(isPrivate: state.isPrivate)) { _, _ in
             withAnimation(.spring(response: 0.22, dampingFraction: 0.45)) { bounce = true }
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
                 withAnimation(.spring(response: 0.3, dampingFraction: 0.6)) { bounce = false }
@@ -1765,22 +1768,25 @@ struct DownloadsButton: View {
 }
 
 struct DownloadsPopover: View {
+    @Environment(BrowserState.self) private var state
     @Environment(DownloadManager.self) private var downloads
     @State private var listHeight: CGFloat = 0
 
     var body: some View {
+        // A normal window lists its own downloads; an Incognito window only Incognito ones.
+        let items = downloads.items(isPrivate: state.isPrivate)
         VStack(alignment: .leading, spacing: 0) {
             HStack {
                 Text("Downloads").font(.system(size: 13, weight: .semibold))
-                if downloads.activeCount > 0, let speed = downloads.totalBytesPerSecond {
+                if downloads.activeCount(isPrivate: state.isPrivate) > 0, let speed = downloads.totalBytesPerSecond(isPrivate: state.isPrivate) {
                     Text(DownloadStats.speed(speed))
                         .font(.system(size: 11).monospacedDigit())
                         .foregroundStyle(.secondary)
                         .contentTransition(.numericText())
                 }
                 Spacer()
-                if downloads.items.contains(where: { $0.state != .running }) {
-                    Button("Clear") { withAnimation(Motion.snappy) { downloads.clearFinished() } }
+                if items.contains(where: { $0.state != .running }) {
+                    Button("Clear") { withAnimation(Motion.snappy) { downloads.clearFinished(isPrivate: state.isPrivate) } }
                         .buttonStyle(.plain)
                         .font(.system(size: 12, weight: .medium))
                         .foregroundStyle(.secondary)
@@ -1791,7 +1797,7 @@ struct DownloadsPopover: View {
 
             Divider()
 
-            if downloads.items.isEmpty {
+            if items.isEmpty {
                 Text("Nothing downloaded yet")
                     .font(.system(size: 12))
                     .foregroundStyle(.secondary)
@@ -1800,7 +1806,7 @@ struct DownloadsPopover: View {
             } else {
                 ScrollView {
                     VStack(spacing: 2) {
-                        ForEach(downloads.items) { item in
+                        ForEach(items) { item in
                             DownloadRow(item: item)
                         }
                     }

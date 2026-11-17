@@ -86,6 +86,36 @@ extension DownloadManager {
         try? data.write(to: Self.file, options: .atomic)
     }
 
+    /// Stops every running download for quitting, keeping what WebKit hands back so each can
+    /// carry on from where it was next time (Retry in the list). Calls back once all have
+    /// stopped, or after a few seconds whatever happens.
+    func pauseAllForQuit(then done: @escaping () -> Void) {
+        let running = items.filter { $0.state == .running && $0.download != nil }
+        guard !running.isEmpty else { done(); return }
+        var called = false
+        let finish = {
+            guard !called else { return }
+            called = true
+            done()
+        }
+        let group = DispatchGroup()
+        for item in running {
+            guard let download = item.download else { continue }
+            group.enter()
+            item.download = nil
+            item.observation = nil
+            download.cancel { data in
+                DispatchQueue.main.async {
+                    item.resumeData = data
+                    item.state = .failed("Paused when Tuff quit")
+                    group.leave()
+                }
+            }
+        }
+        group.notify(queue: .main, execute: finish)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3, execute: finish)
+    }
+
     // MARK: Retry / resume
 
     /// Starts a stopped or failed download again: from where it stopped if WebKit kept resume
@@ -112,7 +142,7 @@ extension DownloadManager {
                 self.attach(download, to: item)
             }
         }
-        pulse += 1
+        bumpPulse(isPrivate: item.isPrivate)
     }
 
     /// Whether Retry can do anything for this item.

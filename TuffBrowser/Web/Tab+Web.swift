@@ -27,11 +27,20 @@ extension Tab: WKNavigationDelegate {
             return
         }
 
-        // Hand non-web schemes (mailto:, facetime:, zoommtg:, …) to the system.
+        // Hand non-web schemes (mailto:, facetime:, zoommtg:, …) to the system, asking first
+        // when a page rather than the user is behind it (`openInOtherApp`).
         if let scheme = url.scheme?.lowercased(), !Self.webSchemes.contains(scheme) {
             if navigationAction.targetFrame?.isMainFrame ?? true {
-                NSWorkspace.shared.open(url)
+                openInOtherApp(url, action: navigationAction)
             }
+            decisionHandler(.cancel, preferences)
+            return
+        }
+
+        // Tuff's own pages open only from Tuff (menus, the command bar, Back / Forward). A
+        // website can't send a tab, a pop-up or a frame to one: `tuff://source` fetches with the
+        // tab's cookies, which a page must not be able to trigger.
+        if InternalPage.isInternal(url), !mayOpenInternalPage(url, action: navigationAction) {
             decisionHandler(.cancel, preferences)
             return
         }
@@ -89,6 +98,20 @@ extension Tab: WKNavigationDelegate {
         decisionHandler(.download)
     }
 
+    /// Whether a navigation to a `tuff://` page comes from Tuff rather than from a website:
+    /// a load Tuff started (`Tab.start`), Back / Forward through the tab's own history, or one
+    /// of Tuff's pages moving to another.
+    private func mayOpenInternalPage(_ url: URL, action: WKNavigationAction) -> Bool {
+        guard action.targetFrame?.isMainFrame ?? false else { return false }
+        if let expected = internalPageLoad, expected == url {
+            internalPageLoad = nil
+            return true
+        }
+        if action.navigationType == .backForward { return true }
+        let source: WKFrameInfo? = action.sourceFrame
+        return source?.securityOrigin.protocol.lowercased() == InternalPage.scheme
+    }
+
     /// WebKit occasionally reports `canShowMIMEType == false` for ordinary pages (seen on a
     /// first visit to youtube.com, whose redirect and service worker hit an edge case), which
     /// turned the page into a downloaded `.html` file and left the tab blank. Never download
@@ -104,11 +127,34 @@ extension Tab: WKNavigationDelegate {
 
     func webView(_ webView: WKWebView, navigationAction: WKNavigationAction, didBecome download: WKDownload) {
         DownloadManager.shared.track(download, isPrivate: browser?.isPrivate ?? false)
+        if navigationAction.targetFrame?.isMainFrame ?? true { mainFrameBecameDownload(in: webView) }
     }
 
     func webView(_ webView: WKWebView, navigationResponse: WKNavigationResponse, didBecome download: WKDownload) {
         if adoptPDFDownload(download) { return }
         DownloadManager.shared.track(download, isPrivate: browser?.isPrivate ?? false)
+        if navigationResponse.isForMainFrame { mainFrameBecameDownload(in: webView) }
+    }
+
+    /// The address the tab was going to turned out to be a file to download. The tab goes
+    /// back to saying the page it is still on; one that was opened just for the download (a
+    /// link to a file in a new tab) closes, as in Chrome. Before, the tab kept the file's
+    /// address, so waking it or relaunching Tuff downloaded the file again.
+    private func mainFrameBecameDownload(in webView: WKWebView) {
+        pendingURL = nil
+        // After WebKit has finished with the navigation that turned into the download.
+        DispatchQueue.main.async { [weak self, weak webView] in
+            guard let self, let webView, self.webView === webView, !self.pdfHoldsAddress else { return }
+            if let page = webView.backForwardList.currentItem?.url {
+                guard page != self.url else { return }
+                self.url = page
+                self.browser?.tabDidChange(self, properties: .URL)
+            } else if let browser = self.browser, browser.section(of: self) == .tabs {
+                // Without an address it isn't kept for Reopen Closed Tab, which would download again.
+                self.url = nil
+                browser.close(self, force: true)
+            }
+        }
     }
 
     /// WebKit's (private) callback for a download started from the page's context menu
@@ -141,11 +187,20 @@ extension Tab: WKNavigationDelegate {
         if let request = permissionRequest, webView.url?.host(percentEncoded: false) != request.host {
             withAnimation(Motion.snappy) { resolvePermission(granted: nil) }
         }
+        showingErrorPage = errorPageURL != nil && webView.url == errorPageURL
+        errorPageURL = nil
         if let u = webView.url {
+            // Moving within a site keeps the icon on show until the page's own is found: the
+            // site's cached one can belong to another of its pages (Docs vs Sheets on
+            // docs.google.com).
+            // (`url` has already moved on when the navigation started, so the icon's own host says.)
+            let host = u.host(percentEncoded: false)?.lowercased()
+            let sameSite = favicon != nil && host != nil && faviconHost == host
             url = u
             applySiteZoom()
             favicon = InternalPage.icon(for: u) ?? ExtensionManager.shared.icon(forPage: u)
-                ?? FaviconStore.shared.cachedIcon(for: u) ?? favicon
+                ?? (sameSite ? favicon : nil) ?? FaviconStore.shared.cachedIcon(for: u) ?? favicon
+            faviconHost = host
             pdfDidCommit(u)
         }
         browser?.tabDidNavigate(self)
@@ -159,6 +214,12 @@ extension Tab: WKNavigationDelegate {
         }
         // Incognito leaves no history and no favicons on disk.
         let incognito = browser?.isPrivate ?? false
+        // An error page isn't a visit: recording it put typos in History (and in the command
+        // bar's completions) and gave pages titles like "You’re offline".
+        if showingErrorPage {
+            refreshHeaderColor()
+            return
+        }
         if !incognito { HistoryStore.shared.record(url: u, title: webView.title ?? "") }
         // A PDF's placeholder page has no header or icon of its own to find.
         if let pdf {
@@ -175,6 +236,7 @@ extension Tab: WKNavigationDelegate {
         FaviconStore.shared.fetchIcon(from: webView, persist: !incognito) { [weak self] image in
             guard let self, let image else { return }
             self.favicon = image
+            self.faviconHost = u.host(percentEncoded: false)?.lowercased()
         }
         browser?.scheduleSave()
     }
@@ -212,10 +274,16 @@ extension Tab: WKNavigationDelegate {
         // An untrusted certificate gets its own page, which can show it and let you through.
         if let failure = CertificateFailure(error: ns, url: failingURL) {
             certificateFailure = failure
-            webView.loadSimulatedRequest(URLRequest(url: failingURL), responseHTML: WebEngine.certificateErrorPage(for: failure))
+            showErrorPage(WebEngine.certificateErrorPage(for: failure), at: failingURL, in: webView)
             return
         }
-        webView.loadSimulatedRequest(URLRequest(url: failingURL), responseHTML: WebEngine.errorPage(for: error, url: failingURL))
+        showErrorPage(WebEngine.errorPage(for: error, url: failingURL), at: failingURL, in: webView)
+    }
+
+    /// Puts one of Tuff's error pages up at the address that failed (`showingErrorPage`).
+    func showErrorPage(_ html: String, at url: URL, in webView: WKWebView) {
+        errorPageURL = url
+        webView.loadSimulatedRequest(URLRequest(url: url), responseHTML: html)
     }
 
     /// The content process went away (memory pressure, or the page crashed it). A tab on screen
@@ -231,7 +299,7 @@ extension Tab: WKNavigationDelegate {
                 NSLocalizedDescriptionKey: "This page stopped working several times in a row, so Tuff stopped reloading it.",
             ])
             if let url = url ?? webView.url {
-                webView.loadSimulatedRequest(URLRequest(url: url), responseHTML: WebEngine.errorPage(for: error, url: url))
+                showErrorPage(WebEngine.errorPage(for: error, url: url), at: url, in: webView)
             }
             return
         }
