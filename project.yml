@@ -48,10 +48,24 @@ targets:
           - CFBundleURLName: Web site URL
             CFBundleTypeRole: Viewer
             CFBundleURLSchemes: [http, https]
+          - CFBundleURLName: BitTorrent magnet link
+            CFBundleTypeRole: Viewer
+            CFBundleURLSchemes: [magnet]
         CFBundleDocumentTypes:
           - CFBundleTypeName: HTML document
             CFBundleTypeRole: Viewer
             LSItemContentTypes: [public.html, public.xhtml]
+          - CFBundleTypeName: BitTorrent file
+            CFBundleTypeRole: Viewer
+            LSHandlerRank: Alternate
+            LSItemContentTypes: [org.bittorrent.torrent]
+        UTImportedTypeDeclarations:
+          - UTTypeIdentifier: org.bittorrent.torrent
+            UTTypeDescription: BitTorrent file
+            UTTypeConformsTo: [public.data]
+            UTTypeTagSpecification:
+              public.filename-extension: [torrent]
+              public.mime-type: [application/x-bittorrent]
     entitlements:
       path: TuffBrowser/Resources/TuffBrowser.entitlements
       properties:

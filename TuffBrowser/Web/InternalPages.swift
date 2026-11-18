@@ -8,6 +8,8 @@ import WebKit
 /// app goes through the `tuff` message handler, which answers only these pages' main frames.
 enum InternalPage: String, CaseIterable {
     case history
+    /// `tuff://downloads`: web downloads and torrents (see `DownloadsPage`).
+    case downloads
     /// `tuff://source?url=…`: a page's HTML as the server sent it (View → View Source).
     case source
 
@@ -18,6 +20,7 @@ enum InternalPage: String, CaseIterable {
     var title: String {
         switch self {
         case .history: "History"
+        case .downloads: "Downloads"
         case .source: "Page Source"
         }
     }
@@ -25,6 +28,7 @@ enum InternalPage: String, CaseIterable {
     var symbol: String {
         switch self {
         case .history: "clock.arrow.circlepath"
+        case .downloads: "arrow.down.circle"
         case .source: "chevron.left.forwardslash.chevron.right"
         }
     }
@@ -97,6 +101,8 @@ final class InternalPageHandler: NSObject, WKURLSchemeHandler, WKScriptMessageHa
         switch InternalPage(url: url) {
         case .history:
             respond(urlSchemeTask, url: url, mime: "text/html", data: Data(HistoryPage.html().utf8))
+        case .downloads:
+            respond(urlSchemeTask, url: url, mime: "text/html", data: Data(DownloadsWebPage.html().utf8))
         case .source:
             serveSource(for: url, in: webView, to: urlSchemeTask)
         case nil:
@@ -224,6 +230,11 @@ final class InternalPageHandler: NSObject, WKURLSchemeHandler, WKScriptMessageHa
                 if confirmed { action() }
                 replyHandler(confirmed, nil)
             }
+        }
+
+        if command.hasPrefix("dl.") {
+            DownloadsWebPage.handle(command, body, browser: browser, reply: replyHandler)
+            return
         }
 
         switch command {

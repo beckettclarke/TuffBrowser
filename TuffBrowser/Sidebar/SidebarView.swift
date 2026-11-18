@@ -1833,6 +1833,14 @@ struct DownloadsPopover: View {
                         .font(.system(size: 12, weight: .medium))
                         .foregroundStyle(.secondary)
                 }
+                // The full page: torrents, details, settings.
+                Button("Show All") {
+                    state.downloadsVisible = false
+                    state.showDownloadsPage()
+                }
+                .buttonStyle(.plain)
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(.secondary)
             }
             .padding(.horizontal, 14)
             .padding(.vertical, 12)

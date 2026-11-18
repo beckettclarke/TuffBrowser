@@ -312,6 +312,8 @@ extension AppDelegate: NSApplicationDelegate {
         _ = HistoryStore.shared
         // Puts the compiled ad-blocking lists on (or builds them) before the first page loads.
         ContentBlocker.shared.start()
+        // Puts back saved torrents; the client stays off the network if there are none.
+        TorrentBridge.setUp()
         showMainWindow()
         #if DEBUG
         DebugHooks.runIfRequested()
@@ -325,7 +327,8 @@ extension AppDelegate: NSApplicationDelegate {
             NSWorkspace.shared.open(urls, withApplicationAt: app, configuration: NSWorkspace.OpenConfiguration()) { _, _ in exit(0) }
             return
         }
-        for url in urls { mainState.newTab(url: url) }
+        // Magnet links and .torrent files go to the torrent client's add sheet.
+        for url in urls where !TorrentBridge.open(url) { mainState.newTab(url: url) }
         if windowController != nil { showMainWindow() }
     }
 
@@ -413,6 +416,7 @@ extension AppDelegate: NSApplicationDelegate {
             HistoryStore.shared.saveNow(synchronously: true)
         }
         DownloadManager.shared.saveNow(quitting: true)
+        TorrentSession.shared.shutdown()
     }
 
     func applicationSupportsSecureRestorableState(_ app: NSApplication) -> Bool { true }

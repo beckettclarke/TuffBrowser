@@ -85,11 +85,10 @@ extension AppDelegate {
         state.newTab(url: source, after: tab)
     }
 
-    /// ⌥⌘L: shows or hides the downloads list, bringing the sidebar out if its button is hidden.
+    /// ⌥⌘L: opens the downloads page (web downloads and torrents) in a tab.
     @objc func showDownloads(_ sender: Any?) {
-        let state = self.state
-        if !state.downloadsButtonShowing { state.toggleSidebar() }
-        state.downloadsVisible.toggle()
+        state.downloadsVisible = false
+        state.showDownloadsPage()
     }
 
     /// Edit → Paste and Go: opens what's on the clipboard in the current tab.

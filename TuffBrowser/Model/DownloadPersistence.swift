@@ -15,6 +15,8 @@ extension DownloadManager {
         var startedAt: Date
         var finishedAt: Date?
         var resumeData: Data?
+        /// The multi-connection engine's ranges, to carry on after a relaunch.
+        var transfer: HTTPTransfer.State?
     }
 
     private static let file = Paths.appSupport.appendingPathComponent("downloads.json")
@@ -40,6 +42,7 @@ extension DownloadManager {
             item.startedAt = entry.startedAt
             item.finishedAt = entry.finishedAt
             item.resumeData = entry.resumeData
+            item.transferState = entry.transfer
             item.chromeID = reserveChromeID()
             if entry.finished {
                 let exists = entry.destination.map { FileManager.default.fileExists(atPath: $0.path) } ?? false
@@ -66,11 +69,12 @@ extension DownloadManager {
         let list: [Saved] = items.filter { !$0.isPrivate }.prefix(Self.saveLimit).compactMap { item in
             switch item.state {
             case .running:
-                guard quitting else { return nil }
+                // The engine's ranges are worth keeping at any time: a crash can resume from them.
+                guard quitting || item.transfer != nil else { return nil }
                 return Saved(
                     filename: item.filename, destination: item.destination, url: item.url, finished: false,
-                    reason: "Stopped when Tuff quit", bytesReceived: item.bytesReceived, totalBytes: item.totalBytes,
-                    startedAt: item.startedAt, finishedAt: nil, resumeData: nil
+                    reason: "Paused when Tuff quit", bytesReceived: item.bytesReceived, totalBytes: item.totalBytes,
+                    startedAt: item.startedAt, finishedAt: nil, resumeData: nil, transfer: item.transfer?.snapshot() ?? item.transferState
                 )
             case .finished, .failed:
                 var reason: String?
@@ -78,7 +82,8 @@ extension DownloadManager {
                 return Saved(
                     filename: item.filename, destination: item.destination, url: item.url, finished: item.state == .finished,
                     reason: reason, bytesReceived: item.bytesReceived, totalBytes: item.totalBytes,
-                    startedAt: item.startedAt, finishedAt: item.finishedAt, resumeData: item.resumeData
+                    startedAt: item.startedAt, finishedAt: item.finishedAt, resumeData: item.resumeData,
+                    transfer: item.state == .finished ? nil : item.transferState
                 )
             }
         }
@@ -90,6 +95,11 @@ extension DownloadManager {
     /// carry on from where it was next time (Retry in the list). Calls back once all have
     /// stopped, or after a few seconds whatever happens.
     func pauseAllForQuit(then done: @escaping () -> Void) {
+        // The engine's downloads stop at once, keeping their ranges.
+        for item in items where item.transfer != nil {
+            pause(item)
+            item.state = .failed("Paused when Tuff quit")
+        }
         let running = items.filter { $0.state == .running && $0.download != nil }
         guard !running.isEmpty else { done(); return }
         var called = false
@@ -122,6 +132,7 @@ extension DownloadManager {
     /// data, else from the start (with the website data it was first made with).
     func retry(_ item: DownloadItem) {
         guard item.state != .running else { return }
+        if resumeTransfer(item) { bumpPulse(isPrivate: item.isPrivate); return }
         let store = item.dataStore ?? (item.isPrivate ? nil : BrowserState.shared.currentProfile.dataStore) ?? DataStores.website
         let view = Self.helperWebView(for: store)
         if let data = item.resumeData {
@@ -148,7 +159,7 @@ extension DownloadManager {
     /// Whether Retry can do anything for this item.
     func canRetry(_ item: DownloadItem) -> Bool {
         guard case .failed = item.state else { return false }
-        return item.resumeData != nil || item.url.map { ["http", "https"].contains($0.scheme?.lowercased() ?? "") } == true
+        return item.resumeData != nil || item.transferState != nil || item.url.map { ["http", "https"].contains($0.scheme?.lowercased() ?? "") } == true
     }
 
     /// Hidden web views that start retried downloads, one per website data store.
@@ -167,6 +178,11 @@ extension DownloadManager {
     /// Deletes the part-downloaded file a stopped download left behind for Resume (the list
     /// entry is being cleared, so nothing will resume it).
     static func discardIncompleteFile(_ item: DownloadItem) {
+        if case .failed = item.state, let part = item.transferState?.partPath {
+            try? FileManager.default.removeItem(atPath: part)
+            item.transferState = nil
+            return
+        }
         guard case .failed = item.state, item.resumeData != nil else { return }
         if let partial = item.partialFile {
             try? FileManager.default.removeItem(at: partial)

@@ -50,3 +50,20 @@
   loads no profile (`App/main.swift`), so tests must not rely on `AppDelegate.shared`.
 - Debug builds can be scripted with `TUFF_DEBUG_SCRIPT` (see `TuffBrowser/Support/DebugHooks.swift`),
   e.g. `snap` / `snapall` for screenshots and `prompt yes|no` to answer an on-screen card.
+
+## Downloads and torrents
+
+- `tuff://downloads` (⌥⌘L) is an HTML page like History: `Downloads/DownloadsPageTemplate.swift`
+  draws it from `dl.state` once a second; `Downloads/DownloadsPage.swift` (`DownloadsWebPage`) answers
+  its `dl.*` messages. Confirmations there use `Prompt`, file pickers use NSOpenPanel / NSSavePanel.
+- Web downloads: WebKit starts them; big GETs from servers that take ranges are handed to
+  `HTTPTransfer` (several connections, dynamic range splitting, pause/resume across relaunches) in
+  `DownloadManager.takeOver` (`Downloads/TurboDownloads.swift`). Partial files end in `.tuffpart`.
+- Torrents: `Downloads/Engine/` is a self-contained BitTorrent client (Foundation, Network and
+  CryptoKit only): v1/v2/hybrid, µTP + TCP, MSE, DHT (v4/v6), PEX, LSD, UPnP/NAT-PMP/PCP, web seeds.
+  Everything runs on `engineQueue`; disk work on `DiskIO`. Seeding is off by default
+  (`TorrentSettings.seedAfterDownload`). `TorrentBridge` ties it to the app (launch, magnets,
+  .torrent files, the add sheet).
+- The engine builds on its own for quick experiments, without the app:
+  `swiftc -O -swift-version 5 -target arm64-apple-macos15.4 TuffBrowser/Downloads/Engine/*.swift main.swift`.
+  `TorrentTests` covers encoding, v2 merkle checks, the creator, MSE and the IP filter.

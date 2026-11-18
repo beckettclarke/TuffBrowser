@@ -27,6 +27,13 @@ extension Tab: WKNavigationDelegate {
             return
         }
 
+        // Magnet links open Tuff's own torrent client (its add sheet asks before anything starts).
+        if url.scheme?.lowercased() == "magnet" {
+            decisionHandler(.cancel, preferences)
+            DispatchQueue.main.async { TorrentBridge.offer(magnet: url) }
+            return
+        }
+
         // Hand non-web schemes (mailto:, facetime:, zoommtg:, …) to the system, asking first
         // when a page rather than the user is behind it (`openInOtherApp`).
         if let scheme = url.scheme?.lowercased(), !Self.webSchemes.contains(scheme) {

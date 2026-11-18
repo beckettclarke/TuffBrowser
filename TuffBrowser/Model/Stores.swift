@@ -649,6 +649,12 @@ final class DownloadItem: Identifiable {
     @ObservationIgnored var lastSampleTime: Date?
     @ObservationIgnored var download: WKDownload?
     @ObservationIgnored var observation: NSKeyValueObservation?
+    /// The multi-connection engine while it runs (`TurboDownloads`), and what it needs to
+    /// carry on after a pause, a failure or a relaunch.
+    @ObservationIgnored var transfer: HTTPTransfer?
+    @ObservationIgnored var transferState: HTTPTransfer.State?
+    /// Connections the engine has open right now.
+    var connections = 0
 
     init(filename: String) { self.filename = filename }
 }
@@ -723,6 +729,8 @@ final class DownloadManager: NSObject {
 
     /// Samples every running download once a second. Runs only while something is downloading.
     @ObservationIgnored private var speedTimer: Timer?
+
+    func startSpeedSamplingIfNeeded() { startSpeedSampling() }
 
     private func startSpeedSampling() {
         guard speedTimer == nil else { return }
@@ -836,6 +844,11 @@ final class DownloadManager: NSObject {
 
     /// Stops a download, keeping what has arrived when the server allows it, so Resume can carry on.
     func cancel(_ item: DownloadItem) {
+        if item.transfer != nil || item.isQueued {
+            pause(item)
+            item.state = .failed("Cancelled")
+            return
+        }
         let download = item.download
         item.state = .failed("Cancelled")
         item.download = nil
@@ -935,6 +948,11 @@ extension DownloadManager: WKDownloadDelegate {
             item?.destination = url
             // Time spent in the save panel isn't download time.
             item?.startedAt = Date()
+            // Big files from servers that take ranges go to the multi-connection engine instead.
+            if let item, self.takeOver(download, item: item, response: response, destination: url) {
+                completionHandler(nil)
+                return
+            }
             // Replacing a file (the save panel asked first): WebKit won't overwrite one, so the
             // download goes to a temporary name beside it and replaces it only once it has
             // finished. A download that fails or is cancelled leaves the old file as it was.
@@ -1017,6 +1035,7 @@ extension DownloadManager: WKDownloadDelegate {
            Self.safeExtensions.contains(url.pathExtension.lowercased()) {
             NSWorkspace.shared.open(url)
         }
+        fileDidFinish(item)
     }
 
     func download(_ download: WKDownload, didFailWithError error: Error, resumeData: Data?) {

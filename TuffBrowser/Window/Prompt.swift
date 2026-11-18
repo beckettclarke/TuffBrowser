@@ -39,6 +39,9 @@ struct Prompt: Identifiable {
     var confirmTitle: String
     /// nil for a notice with a single button.
     var cancelTitle: String? = "Cancel"
+    /// A second way to say yes, beside the main button (e.g. "Use Transmission" next to "Use
+    /// Tuff"); `PromptResult.alternate` says it was picked.
+    var alternateTitle: String?
     var destructive = false
     /// Edited in place while the card is up; `PromptResult.fields` has what was typed.
     var fields: [Field] = []
@@ -57,6 +60,8 @@ struct Prompt: Identifiable {
 
 struct PromptResult {
     var confirmed: Bool
+    /// The prompt's `alternateTitle` button was picked (then `confirmed` is false).
+    var alternate = false
     /// The text of each of the prompt's `fields`, in order.
     var fields: [String]
     var checked: Bool
@@ -87,13 +92,14 @@ enum PromptPresenter {
         }
     }
 
-    static func resolve(_ confirmed: Bool) {
+    static func resolve(_ confirmed: Bool, alternate: Bool = false) {
         guard let (_, continuation) = current else { return }
         current = nil
         let state = currentState
         let live = state.prompt
         let result = PromptResult(
             confirmed: confirmed,
+            alternate: alternate,
             fields: live?.fields.map(\.text) ?? [],
             checked: live?.checked ?? false
         )
@@ -278,6 +284,10 @@ struct PromptCard: View {
                         .opacity(0)
                         .frame(width: 0, height: 0)
                         .accessibilityHidden(true)
+                }
+                if let alternate = prompt.alternateTitle {
+                    Button(alternate) { PromptPresenter.resolve(false, alternate: true) }
+                        .buttonStyle(PromptButtonStyle(fill: .primary.opacity(0.1), text: .primary))
                 }
                 Button { PromptPresenter.resolve(true) } label: {
                     HStack(spacing: 8) {
