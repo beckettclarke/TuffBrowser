@@ -31,6 +31,7 @@ final class MSETransport: PeerTransport {
     private var padLength = 0
     private var provide: UInt32 = 0
     private var iaLength = 0
+    private var initialPayload = Data()
 
     /// `infoHash` for outgoing connections; `lookup` (req2 hash → info hash) for incoming ones.
     init(_ inner: PeerTransport, infoHash: Data?, lookup: ((Data) -> Data?)?, allowPlain: Bool, preferPlain: Bool = false) {
@@ -60,7 +61,10 @@ final class MSETransport: PeerTransport {
     }
 
     func send(_ data: Data) {
-        guard stage == .done else { return }
+        guard stage == .done else {
+            if outgoing, initialPayload.count + data.count <= 68 * 2 { initialPayload.append(data) }
+            return
+        }
         inner.send(encryptor.map { $0.process(data) } ?? data)
     }
 
@@ -124,8 +128,12 @@ final class MSETransport: PeerTransport {
             var payload = Data(count: 8)
             payload.put32(preferPlain && allowPlain ? 0x01 : (allowPlain ? 0x03 : 0x02))
             payload.put16(0)
-            payload.put16(0)
+            payload.put16(UInt16(initialPayload.count))
             step3.append(encryptor!.process(payload))
+            if !initialPayload.isEmpty {
+                step3.append(encryptor!.process(initialPayload))
+                initialPayload = Data()
+            }
             inner.send(step3)
             expectedVC = decryptor!.process(Data(count: 8))
             stage = .findVC
@@ -203,14 +211,14 @@ final class MSETransport: PeerTransport {
             reply.put32(select)
             reply.put16(0)
             inner.send(encryptor!.process(reply))
-            finish(rest: ia + (select == 2 ? decryptor!.process(buffer) : buffer))
+            finish(initial: ia, rest: buffer)
             return false
         case .plainIncoming, .done:
             return false
         }
     }
 
-    private func finish(rest: Data) {
+    private func finish(initial: Data = Data(), rest: Data) {
         stage = .done
         encrypted = select == 2
         if !encrypted { encryptor = nil; decryptor = nil }
@@ -218,7 +226,8 @@ final class MSETransport: PeerTransport {
         let connect = onConnect
         onConnect = nil
         connect?()
-        let incomingData = outgoing && encrypted ? decryptor!.process(rest) : rest
+        var incomingData = initial
+        if let decryptor { incomingData += decryptor.process(rest) } else { incomingData += rest }
         if !incomingData.isEmpty { onData?(incomingData) }
     }
 }

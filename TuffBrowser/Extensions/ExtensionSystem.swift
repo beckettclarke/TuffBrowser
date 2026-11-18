@@ -4,8 +4,7 @@ import IOKit.pwr_mgt
 
 /// Native `chrome.system.*`, `chrome.power` and `chrome.idle` for extensions — read-only system
 /// information, keep-awake power assertions, and the user's idle state. Routed here by
-/// `ExtensionAPIBridge`. `idle.onStateChanged` / `setDetectionInterval` need the event-push mechanism
-/// and are inert for now; `queryState` works.
+/// `ExtensionAPIBridge`. `idle.onStateChanged` and detection intervals use the event-push relay.
 final class ExtensionSystem {
     static let shared = ExtensionSystem()
 
@@ -84,6 +83,12 @@ final class ExtensionSystem {
         if let assertion = assertions.removeValue(forKey: extensionID) {
             IOPMAssertionRelease(assertion)
         }
+    }
+
+    func hasKeepAwakeAssertion(extensionID: String) -> Bool { assertions[extensionID] != nil }
+
+    func extensionUnloaded(_ extensionID: String) {
+        releaseKeepAwake(extensionID: extensionID)
     }
 
     // MARK: idle

@@ -79,6 +79,9 @@ final class Torrent {
     var dirty = true
     /// Resume data for partly downloaded pieces, applied once the info is known.
     private var savedPartials: [String: [Int]] = [:]
+    private var savedHave: Data?
+    private var savedRenamed: [String: [String]] = [:]
+    private var savedRootName: String?
     var savedStamps: [[Double]] = []
 
     private var metaSize = 0
@@ -167,17 +170,15 @@ final class Torrent {
     /// Restores a torrent saved earlier; returns whether its files need checking.
     func restore(info: TorrentInfo?, have: Data?, priorities: [Int], partials: [String: [Int]], stamps: [[Double]], renamed: [String: [String]], rootName: String?) -> Bool {
         if !priorities.isEmpty { filePriority = priorities }
+        savedHave = have
         savedPartials = partials
         savedStamps = stamps
+        savedRenamed = renamed
+        savedRootName = rootName
+        if let rootName { name = rootName }
         guard let info else { return false }
         adopt(info, fresh: false)
-        if let rootName { name = rootName }
-        let renames = Dictionary(uniqueKeysWithValues: renamed.compactMap { k, v in Int(k).map { ($0, v) } })
-        storage?.locked { $0.renamed = renames; $0.rootName = rootName }
-        if let have { self.have = Bitfield(count: info.pieceCount, data: have) }
-        configureStorage()
-        updatePriorities()
-        applyPartials()
+        applySavedMetadata()
         // Quick check: any file whose size or date changed since we last saw it means a full check.
         guard self.have.setCount > 0 || !downloading.isEmpty else { return false }
         let now = storage!.stamps()
@@ -188,16 +189,65 @@ final class Torrent {
         return false
     }
 
+    private func applySavedMetadata() {
+        guard let info else { return }
+        if let savedHave { have = Bitfield(count: info.pieceCount, data: savedHave) }
+        if let savedRootName { name = savedRootName }
+        let renames = savedRenamed.reduce(into: [Int: [String]]()) { result, pair in
+            if let index = Int(pair.key) { result[index] = pair.value }
+        }
+        storage?.locked { $0.renamed = renames; $0.rootName = savedRootName }
+        configureStorage()
+        updatePriorities()
+        applyPartials()
+        savedHave = nil
+        savedRenamed = [:]
+        savedRootName = nil
+    }
+
+    func adoptMetadata(_ source: TorrentSource) -> Bool {
+        guard info == nil, let metadata = source.info else { return false }
+        if let expected = infoHashV2 {
+            guard metadata.infoHashV2 == expected else { return false }
+        } else {
+            guard metadata.infoHashV1 == infoHash else { return false }
+        }
+        for seed in source.webSeeds.map({ WebSeed(url: $0, hoffman: false) }) + source.httpSeeds.map({ WebSeed(url: $0, hoffman: true) })
+        where !webSeeds.contains(where: { $0.url == seed.url && $0.hoffman == seed.hoffman }) {
+            webSeeds.append(seed)
+        }
+        completeMetadata(metadata)
+        return true
+    }
+
+    private func completeMetadata(_ parsed: TorrentInfo) {
+        let hadResume = savedHave != nil || !savedPartials.isEmpty
+        adopt(parsed, fresh: true)
+        applySavedMetadata()
+        session.log("metadata received", self)
+        for peer in peers where peer.phase == .active {
+            if peer.have == nil || peer.have!.count != parsed.pieceCount { absorbPendingHaves(peer) }
+            updateInterest(peer)
+        }
+        if hadResume || storage?.anyFileExists == true { recheck() }
+        dirty = true
+        session.save(self)
+        session.metadataArrived(self)
+    }
+
     private func fileHasPieces(_ i: Int) -> Bool { info?.pieces(ofFile: i)?.contains { have[$0] } ?? false }
 
     private func applyPartials() {
         guard let info else { return }
         for (key, blocks) in savedPartials {
-            guard let piece = Int(key), piece < info.pieceCount, !have[piece] else { continue }
+            guard let piece = Int(key), piece >= 0, piece < info.pieceCount, !have[piece] else { continue }
             let count = (info.pieceSize(piece) + Peer.blockSize - 1) / Peer.blockSize
             var progress = PieceProgress(blocks: [UInt8](repeating: 0, count: count))
-            for b in blocks where b < count { progress.blocks[b] = 2; progress.arrived += 1 }
-            if progress.arrived > 0, progress.arrived < count { downloading[piece] = progress }
+            for b in blocks where b >= 0 && b < count { progress.blocks[b] = 2; progress.arrived += 1 }
+            if progress.arrived > 0, progress.arrived < count {
+                downloading[piece] = progress
+                if let storage { session.disk.markRestored(storage, piece: piece, blocks: blocks.filter { $0 >= 0 && $0 < count }) }
+            }
         }
         savedPartials = [:]
     }
@@ -315,7 +365,7 @@ final class Torrent {
     func rename(file: Int?, to newName: String, done: @escaping (String?) -> Void) {
         let clean = TorrentInfo.clean(newName)
         guard !clean.isEmpty else { done("That name can’t be used"); return }
-        guard let storage else { name = clean; done(nil); return }
+        guard let storage else { name = clean; savedRootName = clean; done(nil); return }
         session.disk.queue.async {
             var failure: String?
             do { try storage.rename(file: file, to: clean) } catch { failure = error.localizedDescription }
@@ -335,21 +385,28 @@ final class Torrent {
         let flag = Flag()
         checkFlag = flag
         checking = 0
+        let partials = downloading.filter { $0.value.arrived > 0 && $0.value.arrived < $0.value.blocks.count }
         downloading.removeAll()
-        session.disk.check(storage, cancelled: { flag.cancelled }, progress: { [weak self] p in
-            if !flag.cancelled { self?.checking = p }
-        }, done: { [weak self] found in
-            guard let self, !flag.cancelled, let found else { return }
-            self.checking = nil
-            self.have = found
-            self.rebuildNeed()
-            self.orderDirty = true
-            self.configureStorage()
-            if self.isComplete, self.completedAt == nil { self.completedAt = Date() }
-            if self.isComplete { for i in self.info!.files.indices { self.finishFileIfDone(i) } }
-            self.dirty = true
-            self.session.log("checked", self)
-        })
+        session.disk.queue.async { [weak self] in
+            guard let self else { return }
+            self.session.disk.check(storage, cancelled: { flag.cancelled }, progress: { [weak self] p in
+                if !flag.cancelled { self?.checking = p }
+            }, done: { [weak self] found in
+                guard let self, !flag.cancelled, let found else { return }
+                self.checking = nil
+                self.have = found
+                self.rebuildNeed()
+                self.orderDirty = true
+                for (piece, progress) in partials where piece < found.count && !found[piece] {
+                    self.downloading[piece] = progress
+                }
+                self.configureStorage()
+                if self.isComplete, self.completedAt == nil { self.completedAt = Date() }
+                if self.isComplete { for i in self.info!.files.indices { self.finishFileIfDone(i) } }
+                self.dirty = true
+                self.session.log("checked", self)
+            })
+        }
     }
 
     // MARK: Streaming
@@ -781,16 +838,7 @@ final class Torrent {
             metaAsked = metaAsked.map { _ in nil }
             return
         }
-        adopt(parsed, fresh: true)
-        session.log("metadata received", self)
-        for peer in peers where peer.phase == .active {
-            if peer.have == nil || peer.have!.count != parsed.pieceCount { absorbPendingHaves(peer) }
-            updateInterest(peer)
-        }
-        if storage?.anyFileExists ?? false { recheck() }
-        dirty = true
-        session.save(self)
-        session.metadataArrived(self)
+        completeMetadata(parsed)
     }
 
     private func sendPex(to peer: Peer, now: Date) {
@@ -1423,6 +1471,13 @@ final class Torrent {
     }
 
     func resumeData() -> [String: Any] {
+        let partialCandidates = Dictionary(uniqueKeysWithValues: downloading.compactMap { piece, progress -> (String, [Int])? in
+            let got = progress.blocks.indices.filter { progress.blocks[$0] == 2 }
+            return got.isEmpty || progress.verifying ? nil : (String(piece), got)
+        })
+        let numeric = Dictionary(uniqueKeysWithValues: partialCandidates.compactMap { key, blocks in Int(key).map { ($0, blocks) } })
+        let durable = storage.map { session.disk.durableBlocks($0, candidates: numeric) } ?? [:]
+        let partials = Dictionary(uniqueKeysWithValues: durable.map { (String($0.key), $0.value) })
         var d: [String: Any] = [
             "hash": infoHash.tHex, "name": name, "path": savePath.path, "trackers": trackers.map { [$0.url, String($0.tier)] },
             "webSeeds": webSeeds.filter { !$0.hoffman }.map(\.url), "httpSeeds": webSeeds.filter(\.hoffman).map(\.url),
@@ -1432,10 +1487,7 @@ final class Torrent {
             "manualSeed": manualSeed, "queue": queuePosition, "forceStart": forceStart, "superSeed": superSeeding,
             "downloadLimit": downloadLimit, "uploadLimit": uploadLimit, "banned": Array(banned.prefix(500)),
             "peers": candidates.filter { $0.value.fails == 0 && $0.value.source != "Incoming" }.keys.prefix(100).map(\.description),
-            "partials": Dictionary(uniqueKeysWithValues: downloading.compactMap { piece, p -> (String, [Int])? in
-                let got = p.blocks.indices.filter { p.blocks[$0] == 2 }
-                return got.isEmpty || p.verifying ? nil : (String(piece), got)
-            }),
+            "partials": partials,
         ]
         if let infoHashV2 { d["hashV2"] = infoHashV2.tHex }
         if let storage {

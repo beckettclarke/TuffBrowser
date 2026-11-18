@@ -277,11 +277,39 @@ final class BrowserState {
 
     // MARK: Tabs
 
+    private func extensionDestination(
+        at index: Int?, pinned: Bool, opener: Tab?
+    ) -> (space: Space, section: TabSection, index: Int, folder: Folder?)? {
+        let fallback = opener.flatMap { space(containing: $0) } ?? currentSpace
+        guard index != nil || pinned else { return nil }
+        if pinned, index == nil { return (fallback, .pinned, fallback.pinnedItems.count, nil) }
+        let all = allTabs
+        guard let index, !all.isEmpty, index < all.count else {
+            if pinned { return (fallback, .pinned, fallback.pinnedItems.count, nil) }
+            return (fallback, .tabs, fallback.tabs.count, nil)
+        }
+        let anchor = all[max(0, index)]
+        guard let owner = space(containing: anchor) else { return (fallback, pinned ? .pinned : .tabs, 0, nil) }
+        switch section(of: anchor) {
+        case .tabs:
+            if pinned { return (owner, .pinned, owner.pinnedItems.count, nil) }
+            return (owner, .tabs, owner.tabs.firstIndex { $0 === anchor } ?? owner.tabs.count, nil)
+        case .pinned:
+            if !pinned { return (owner, .tabs, 0, nil) }
+            if let folder = owner.folder(containing: anchor) {
+                return (owner, .pinned, folder.tabs.firstIndex { $0 === anchor } ?? folder.tabs.count, folder)
+            }
+            return (owner, .pinned, owner.pinnedIndex(of: anchor.id) ?? owner.pinnedItems.count, nil)
+        case .favorites, .none:
+            return (fallback, pinned ? .pinned : .tabs, 0, nil)
+        }
+    }
+
     @discardableResult
     func newTab(
         url: URL?, select: Bool = true, in targetSpace: Space? = nil,
         configuration: WKWebViewConfiguration? = nil, after opener: Tab? = nil, beside: Tab? = nil,
-        sessionState: Data? = nil
+        sessionState: Data? = nil, extensionIndex: Int? = nil, pinned: Bool = false
     ) -> Tab {
         guard restored else {
             let tab = Tab(url: url, sessionState: sessionState)
@@ -289,13 +317,35 @@ final class BrowserState {
             pendingTabs.append((tab, select))
             return tab
         }
-        let space = targetSpace ?? opener.flatMap { self.space(containing: $0) } ?? (beside.flatMap { self.space(containing: $0) }) ?? currentSpace
-        let tab = Tab(url: url, sessionState: sessionState)
+        let destination = extensionDestination(at: extensionIndex, pinned: pinned, opener: opener ?? beside)
+        let space = targetSpace ?? destination?.space ?? opener.flatMap { self.space(containing: $0) } ?? (beside.flatMap { self.space(containing: $0) }) ?? currentSpace
+        let tab = Tab(url: url, homeURL: (pinned || destination?.section == .pinned) ? url : nil, sessionState: sessionState)
         tab.browser = self
         tab.openerTab = opener
         var index = settings.tabs.newTabPosition == .top ? 0 : space.tabs.count
         if let anchor = opener ?? beside, let i = space.tabs.firstIndex(where: { $0 === anchor }) { index = i + 1 }
-        animate { space.tabs.insert(tab, at: index) }
+        animate {
+            if let destination {
+                switch destination.section {
+                case .pinned:
+                    tab.homeURL = tab.homeURL ?? url
+                    if let folder = destination.folder, space.folders.contains(where: { $0 === folder }) {
+                        folder.tabs.insert(tab, at: min(destination.index, folder.tabs.count))
+                    } else {
+                        space.pinnedItems.insert(.tab(tab), at: min(destination.index, space.pinnedItems.count))
+                    }
+                case .tabs:
+                    space.tabs.insert(tab, at: min(destination.index, space.tabs.count))
+                case .favorites:
+                    space.tabs.insert(tab, at: min(index, space.tabs.count))
+                }
+            } else if pinned {
+                tab.homeURL = tab.homeURL ?? url
+                space.pinnedItems.append(.tab(tab))
+            } else {
+                space.tabs.insert(tab, at: index)
+            }
+        }
         if configuration != nil || url != nil { tab.wake(configuration: configuration, opener: opener) }
         ext?.didOpen(tab)
         if select { self.select(tab) }
@@ -555,12 +605,18 @@ final class BrowserState {
 
     /// A copy of the tab beside it, with its back / forward history and its name, as in
     /// Safari and Chrome.
-    func duplicate(_ tab: Tab) {
-        guard let url = tab.url else { return }
-        let copy = newTab(url: url, select: false, beside: tab, sessionState: tab.sessionState)
+    @discardableResult
+    func duplicate(
+        _ tab: Tab, select: Bool = true, extensionIndex: Int? = nil, pinned: Bool = false, opener: Tab? = nil
+    ) -> Tab? {
+        guard let url = tab.url else { return nil }
+        let copy = newTab(
+            url: url, select: select, after: opener, beside: opener == nil && extensionIndex == nil ? tab : nil,
+            sessionState: tab.sessionState, extensionIndex: extensionIndex, pinned: pinned
+        )
         copy.customTitle = tab.customTitle
         copy.title = tab.title
-        select(copy)
+        return copy
     }
 
     func selectAdjacentTab(offset: Int) {
@@ -581,6 +637,8 @@ final class BrowserState {
     /// For `.pinned`, `index` is a place in the space's `pinnedItems` (among folders and pinned
     /// tabs), or with `folder`, a place in that folder.
     func move(_ tab: Tab, to section: TabSection, in space: Space? = nil, folder: Folder? = nil, at index: Int? = nil) {
+        let oldIndex = allTabs.firstIndex { $0 === tab }
+        let oldPinned = self.section(of: tab).map { $0 != .tabs } ?? false
         let destination = space ?? self.space(containing: tab) ?? currentSpace
         let origin = self.space(containing: tab)
         let wasSelectedInOrigin = origin?.selectedTabID == tab.id
@@ -622,6 +680,10 @@ final class BrowserState {
                 updateWindowTitle()
             }
         }
+        let newIndex = allTabs.firstIndex { $0 === tab }
+        let newPinned = section != .tabs
+        if oldPinned != newPinned { ext?.didChange(tab, properties: .pinned) }
+        if let oldIndex, let newIndex, oldIndex != newIndex { ext?.didMove(tab, fromIndex: oldIndex) }
         scheduleSave()
     }
 
@@ -1665,6 +1727,7 @@ final class BrowserState {
             currentSpaceIndex = 0
         }
         pagerPosition = Double(currentSpaceIndex)
+        HistoryStore.shared.adoptLegacyEntries(profileID: profiles[0].id)
         restored = true
 
         allTabs.forEach { ext?.didOpen($0) }

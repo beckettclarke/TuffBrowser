@@ -119,8 +119,16 @@ extension Tab: WKWebExtensionTab {
         using configuration: WKWebExtension.TabConfiguration, for context: WKWebExtensionContext,
         completionHandler: @escaping ((any WKWebExtensionTab)?, (any Error)?) -> Void
     ) {
-        guard let browser, let url else { completionHandler(nil, nil); return }
-        completionHandler(browser.newTab(url: url, select: configuration.shouldBeActive, after: self), nil)
+        guard let browser else { completionHandler(nil, nil); return }
+        let parent = configuration.parentTab as? Tab
+        let index = configuration.index == NSNotFound ? nil : configuration.index
+        let copy = browser.duplicate(
+            self, select: configuration.shouldBeActive, extensionIndex: index,
+            pinned: configuration.shouldBePinned, opener: parent ?? self
+        )
+        copy?.readerModeRequested = configuration.shouldReaderModeBeActive
+        if configuration.shouldBeMuted { copy?.setMuted(true) }
+        completionHandler(copy, nil)
     }
 
     func close(for context: WKWebExtensionContext, completionHandler: @escaping ((any Error)?) -> Void) {
@@ -136,6 +144,7 @@ extension Tab: WKWebExtensionTab {
     func isReaderModeActive(for context: WKWebExtensionContext) -> Bool { reader != nil }
 
     func setReaderModeActive(_ active: Bool, for context: WKWebExtensionContext, completionHandler: @escaping ((any Error)?) -> Void) {
+        readerModeRequested = active
         if active { openReader() } else { closeReader() }
         completionHandler(nil)
     }

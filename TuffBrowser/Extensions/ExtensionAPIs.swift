@@ -12,6 +12,40 @@ import WebKit
 /// data, say) and calls `completion` when it has an answer; the shim's `tabs.create` promise settles
 /// then. Methods that WebKit itself implements are never routed here — the shim only supplies the
 /// namespaces the engine lacks.
+enum ExtensionAPIPermissions {
+    private static let namespaces = [
+        "topSites": "topSites", "history": "history", "browsingData": "browsingData",
+        "management": "management", "sessions": "sessions", "notifications": "notifications",
+        "offscreen": "offscreen", "identity": "identity", "downloads": "downloads",
+        "system.cpu": "system.cpu", "system.memory": "system.memory", "system.storage": "system.storage",
+        "power": "power", "idle": "idle", "tts": "tts", "search": "search",
+        "userScripts": "userScripts", "tabGroups": "tabGroups", "contextualIdentities": "contextualIdentities",
+        "contentSettings": "contentSettings", "clipboard": "clipboardWrite", "find": "find",
+        "omnibox": "omnibox", "theme": "theme",
+    ]
+
+    static func setting(_ path: String) -> String? {
+        if path.hasPrefix("privacy.") { return "privacy" }
+        if path.hasPrefix("proxy.") { return "proxy" }
+        if path.hasPrefix("fontSettings.") { return "fontSettings" }
+        if path.hasPrefix("browserSettings.") { return "browserSettings" }
+        return nil
+    }
+
+    static func event(_ name: String) -> String? {
+        if name.hasPrefix("settings.onChange.") { return setting(String(name.dropFirst("settings.onChange.".count))) }
+        let namespace = name.split(separator: ".").first.map(String.init) ?? ""
+        return namespaces[namespace]
+    }
+
+    static func required(namespace: String, method: String, args: [String: Any] = [:]) -> String? {
+        if namespace == "__events" { return (args["event"] as? String).map(event) ?? nil }
+        if namespace == "settings" { return (args["path"] as? String).flatMap(setting) }
+        if namespace == "tabs" { return ["group", "ungroup"].contains(method) ? "tabGroups" : nil }
+        return namespaces[namespace]
+    }
+}
+
 final class ExtensionAPIBridge {
     static let shared = ExtensionAPIBridge()
 
@@ -42,6 +76,10 @@ final class ExtensionAPIBridge {
         let finish: (Any?) -> Void = { value in completion(Self.reply(["value": value ?? NSNull()])) }
         let fail: (Error) -> Void = { error in completion(Self.reply(["error": error.localizedDescription])) }
         do {
+            if let permission = ExtensionAPIPermissions.required(namespace: namespace, method: method, args: args),
+               !context.currentPermissions.contains(WKWebExtension.Permission(rawValue: permission)) {
+                throw APIError("This extension does not have the \(permission) permission.")
+            }
             try perform(namespace: namespace, method: method, args: args, context: context, finish: finish, fail: fail)
         } catch {
             fail(error)
@@ -62,7 +100,7 @@ final class ExtensionAPIBridge {
         switch (namespace, method) {
         // chrome.topSites
         case ("topSites", "get"):
-            finish(HistoryStore.shared.topSites())
+            finish(HistoryStore.shared.topSites(profileID: browser.currentProfile.id))
 
         // chrome.history
         case ("history", "search"):
@@ -70,24 +108,25 @@ final class ExtensionAPIBridge {
                 text: args["text"] as? String ?? "",
                 startTime: args["startTime"] as? Double,
                 endTime: args["endTime"] as? Double,
-                maxResults: args["maxResults"] as? Int ?? 100
+                maxResults: args["maxResults"] as? Int ?? 100,
+                profileID: browser.currentProfile.id
             ))
         case ("history", "getVisits"):
-            finish(HistoryStore.shared.chromeVisits(for: try Self.url(args["url"])))
+            finish(HistoryStore.shared.chromeVisits(for: try Self.url(args["url"]), profileID: browser.currentProfile.id))
         case ("history", "addUrl"):
-            HistoryStore.shared.record(url: try Self.url(args["url"]), title: "")
+            HistoryStore.shared.record(url: try Self.url(args["url"]), title: "", profileID: browser.currentProfile.id)
             finish(nil)
         case ("history", "deleteUrl"):
-            HistoryStore.shared.deleteUrl(try Self.url(args["url"]))
+            HistoryStore.shared.deleteUrl(try Self.url(args["url"]), profileID: browser.currentProfile.id)
             finish(nil)
         case ("history", "deleteRange"):
             guard let start = args["startTime"] as? Double, let end = args["endTime"] as? Double else {
                 throw APIError("startTime and endTime are required.")
             }
-            HistoryStore.shared.deleteRange(startTime: start, endTime: end)
+            HistoryStore.shared.deleteRange(startTime: start, endTime: end, profileID: browser.currentProfile.id)
             finish(nil)
         case ("history", "deleteAll"):
-            HistoryStore.shared.clear()
+            HistoryStore.shared.clear(profileID: browser.currentProfile.id)
             finish(nil)
 
         // chrome.browsingData
@@ -100,7 +139,12 @@ final class ExtensionAPIBridge {
         case ("browsingData", "removeLocalStorage"):
             removeBrowsingData(types: ["localStorage": true], since: args["since"] as? Double ?? 0, finish: finish)
         case ("browsingData", "removeHistory"):
-            HistoryStore.shared.clear()
+            let since = args["since"] as? Double ?? 0
+            if since > 0 {
+                HistoryStore.shared.deleteRange(startTime: since, endTime: Date().timeIntervalSince1970 * 1000)
+            } else {
+                HistoryStore.shared.clear()
+            }
             finish(nil)
         case ("browsingData", "settings"):
             finish([
@@ -130,6 +174,15 @@ final class ExtensionAPIBridge {
             }
             extensions.setEnabled(enabled, id: id)
             finish(nil)
+        case ("management", "uninstallSelf"):
+            let id = context.uniqueIdentifier
+            Task { @MainActor in
+                if await self.extensions.confirmUninstall(id: id) {
+                    finish(nil)
+                } else {
+                    fail(APIError("The extension wasn’t removed."))
+                }
+            }
 
         // chrome.sessions
         case ("sessions", "getRecentlyClosed"):
@@ -152,9 +205,15 @@ final class ExtensionAPIBridge {
             )
         case ("notifications", "clear"):
             guard let id = args["notificationId"] as? String else { throw APIError("notificationId is required.") }
-            ExtensionNotifications.shared.clear(id: id, finish: finish)
+            ExtensionNotifications.shared.clear(id: id, extensionID: context.uniqueIdentifier, finish: finish)
+        case ("notifications", "update"):
+            guard let id = args["notificationId"] as? String else { throw APIError("notificationId is required.") }
+            ExtensionNotifications.shared.update(
+                id: id, options: args["options"] as? [String: Any] ?? [:], extensionID: context.uniqueIdentifier,
+                finish: finish, fail: fail
+            )
         case ("notifications", "getAll"):
-            ExtensionNotifications.shared.getAll(finish: finish)
+            ExtensionNotifications.shared.getAll(extensionID: context.uniqueIdentifier, finish: finish)
         case ("notifications", "getPermissionLevel"):
             ExtensionNotifications.shared.getPermissionLevel(finish: finish)
 
@@ -193,8 +252,10 @@ final class ExtensionAPIBridge {
             ExtensionDownloads.shared.open(id: try Self.int(args["id"]), finish: finish, fail: fail)
         case ("downloads", "show"):
             ExtensionDownloads.shared.show(id: try Self.int(args["id"]), finish: finish, fail: fail)
-        case ("downloads", "pause"), ("downloads", "resume"):
-            ExtensionDownloads.shared.pauseResume(id: (args["id"] as? Int) ?? 0, fail: fail)
+        case ("downloads", "pause"):
+            ExtensionDownloads.shared.pause(id: try Self.int(args["id"]), finish: finish, fail: fail)
+        case ("downloads", "resume"):
+            ExtensionDownloads.shared.resume(id: try Self.int(args["id"]), finish: finish, fail: fail)
 
         // chrome.system / power / idle
         case ("system.cpu", "getInfo"):
@@ -229,7 +290,7 @@ final class ExtensionAPIBridge {
         case ("tts", "getVoices"):
             ExtensionTTS.shared.getVoices(finish: finish)
 
-        // chrome.search
+        // chrome.search / Firefox browser.search
         case ("search", "query"):
             guard let text = args["text"] as? String else { throw APIError("text is required.") }
             let url = AppSettings.shared.general.searchEngine.searchURL(for: text)
@@ -239,6 +300,18 @@ final class ExtensionAPIBridge {
                 browser.newTab(url: url)
             }
             finish(nil)
+        case ("search", "get"):
+            let engine = AppSettings.shared.general.searchEngine
+            let name = engine == .custom ? "Custom" : engine.label
+            let marker = "TUFF_SEARCH_TERMS"
+            let searchURL = engine.searchURL(for: marker).absoluteString.replacingOccurrences(of: marker, with: "{searchTerms}")
+            let suggestURL: Any = engine.suggestURL(for: marker)?.absoluteString.replacingOccurrences(of: marker, with: "{searchTerms}") ?? NSNull()
+            finish([[
+                "name": name,
+                "isDefault": true,
+                "searchUrl": searchURL,
+                "suggestUrl": suggestURL,
+            ]])
 
         // Firefox contentScripts / userScripts (MV2) and Chrome userScripts (MV3), with inline code.
         case ("contentScripts", "register"), ("userScripts", "registerLegacy"):
@@ -354,6 +427,21 @@ final class ExtensionAPIBridge {
             ExtensionOmnibox.shared.suggest(request: try Self.int(args["request"]), results: args["suggestions"] as? [[String: Any]] ?? [])
             finish(nil)
 
+        // Internal permission calls for native-only names WebKit rejects in permissions.*.
+        case ("__permissions", "contains"):
+            let names = args["permissions"] as? [String] ?? []
+            finish(names.allSatisfy { context.currentPermissions.contains(WKWebExtension.Permission(rawValue: $0)) })
+        case ("__permissions", "request"):
+            extensions.requestNativePermissions(args["permissions"] as? [String] ?? [], context: context, completion: finish)
+        case ("__permissions", "remove"):
+            let names = args["permissions"] as? [String] ?? []
+            let optional = Set(context.webExtension.manifest["optional_permissions"] as? [String] ?? [])
+            guard !names.isEmpty, Set(names).isSubset(of: optional) else { finish(false); break }
+            for name in names {
+                context.setPermissionStatus(.unknown, for: WKWebExtension.Permission(rawValue: name))
+            }
+            finish(true)
+
         // Event subscriptions from the shim (see ExtensionEventPush).
         case ("__events", "subscribe"):
             if let event = args["event"] as? String {
@@ -407,7 +495,13 @@ final class ExtensionAPIBridge {
         if types["webSQL"] as? Bool == true { dataTypes.insert(WKWebsiteDataTypeWebSQLDatabases) }
         if types["serviceWorkers"] as? Bool == true { dataTypes.insert(WKWebsiteDataTypeServiceWorkerRegistrations) }
         if types["fileSystems"] as? Bool == true { dataTypes.insert(WKWebsiteDataTypeFileSystem) }
-        if types["history"] as? Bool == true { HistoryStore.shared.clear() }
+        if types["history"] as? Bool == true {
+            if since > 0 {
+                HistoryStore.shared.deleteRange(startTime: since, endTime: Date().timeIntervalSince1970 * 1000)
+            } else {
+                HistoryStore.shared.clear()
+            }
+        }
         // The downloads list (the files stay), as in Chrome.
         if types["downloads"] as? Bool == true { DownloadManager.shared.clearFinished(isPrivate: false, since: since > 0 ? Date(timeIntervalSince1970: since / 1000) : nil) }
         // Tuff saves no passwords or form entries, so there is nothing to remove for those.

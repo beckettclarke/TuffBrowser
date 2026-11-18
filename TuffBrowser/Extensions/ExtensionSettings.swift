@@ -231,6 +231,13 @@ final class ExtensionSettings {
     }
 
     private func registerProxy() {
+        if let config = proxyConfig,
+           (config["mode"] as? String == "direct" || config["proxyType"] as? String == "none") {
+            saved.values["proxy.settings"] = nil
+            saved.controllers["proxy.settings"] = nil
+            saved.originals["proxy.settings"] = nil
+            save()
+        }
         // Chrome's ProxyConfig ({mode, rules}) or Firefox's ({proxyType, http, ssl, socks, …}).
         register("proxy.settings", get: { self.proxyConfig ?? ["mode": "system", "proxyType": "system"] }) { value in
             guard let config = value as? [String: Any], config["mode"] is String || config["proxyType"] is String else {
@@ -249,9 +256,10 @@ final class ExtensionSettings {
     static func proxyConfigurations(for config: [String: Any]) throws -> [nw_proxy_config_t]? {
         if let type = config["proxyType"] as? String { return try firefoxProxyConfigurations(type: type, config: config) }
         switch config["mode"] as? String {
-        case "system", "direct", nil:
-            // Direct can't be forced through WebKit; it also has no proxy of its own.
+        case "system", nil:
             return nil
+        case "direct":
+            throw Failure("Tuff can’t force direct connections while system proxies are configured.")
         case "fixed_servers":
             let rules = config["rules"] as? [String: Any] ?? [:]
             let server = (rules["singleProxy"] ?? rules["proxyForHttps"] ?? rules["proxyForHttp"] ?? rules["fallbackProxy"]) as? [String: Any]
@@ -284,8 +292,10 @@ final class ExtensionSettings {
     /// Firefox's `proxy.settings` value: `manual` with "host:port" servers.
     private static func firefoxProxyConfigurations(type: String, config: [String: Any]) throws -> [nw_proxy_config_t]? {
         switch type {
-        case "none", "system":
+        case "system":
             return nil
+        case "none":
+            throw Failure("Tuff can’t force direct connections while system proxies are configured.")
         case "manual":
             func server(_ key: String) -> (host: String, port: Int?)? {
                 guard var text = config[key] as? String, !text.trimmingCharacters(in: .whitespaces).isEmpty else { return nil }

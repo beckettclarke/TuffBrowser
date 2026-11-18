@@ -737,7 +737,7 @@ enum BrowserImporter {
     static func apply(_ bundle: ImportBundle, from source: BrowserSource, to state: BrowserState) -> ImportSummary {
         var summary = ImportSummary()
         if let history = bundle.history, !history.isEmpty {
-            HistoryStore.shared.merge(history)
+            HistoryStore.shared.merge(history, profileID: state.currentProfile.id)
             summary.pages = history.count
         }
 

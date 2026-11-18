@@ -1,9 +1,8 @@
 # Known bugs
 
-Last updated 2026-11-17. Everything found in the extension / keyboard / focus sweep and the
-2026-11-16 security / bug audit is fixed. The 2026-11-17 pass fixed the extension and app
-correctness bugs from TODOS.md (sections F, G, H) — listed at the end of the table below. Two
-things are left over. Missing features are in TODOS.md (section K).
+Last updated 2026-11-18. The extension / keyboard / focus sweep, the 2026-11-16 security / bug
+audit, the 2026-11-17 app correctness pass, and the 18-item `CDL-HANDOFF.md` correctness pass are
+fixed. Two older limitations are left over. Missing features are in TODOS.md (section K).
 
 ## Left over
 
@@ -79,6 +78,19 @@ things are left over. Missing features are in TODOS.md (section K).
 | A card raised with the browser window closed fell back to a native `NSAlert`. | `PromptPresenter.showNext` |
 | Favicons were fetched without the page's cookies, so icons behind a sign-in failed. Requests now carry the page profile's cookies for the icon's address (and no other profile's). | `FaviconStore.request(for:context:)` |
 | A proxy bypass list set by an extension was dropped: Network's Swift `ProxyConfiguration.excludedDomains` doesn't keep its domains, so proxies are built with the C API. | `ExtensionSettings.proxyConfigurations` |
+| Native extension APIs relied on JavaScript namespace visibility instead of checking permissions. The bridge now checks live grants centrally, including optional revocations and event subscriptions. | `Extensions/ExtensionAPIs.swift`, `ExtensionEventPush.swift` |
+| Extension updates re-enabled disabled extensions and lost links, pins and side-panel preferences. | `ExtensionManager.preservingState` |
+| `tabs.create` ignored opener, index, pinning and reader mode; moves lacked notifications and duplication lost history. | `ExtensionManager`, `ExtensionBridge`, `BrowserState` |
+| Extension downloads had no working pause/resume, inconsistent events, orphaned initiation IDs and delayed erase persistence. | `ExtensionDownloads`, `DownloadManager`, `TurboDownloads` |
+| Extension notifications shared raw system IDs, leaked `getAll`, allowed cross-owner clears and lacked `update`. | `ExtensionNotifications.swift` |
+| Dynamic script globs widened matches, and native events could be lost before the relay loaded or while it recovered. | `ExtensionContentScripts`, `ExtensionEventPush` |
+| Disable/remove/reload/unlink left extension power assertions alive. | `ExtensionSystem`, `ExtensionManager` |
+| `browsingData` ignored history `since`; content settings flattened pattern semantics; direct proxy mode silently used system proxies. | `ExtensionAPIs`, `ExtensionBrowserAPIs`, `SiteSettings`, `SitePermissions`, `ExtensionSettings` |
+| Malformed torrent sizes could overflow or trigger excessive allocations; Incognito could enter the persistent torrent session. | `Engine/TorrentMeta`, `TorrentBridge`, `DownloadsPage` |
+| A .torrent could not complete an existing magnet, and resume snapshots could include blocks still buffered in memory. | `Engine/Torrent`, `TorrentSession`, `TorrentStorage` |
+| MSE initial payload handling and web-seed multi-file cancellation were incorrect. | `Engine/MSE`, `Engine/WebSeed` |
+| Download/source cookie matching ignored path boundaries and expiry; redirects could retain old cookies. | `FaviconStore.cookies`, `TurboDownloads`, `InternalPages`, `HTTPTransfer` |
+| Ad-block allowlists were missed before rule activation; contenteditable edits were invisible to idle protection; history writes could finish out of order. | `ContentBlocker`, `Tab`, `HistoryWriter` |
 
 New debug-script commands (debug builds only): `press [cmd+][shift+][opt+][ctrl+]<key|tab>` sends
 a real key event, and `responder` logs what has keyboard focus. `move x y` and `middleclick x y` post

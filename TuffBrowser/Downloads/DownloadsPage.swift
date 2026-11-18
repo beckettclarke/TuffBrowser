@@ -1,7 +1,7 @@
 import AppKit
 import WebKit
 
-/// The page at tuff://downloads: every web download and torrent, full screen, with details,
+/// The page at tuff://downloads: web downloads, plus the global torrent list in regular windows.
 /// settings, an add sheet and a torrent maker. The page asks the app for everything through
 /// `dl.*` messages (see `InternalPageHandler`); this answers them.
 enum DownloadsWebPage {
@@ -19,26 +19,30 @@ enum DownloadsWebPage {
         let isPrivate = browser?.isPrivate ?? false
         let id = body["id"] as? String ?? ""
         let item = manager.items.first { $0.id.uuidString == id && $0.isPrivate == isPrivate }
+        if isPrivate, ["dl.torrent", "dl.openTorrent", "dl.pending", "dl.torrents", "dl.create"].contains(command) {
+            reply(nil, "Torrents aren’t available in Incognito")
+            return
+        }
 
         switch command {
         case "dl.state":
-            let snap = TorrentSession.shared.snapshot()
+            let snap: (torrents: [[String: Any]], global: [String: Any], events: [[String: Any]]) = isPrivate ? ([], [:], []) : TorrentSession.shared.snapshot()
             var out: [String: Any] = [
                 "http": manager.items(isPrivate: isPrivate).map(dict),
                 "torrents": snap.torrents,
                 "global": snap.global,
                 "events": snap.events,
                 "httpSpeed": manager.totalBytesPerSecond(isPrivate: isPrivate) ?? 0,
-                "pending": TorrentBridge.pendingSheets(defaultPath: AppSettings.shared.downloads.folder.path),
+                "pending": isPrivate ? [] : TorrentBridge.pendingSheets(defaultPath: AppSettings.shared.downloads.folder.path),
                 "private": isPrivate,
-                "torrentsEnabled": TorrentBridge.enabled,
+                "torrentsEnabled": isPrivate ? false : TorrentBridge.enabled,
                 "advanced": DownloadManager.httpSettings.advanced,
             ]
             let detailID = body["detail"] as? String ?? ""
-            if let item = manager.items.first(where: { $0.id.uuidString == detailID }) {
+            if let item = manager.items.first(where: { $0.id.uuidString == detailID && $0.isPrivate == isPrivate }) {
                 out["detail"] = detail(item)
                 reply(out, nil)
-            } else if !detailID.isEmpty {
+            } else if !detailID.isEmpty, !isPrivate {
                 TorrentSession.shared.detail(detailID) { d in
                     if let d { out["detail"] = d }
                     reply(out, nil)
@@ -60,11 +64,18 @@ enum DownloadsWebPage {
             var added = 0
             for line in lines {
                 if line.lowercased().hasPrefix("magnet:"), let url = URL(string: line) {
-                    TorrentBridge.offer(magnet: url); added += 1
+                    TorrentBridge.offer(magnet: url, isPrivate: isPrivate)
+                    if !isPrivate { added += 1 }
                 } else if line.count == 40, Data(tHex: line) != nil, let url = URL(string: "magnet:?xt=urn:btih:" + line) {
-                    TorrentBridge.offer(magnet: url); added += 1
+                    TorrentBridge.offer(magnet: url, isPrivate: isPrivate)
+                    if !isPrivate { added += 1 }
                 } else if let url = URL(string: line), ["http", "https"].contains(url.scheme?.lowercased() ?? "") {
-                    if url.pathExtension.lowercased() == "torrent", DownloadManager.httpSettings.openTorrents { TorrentBridge.offer(remote: url) } else { manager.addURL(url, isPrivate: isPrivate) }
+                    if url.pathExtension.lowercased() == "torrent", DownloadManager.httpSettings.openTorrents {
+                        TorrentBridge.offer(remote: url, isPrivate: isPrivate)
+                        if isPrivate { continue }
+                    } else {
+                        manager.addURL(url, isPrivate: isPrivate)
+                    }
                     added += 1
                 }
             }
@@ -90,17 +101,21 @@ enum DownloadsWebPage {
 
         case "dl.settings":
             TorrentSession.shared.currentSettings { torrent in
-                reply(["torrent": torrent, "http": DownloadManager.httpSettings.dict, "folder": AppSettings.shared.downloads.folder.path], nil)
+                reply(["torrent": isPrivate ? [:] : torrent, "http": DownloadManager.httpSettings.dict, "folder": AppSettings.shared.downloads.folder.path], nil)
             }
 
         case "dl.setting":
             guard let key = body["key"] as? String, let value = body["value"] else { reply(false, nil); return }
+            if isPrivate, body["scope"] as? String != "http", key != "folder" {
+                reply(false, "Torrents aren’t available in Incognito")
+                return
+            }
             if body["scope"] as? String == "http" {
                 DownloadManager.httpSettings.apply([key: value])
                 manager.runQueue()
             } else if key == "folder", let path = value as? String {
                 AppSettings.shared.downloads.folderPath = path
-                TorrentSession.shared.setDefaultSavePath(URL(fileURLWithPath: path, isDirectory: true))
+                if !isPrivate { TorrentSession.shared.setDefaultSavePath(URL(fileURLWithPath: path, isDirectory: true)) }
             } else {
                 TorrentSession.shared.updateSettings([key: value])
             }

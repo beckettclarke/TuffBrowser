@@ -157,12 +157,7 @@ final class InternalPageHandler: NSObject, WKURLSchemeHandler, WKScriptMessageHa
         webView.configuration.websiteDataStore.httpCookieStore.getAllCookies { [weak self] cookies in
             var request = URLRequest(url: target)
             request.httpShouldHandleCookies = false
-            let host = target.host(percentEncoded: false)?.lowercased() ?? ""
-            let matching = cookies.filter { cookie in
-                let domain = cookie.domain.lowercased()
-                let domainMatches = domain.hasPrefix(".") ? (host == domain.dropFirst() || host.hasSuffix(domain)) : host == domain
-                return domainMatches && target.path.hasPrefix(cookie.path) && (!cookie.isSecure || scheme == "https")
-            }
+            let matching = FaviconStore.cookies(cookies, for: target)
             HTTPCookie.requestHeaderFields(with: matching).forEach { request.setValue($1, forHTTPHeaderField: $0) }
             if let userAgent { request.setValue(userAgent, forHTTPHeaderField: "User-Agent") }
             // Trusts a certificate the user let through on the certificate error page, as the tab does.
@@ -222,6 +217,7 @@ final class InternalPageHandler: NSObject, WKURLSchemeHandler, WKScriptMessageHa
             return
         }
         let browser = (message.webView as? TuffWebView)?.tab?.browser
+        let profileID = browser?.currentProfile.id ?? BrowserState.shared.currentProfile.id
         func confirm(_ prompt: Prompt, then action: @escaping () -> Void) {
             Task { @MainActor in
                 var prompt = prompt
@@ -246,7 +242,7 @@ final class InternalPageHandler: NSObject, WKURLSchemeHandler, WKScriptMessageHa
             filter.end = Self.date(body["end"])
             let offset = (body["offset"] as? NSNumber)?.intValue ?? 0
             let limit = min(500, (body["limit"] as? NSNumber)?.intValue ?? 200)
-            let page = HistoryStore.shared.browse(filter, offset: offset, limit: limit)
+            let page = HistoryStore.shared.browse(filter, offset: offset, limit: limit, profileID: profileID)
             replyHandler([
                 "items": page.items.map { e -> [String: Any] in
                     [
@@ -268,7 +264,7 @@ final class InternalPageHandler: NSObject, WKURLSchemeHandler, WKScriptMessageHa
                 ranges[name] = (Date(timeIntervalSince1970: value[0].doubleValue / 1000), Date(timeIntervalSince1970: value[1].doubleValue / 1000))
             }
             let limit = min(200, (body["sites"] as? NSNumber)?.intValue ?? 12)
-            let overview = HistoryStore.shared.overview(ranges: ranges, siteLimit: limit)
+            let overview = HistoryStore.shared.overview(ranges: ranges, siteLimit: limit, profileID: profileID)
             replyHandler([
                 "total": overview.total,
                 "counts": overview.counts,
@@ -278,7 +274,14 @@ final class InternalPageHandler: NSObject, WKURLSchemeHandler, WKScriptMessageHa
 
         case "history.delete":
             let urls = (body["urls"] as? [String] ?? []).compactMap(URL.init(string:))
-            HistoryStore.shared.delete(urls)
+            let times = body["times"] as? [NSNumber] ?? []
+            if times.count == urls.count, !urls.isEmpty {
+                for (url, time) in zip(urls, times) {
+                    HistoryStore.shared.deleteVisit(url: url, at: time.doubleValue, profileID: profileID)
+                }
+            } else {
+                HistoryStore.shared.delete(urls, profileID: profileID)
+            }
             replyHandler(true, nil)
 
         case "history.deleteRange":
@@ -296,7 +299,7 @@ final class InternalPageHandler: NSObject, WKURLSchemeHandler, WKScriptMessageHa
                 confirmTitle: "Remove",
                 destructive: true
             )) {
-                HistoryStore.shared.deleteRange(startTime: start, endTime: end)
+                HistoryStore.shared.deleteRange(startTime: start, endTime: end, profileID: profileID)
             }
 
         case "history.deleteHost":
@@ -304,27 +307,27 @@ final class InternalPageHandler: NSObject, WKURLSchemeHandler, WKScriptMessageHa
                 replyHandler(false, nil)
                 return
             }
-            let count = HistoryStore.shared.browse(HistoryStore.Filter(host: host), offset: 0, limit: 0).total
+            let count = HistoryStore.shared.browse(HistoryStore.Filter(host: host), offset: 0, limit: 0, profileID: profileID).total
             confirm(Prompt(
                 symbol: "globe",
                 title: "Remove \(host) from history?",
-                subtitle: count == 1 ? "1 page" : "\(count.formatted()) pages",
+                subtitle: count == 1 ? "1 visit" : "\(count.formatted()) visits",
                 message: "Every page you visited on \(host) is removed from your history. This can’t be undone.",
                 confirmTitle: "Remove",
                 destructive: true
             )) {
-                HistoryStore.shared.deleteHost(host)
+                HistoryStore.shared.deleteHost(host, profileID: profileID)
             }
 
         case "history.clear":
             confirm(Prompt(
                 symbol: "clock.badge.xmark",
                 title: "Clear all history?",
-                message: "Every page in your history is removed, along with recently closed tabs. Your open tabs stay. This can’t be undone.",
+                message: "Every page in this profile’s history is removed, along with recently closed tabs. Your open tabs stay. This can’t be undone.",
                 confirmTitle: "Clear History",
                 destructive: true
             )) {
-                HistoryStore.shared.clear()
+                HistoryStore.shared.clear(profileID: profileID)
                 BrowserState.shared.forgetClosedTabs()
             }
 
@@ -677,7 +680,7 @@ private enum HistoryPage {
         }
         if (!total) { count.textContent = ''; return; }
         const n = total.toLocaleString();
-        count.textContent = query ? `${n} ${total === 1 ? 'match' : 'matches'}` : `${n} ${total === 1 ? 'page' : 'pages'}`;
+        count.textContent = query ? `${n} ${total === 1 ? 'match' : 'matches'}` : `${n} ${total === 1 ? 'visit' : 'visits'}`;
       }
 
       $('removeScope').onclick = async () => {
@@ -735,7 +738,7 @@ private enum HistoryPage {
       }
 
       async function remove(a, item) {
-        await send('history.delete', { urls: [item.url] }, 0);
+        await send('history.delete', { urls: [item.url], times: [item.time] }, 0);
         const list = a.parentElement;
         a.remove();
         if (!list.children.length) list.parentElement.remove();

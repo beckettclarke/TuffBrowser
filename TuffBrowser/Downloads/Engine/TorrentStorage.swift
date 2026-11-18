@@ -293,6 +293,7 @@ final class DiskIO {
     private struct Buffer { var blocks: [Int: Data] = [:]; var bytes = 0; var spilled = false; var touched = Date() }
     private var buffers: [Key: Buffer] = [:]
     private var buffered = 0
+    private var durable: [Key: Set<Int>] = [:]
     private var cache: [Key: Data] = [:]
     private var cacheOrder: [Key] = []
     private var cached = 0
@@ -330,7 +331,10 @@ final class DiskIO {
             // Some blocks already went to disk (memory pressure, or a piece resumed after a
             // relaunch): finish writing and check from disk.
             if buffer.spilled || buffer.bytes != storage.info.pieceSize(piece) {
-                do { try flush(buffer, storage, pieceStart) } catch { engineQueue.async { done(.failure(error)) }; return }
+                do {
+                    try flush(buffer, storage, pieceStart)
+                    durable[key] = nil
+                } catch { engineQueue.async { done(.failure(error)) }; return }
                 hashQueue.async {
                     let whole = storage.readPiece(piece) ?? Data()
                     let ok = storage.info.verify(piece, whole)
@@ -340,6 +344,7 @@ final class DiskIO {
                 return
             }
             var whole = Data(capacity: storage.info.pieceSize(piece))
+            durable[key] = nil
             for o in buffer.blocks.keys.sorted() { whole.append(buffer.blocks[o]!) }
             hashQueue.async { [self] in
                 let ok = storage.info.verify(piece, whole)
@@ -354,7 +359,28 @@ final class DiskIO {
     }
 
     private func flush(_ buffer: Buffer, _ storage: TorrentStorage, _ pieceStart: Int64) throws {
-        for (o, block) in buffer.blocks { try storage.write(block, at: pieceStart + Int64(o)) }
+        let piece = Int(pieceStart / Int64(storage.info.pieceLength))
+        let key = Key(storage: ObjectIdentifier(storage), piece: piece)
+        for (offset, block) in buffer.blocks {
+            try storage.write(block, at: pieceStart + Int64(offset))
+            durable[key, default: []].insert(offset / Peer.blockSize)
+        }
+    }
+
+    func markRestored(_ storage: TorrentStorage, piece: Int, blocks: [Int]) {
+        queue.async {
+            self.durable[Key(storage: ObjectIdentifier(storage), piece: piece), default: []].formUnion(blocks)
+        }
+    }
+
+    func durableBlocks(_ storage: TorrentStorage, candidates: [Int: [Int]]) -> [Int: [Int]] {
+        queue.sync {
+            candidates.reduce(into: [Int: [Int]]()) { result, pair in
+                let written = durable[Key(storage: ObjectIdentifier(storage), piece: pair.key)] ?? []
+                let blocks = pair.value.filter { written.contains($0) }.sorted()
+                if !blocks.isEmpty { result[pair.key] = blocks }
+            }
+        }
     }
 
     /// Over budget: write the stalest partial pieces to disk to free memory.

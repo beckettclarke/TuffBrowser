@@ -109,10 +109,34 @@ final class SitePermissions {
         return "\(scheme)://\(host)\(port)"
     }
 
+    private func wildcardDecision(
+        saved: [Entry], session: [String: Bool], origin: String, kind: SitePermissionKind
+    ) -> Bool? {
+        var candidates: [(pattern: ContentSettingPattern, granted: Bool, session: Bool)] = []
+        for entry in saved where entry.kind == kind {
+            guard let pattern = ContentSettingPattern(pattern: entry.origin),
+                  (entry.origin.contains("*") || URL(string: entry.origin)?.port != nil), pattern.matches(origin: origin) else { continue }
+            candidates.append((pattern, entry.granted, false))
+        }
+        for (key, granted) in session where key.hasSuffix("|\(kind.rawValue)") {
+            let patternKey = String(key.dropLast(kind.rawValue.count + 1))
+            guard let pattern = ContentSettingPattern(pattern: patternKey),
+                  (patternKey.contains("*") || URL(string: patternKey)?.port != nil), pattern.matches(origin: origin) else { continue }
+            candidates.append((pattern, granted, true))
+        }
+        return candidates.max {
+            ($0.pattern.specificity, $0.session ? 1 : 0) < ($1.pattern.specificity, $1.session ? 1 : 0)
+        }?.granted
+    }
+
     func decision(origin: String, kind: SitePermissionKind, incognito: Bool) -> Bool? {
         let key = "\(origin)|\(kind.rawValue)"
-        if incognito, let answer = incognitoSession[key] { return answer }
+        if incognito {
+            if let answer = incognitoSession[key] { return answer }
+            if let answer = wildcardDecision(saved: [], session: incognitoSession, origin: origin, kind: kind) { return answer }
+        }
         var answer = session[key] ?? saved.first(where: { $0.id == key })?.granted
+        if answer == nil { answer = wildcardDecision(saved: saved, session: session, origin: origin, kind: kind) }
         // A normal window's "Allow" doesn't carry into Incognito; its "Don't Allow" does.
         if incognito, answer == true { answer = nil }
         if let answer { return answer }
@@ -148,7 +172,8 @@ final class SitePermissions {
         incognitoSession.removeAll()
     }
 
-    func remove(_ entry: Entry) {
+    func remove(_ entry: Entry, incognito: Bool = false) {
+        if incognito { incognitoSession[entry.id] = nil }
         saved.removeAll { $0.id == entry.id }
         session[entry.id] = nil
         save()

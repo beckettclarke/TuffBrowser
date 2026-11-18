@@ -161,6 +161,7 @@ enum WebEngine {
         PopupBlocker.install(into: config.userContentController)
         WebNotifications.install(into: config.userContentController)
         EmbeddedSignIn.install(into: config.userContentController)
+        Tab.installUnsavedInputTracking(into: config.userContentController)
         // Scripts extensions register at run time; Incognito windows don't run extensions.
         if dataStore.isPersistent { ExtensionContentScripts.shared.attach(config.userContentController) }
         ContentBlocker.shared.attach(config.userContentController)

@@ -142,11 +142,10 @@ final class ExtensionContentScripts {
     // MARK: Building scripts
 
     private func makeScripts(_ details: [String: Any], extensionID: String, resources: URL?, defaultWorld: String) throws -> [WKUserScript] {
-        var include = Self.patterns(details["matches"])
+        let include = Self.patterns(details["matches"])
         let exclude = Self.patterns(details["excludeMatches"])
-        // Firefox `userScripts` and Chrome both allow `includeGlobs` instead of `matches`; a glob
-        // narrows matches, so without matches it can only mean "everything".
-        if include.isEmpty, details["includeGlobs"] != nil { include = ["<all_urls>"] }
+        let includeGlobs = details["includeGlobs"] as? [String] ?? []
+        let excludeGlobs = details["excludeGlobs"] as? [String] ?? []
         guard !include.isEmpty else { throw RegistrationError("matches is required.") }
 
         let world: WKContentWorld
@@ -170,7 +169,28 @@ final class ExtensionContentScripts {
             sources.append(code)
         }
         guard !sources.isEmpty else { throw RegistrationError("At least one js or css entry is required.") }
-        return sources.map { Self.makeScript(source: $0, time: time, mainFrameOnly: mainFrameOnly, include: include, exclude: exclude, world: world) }
+        return sources.map { source in
+            let guarded: String
+            if includeGlobs.isEmpty && excludeGlobs.isEmpty {
+                guarded = source
+            } else {
+                guarded = "if (\(Self.globTest(include: includeGlobs, exclude: excludeGlobs))) {\n\(source)\n}"
+            }
+            return Self.makeScript(source: guarded, time: time, mainFrameOnly: mainFrameOnly, include: include, exclude: exclude, world: world)
+        }
+    }
+
+    static func globRegex(_ glob: String) -> String {
+        "^" + NSRegularExpression.escapedPattern(for: glob)
+            .replacingOccurrences(of: "\\*", with: ".*")
+            .replacingOccurrences(of: "\\?", with: ".") + "$"
+    }
+
+    private static func globTest(include: [String], exclude: [String]) -> String {
+        let encode = { (list: [String]) in
+            (try? JSONSerialization.data(withJSONObject: list.map(globRegex))).flatMap { String(data: $0, encoding: .utf8) } ?? "[]"
+        }
+        return "(function(u){var t=function(l){return l.some(function(r){return new RegExp(r).test(u);});};return (!\(encode(include)).length||t(\(encode(include))))&&!t(\(encode(exclude)));})(location.href)"
     }
 
     /// `{code}` as given, or `{file}` read from the extension's own files.

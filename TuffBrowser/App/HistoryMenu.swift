@@ -44,7 +44,7 @@ final class HistoryMenuFiller: NSObject, NSMenuDelegate {
 
         // Recent pages (not shown in Incognito, which keeps no History).
         if !state.isPrivate {
-            let recent = HistoryStore.shared.browse(HistoryStore.Filter(), offset: 0, limit: Self.recentLimit).items
+            let recent = HistoryStore.shared.browse(HistoryStore.Filter(), offset: 0, limit: Self.recentLimit, profileID: state.currentProfile.id).items
             if !recent.isEmpty {
                 added.append(mark(NSMenuItem.separator()))
                 let heading = NSMenuItem(title: "Recently Visited", action: nil, keyEquivalent: "")

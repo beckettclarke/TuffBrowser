@@ -10,30 +10,42 @@ final class WebSeed {
     var retryAt = Date()
     var downloaded: Int64 = 0
     private(set) var busy = false
-    private var task: URLSessionDataTask?
+    private var tasks: Set<URLSessionDataTask> = []
+    private var generation: UInt64 = 0
 
     init(url: String, hoffman: Bool) {
         self.url = url
         self.hoffman = hoffman
     }
 
-    func cancel() { task?.cancel(); task = nil; busy = false }
+    var activeTaskCount: Int { tasks.count }
+
+    func cancel() {
+        generation &+= 1
+        tasks.forEach { $0.cancel() }
+        tasks.removeAll()
+        busy = false
+        status = "Idle"
+    }
 
     /// Fetches piece `piece`, calling back on the engine queue with its data or nil.
     func fetch(_ piece: Int, info: TorrentInfo, session: URLSession, done: @escaping (Data?) -> Void) {
+        cancel()
+        let token = generation
         busy = true
         status = "Downloading"
         let start = Int64(piece) * Int64(info.pieceLength)
         let length = info.pieceSize(piece)
         if hoffman {
-            guard var parts = URLComponents(string: url) else { finish(nil, done); return }
+            guard var parts = URLComponents(string: url) else { finish(nil, token: token, done); return }
             let hash = info.infoHash.map { String(format: "%%%02X", $0) }.joined()
             parts.percentEncodedQuery = (parts.percentEncodedQuery.map { $0 + "&" } ?? "") + "info_hash=\(hash)&piece=\(piece)&ranges=0-\(length - 1)"
-            guard let u = parts.url else { finish(nil, done); return }
-            get(URLRequest(url: u), session: session, expect: length) { [weak self] data in self?.finish(data, done) }
+            guard let u = parts.url else { finish(nil, token: token, done); return }
+            get(URLRequest(url: u), session: session, expect: length, token: token) { [weak self] data in
+                self?.finish(data, token: token, done)
+            }
             return
         }
-        // GetRight: one ranged request per file the piece touches, joined.
         var spans: [(URL?, Int64, Int)] = []
         var at = start
         let end = start + Int64(length)
@@ -50,13 +62,14 @@ final class WebSeed {
             var request = URLRequest(url: u, timeoutInterval: 30)
             request.setValue("bytes=\(span.1)-\(span.1 + Int64(span.2) - 1)", forHTTPHeaderField: "Range")
             group.enter()
-            get(request, session: session, expect: span.2) { data in
+            get(request, session: session, expect: span.2, token: token) { data in
                 if let data { pieces[n] = data } else { failed = true }
                 group.leave()
             }
         }
         group.notify(queue: engineQueue) { [weak self] in
-            self?.finish(failed ? nil : pieces.reduce(into: Data()) { $0.append($1 ?? Data()) }, done)
+            guard let self, self.generation == token else { return }
+            self.finish(failed ? nil : pieces.reduce(into: Data()) { $0.append($1 ?? Data()) }, token: token, done)
         }
     }
 
@@ -71,23 +84,30 @@ final class WebSeed {
         return URL(string: base + path)
     }
 
-    private func get(_ request: URLRequest, session: URLSession, expect: Int, done: @escaping (Data?) -> Void) {
-        let task = session.dataTask(with: request) { [weak self] data, response, _ in
+    private func get(
+        _ request: URLRequest, session: URLSession, expect: Int, token: UInt64,
+        done: @escaping (Data?) -> Void
+    ) {
+        var task: URLSessionDataTask!
+        task = session.dataTask(with: request) { [weak self] data, response, _ in
             let code = (response as? HTTPURLResponse)?.statusCode ?? 0
             engineQueue.async {
+                self?.tasks.remove(task)
+                guard let self, self.generation == token else { done(nil); return }
                 if code == 503, let data, let wait = Int(String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)) {
-                    self?.retryAt = Date().addingTimeInterval(TimeInterval(min(wait, 3600)))
+                    self.retryAt = Date().addingTimeInterval(TimeInterval(min(wait, 3600)))
                 }
                 done((code == 200 || code == 206) && data?.count == expect ? data : nil)
             }
         }
-        self.task = task
+        tasks.insert(task)
         task.resume()
     }
 
-    private func finish(_ data: Data?, _ done: (Data?) -> Void) {
+    private func finish(_ data: Data?, token: UInt64, _ done: (Data?) -> Void) {
+        guard generation == token else { return }
         busy = false
-        task = nil
+        tasks.removeAll()
         if let data {
             failures = 0
             downloaded += Int64(data.count)

@@ -280,7 +280,7 @@ final class ExtensionManager: NSObject {
 
     @MainActor
     private func load(_ record: ExtensionRecord) async {
-        guard contexts[record.id] == nil, !loading.contains(record.id) else { return }
+        guard record.enabled, contexts[record.id] == nil, !loading.contains(record.id) else { return }
         loading.insert(record.id)
         defer { loading.remove(record.id) }
         do {
@@ -302,6 +302,10 @@ final class ExtensionManager: NSObject {
 
             // Like Chrome, permissions listed in the manifest are granted at install time
             // (the user already confirmed them in the install prompt).
+            for name in webExtension.manifest["permissions"] as? [String] ?? []
+            where name != "<all_urls>" && !name.contains("://") {
+                context.setPermissionStatus(.grantedExplicitly, for: WKWebExtension.Permission(rawValue: name))
+            }
             for permission in webExtension.requestedPermissions {
                 context.setPermissionStatus(.grantedExplicitly, for: permission)
             }
@@ -347,6 +351,8 @@ final class ExtensionManager: NSObject {
 
     private func unload(_ id: String) {
         socketRelays.removeValue(forKey: id)?.stop()
+        ExtensionSystem.shared.extensionUnloaded(id)
+        ExtensionNotifications.shared.extensionUnloaded(id)
         ExtensionOffscreen.shared.extensionUnloaded(id)
         ExtensionEventPush.shared.extensionUnloaded(id)
         ExtensionContentScripts.shared.extensionUnloaded(id)
@@ -638,13 +644,21 @@ final class ExtensionManager: NSObject {
         ))
     }
 
+    static func preservingState(of existing: ExtensionRecord?, into new: ExtensionRecord) -> ExtensionRecord {
+        guard let existing else { return new }
+        var record = new
+        record.enabled = existing.enabled
+        record.linkedTo = existing.linkedTo
+        record.pinned = existing.pinned
+        record.sidePanel = existing.sidePanel
+        return record
+    }
+
     @MainActor
-    private func finishInstall(_ record: ExtensionRecord) {
-        var record = record
-        let existing = records.first { $0.id == record.id }
+    private func finishInstall(_ newRecord: ExtensionRecord) {
+        let existing = records.first { $0.id == newRecord.id }
+        let record = Self.preservingState(of: existing, into: newRecord)
         let isUpdate = existing != nil
-        // An update keeps the profiles / spaces the extension was linked to.
-        record.linkedTo = existing?.linkedTo
         iconCache[record.id] = nil
         unload(record.id)
         records.removeAll { $0.id == record.id }
@@ -951,6 +965,9 @@ final class ExtensionManager: NSObject {
     // MARK: Tab events (browser → extensions)
 
     func didOpen(_ tab: Tab) { controller.didOpenTab(tab) }
+    func didMove(_ tab: Tab, fromIndex: Int) {
+        controller.didMoveTab(tab, from: fromIndex)
+    }
     func didClose(_ tab: Tab) {
         controller.didCloseTab(tab, windowIsClosing: false)
         SidePanelManager.shared.tabClosed(tab)
@@ -1060,7 +1077,13 @@ extension ExtensionManager: WKWebExtensionControllerDelegate {
             return
         }
         trace("openNewTab \(configuration.url?.absoluteString ?? "-")")
-        let tab = browser.newTab(url: configuration.url, select: configuration.shouldBeActive)
+        let parent = configuration.parentTab as? Tab
+        let index = configuration.index == NSNotFound ? nil : configuration.index
+        let tab = browser.newTab(
+            url: configuration.url, select: configuration.shouldBeActive, after: parent,
+            extensionIndex: index, pinned: configuration.shouldBePinned
+        )
+        tab.readerModeRequested = configuration.shouldReaderModeBeActive
         if configuration.shouldBeMuted { tab.setMuted(true) }
         completionHandler(tab, nil)
     }
@@ -1119,6 +1142,26 @@ extension ExtensionManager: WKWebExtensionControllerDelegate {
             cancelTitle: "Don’t Allow"
         )
         Task { @MainActor in answer(await PromptPresenter.present(prompt)) }
+    }
+
+    func requestNativePermissions(
+        _ names: [String], context: WKWebExtensionContext, completion: @escaping (Bool) -> Void
+    ) {
+        guard !names.isEmpty else { completion(false); return }
+        let current = context.currentPermissions
+        if names.allSatisfy({ current.contains(WKWebExtension.Permission(rawValue: $0)) }) { completion(true); return }
+        let optional = Set(context.webExtension.manifest["optional_permissions"] as? [String] ?? [])
+        guard Set(names).isSubset(of: optional) else { completion(false); return }
+        var items = Self.permissionSummary(["permissions": names])
+        if items.isEmpty { items = [.init(symbol: "puzzlepiece.extension", text: "Use " + names.joined(separator: ", "))] }
+        ask(context, items) { granted in
+            if granted {
+                for name in names {
+                    context.setPermissionStatus(.grantedExplicitly, for: WKWebExtension.Permission(rawValue: name))
+                }
+            }
+            completion(granted)
+        }
     }
 
     func webExtensionController(

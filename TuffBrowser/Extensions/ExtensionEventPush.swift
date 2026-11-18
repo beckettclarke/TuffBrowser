@@ -32,8 +32,14 @@ final class ExtensionEventPush {
 
     /// Sends an event to every extension listening for it. `extra` asks the shim to fill
     /// something in first (`groupWindow`: the window id of the tab group in the first argument).
+    private func allows(_ id: String, _ event: String) -> Bool {
+        guard let context = ExtensionManager.shared.contexts[id] else { return false }
+        guard let permission = ExtensionAPIPermissions.event(event) else { return true }
+        return context.currentPermissions.contains(WKWebExtension.Permission(rawValue: permission))
+    }
+
     func emit(_ event: String, args: [Any], extra: [String: Any] = [:]) {
-        for (id, events) in subscriptions where events.contains(event) {
+        for (id, events) in subscriptions where events.contains(event) && allows(id, event) {
             relays[id]?.send(event: event, args: args, extra: extra)
         }
     }
@@ -51,7 +57,7 @@ final class ExtensionEventPush {
             indexes[field] = index
         }
         for (id, events) in subscriptions where events.contains(event) {
-            guard let context = ExtensionManager.shared.contexts[id], allowed(context) else { continue }
+            guard allows(id, event), let context = ExtensionManager.shared.contexts[id], allowed(context) else { continue }
             relays[id]?.send(event: event, args: [details], extra: ["tabs": indexes])
         }
     }
@@ -59,14 +65,14 @@ final class ExtensionEventPush {
     /// Sends a window event; the shim passes the listener the window as `windows.getLastFocused`
     /// reports it (Tuff has the one).
     func emitWindowEvent(_ event: String) {
-        for (id, events) in subscriptions where events.contains(event) {
+        for (id, events) in subscriptions where events.contains(event) && allows(id, event) {
             relays[id]?.send(event: event, args: [], extra: ["window": true])
         }
     }
 
     /// Sends an event to one extension (e.g. a notification click to its owner), if it listens.
     func emit(_ event: String, args: [Any], extra: [String: Any] = [:], to extensionID: String) {
-        guard subscriptions[extensionID]?.contains(event) == true else { return }
+        guard subscriptions[extensionID]?.contains(event) == true, allows(extensionID, event) else { return }
         relays[extensionID]?.send(event: event, args: args, extra: extra)
     }
 
@@ -80,6 +86,12 @@ final class ExtensionEventPush {
 private final class EventRelay: NSObject, WKNavigationDelegate {
     private var webView: WKWebView?
     private let url: URL
+    private let relayID = UUID().uuidString
+    private var nextMessageID = 1
+    private var pending: [[String: Any]] = []
+    private var ready = false
+    private var sending = false
+    private var generation = 0
 
     init(configuration: WKWebViewConfiguration?, url: URL) {
         self.url = url
@@ -92,20 +104,57 @@ private final class EventRelay: NSObject, WKNavigationDelegate {
     }
 
     func send(event: String, args: [Any], extra: [String: Any] = [:]) {
-        var message: [String: Any] = ["__tuffEvent": event, "args": args]
+        guard webView != nil else { return }
+        var message: [String: Any] = [
+            "__tuffEvent": event, "args": args, "__tuffDelivery": relayID + ":\(nextMessageID)",
+        ]
+        nextMessageID += 1
         message.merge(extra) { a, _ in a }
-        guard let data = try? JSONSerialization.data(withJSONObject: message),
+        pending.append(message)
+        deliverNext()
+    }
+
+    private func deliverNext() {
+        guard ready, !sending, let message = pending.first, let webView,
+              let data = try? JSONSerialization.data(withJSONObject: message),
               let json = String(data: data, encoding: .utf8) else { return }
-        webView?.evaluateJavaScript("try { chrome.runtime.sendMessage(\(json)); } catch (e) {}", completionHandler: nil)
+        sending = true
+        let generation = self.generation
+        webView.evaluateJavaScript("try { chrome.runtime.sendMessage(\(json)); } catch (e) {}") { [weak self] _, error in
+            DispatchQueue.main.async {
+                guard let self, self.generation == generation else { return }
+                self.sending = false
+                guard error == nil else {
+                    self.ready = false
+                    self.webView?.reload()
+                    return
+                }
+                if !self.pending.isEmpty { self.pending.removeFirst() }
+                self.deliverNext()
+            }
+        }
+    }
+
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        ready = true
+        sending = false
+        deliverNext()
     }
 
     func stop() {
+        generation += 1
+        ready = false
+        sending = false
+        pending.removeAll()
         webView?.stopLoading()
         webView?.navigationDelegate = nil
         webView = nil
     }
 
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+        generation += 1
+        ready = false
+        sending = false
         webView.load(URLRequest(url: url))
     }
 }

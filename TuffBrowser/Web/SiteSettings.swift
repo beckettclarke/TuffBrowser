@@ -3,6 +3,50 @@ import Observation
 import SwiftUI
 import WebKit
 
+struct ContentSettingPattern {
+    let scheme: String
+    let host: String
+    let port: String?
+
+    var key: String { "\(scheme)://\(host)" + (port.map { ":\($0)" } ?? "") }
+    var isGlobal: Bool { scheme == "*" && host == "*" && (port == nil || port == "*") }
+    var specificity: Int {
+        (host == "*" ? 0 : host.hasPrefix("*.") ? 100 + host.count : 1000 + host.count)
+            + (scheme == "*" ? 0 : 100) + (port == nil || port == "*" ? 0 : 10)
+    }
+
+    init?(pattern: String) {
+        let regex = try? NSRegularExpression(pattern: #"^(\*|https?)://(\*|(?:\*\.)?[^/:*]+)(?::([0-9]+|\*))?(?:/.*)?$"#)
+        guard let match = regex?.firstMatch(in: pattern, range: NSRange(pattern.startIndex..., in: pattern)),
+              let schemeRange = Range(match.range(at: 1), in: pattern),
+              let hostRange = Range(match.range(at: 2), in: pattern) else { return nil }
+        scheme = String(pattern[schemeRange]).lowercased()
+        host = String(pattern[hostRange]).lowercased()
+        port = Range(match.range(at: 3), in: pattern).map { String(pattern[$0]) }
+    }
+
+    func matches(_ url: URL?) -> Bool {
+        guard let url, let pageScheme = url.scheme?.lowercased(), ["http", "https"].contains(pageScheme),
+              let pageHost = url.host(percentEncoded: false)?.lowercased() else { return false }
+        if scheme != "*" && scheme != pageScheme { return false }
+        let hostMatches: Bool
+        if host == "*" {
+            hostMatches = true
+        } else if host.hasPrefix("*.") {
+            let bare = String(host.dropFirst(2))
+            hostMatches = pageHost == bare || pageHost.hasSuffix("." + bare)
+        } else {
+            hostMatches = pageHost == host
+        }
+        guard hostMatches else { return false }
+        guard let port, port != "*" else { return true }
+        let defaultPort = pageScheme == "https" ? 443 : 80
+        return Int(port) == (url.port ?? defaultPort)
+    }
+
+    func matches(origin: String) -> Bool { matches(URL(string: origin)) }
+}
+
 /// Per-site choices that override Settings → Privacy for one site: JavaScript, pop-ups and
 /// autoplay, plus the cross-site cookie access sites ask for with the Storage Access API.
 ///
@@ -54,14 +98,34 @@ final class SiteSettings {
         return host
     }
 
+    private func matchingEntry(in entries: [String: Entry], for url: URL?) -> (key: String, entry: Entry)? {
+        entries.compactMap { key, entry -> (String, Entry, Int)? in
+            guard key.contains("://"), let pattern = ContentSettingPattern(pattern: key), pattern.matches(url) else { return nil }
+            return (key, entry, pattern.specificity)
+        }.max { $0.2 < $1.2 }.map { ($0.0, $0.1) }
+    }
+
     func entry(for url: URL?, incognito: Bool) -> Entry {
         guard let key = Self.key(for: url) else { return Entry() }
         if incognito, let overlay = incognitoSites[key] { return overlay }
-        return sites[key] ?? Entry()
+        if let exact = sites[key] { return exact }
+        let normal = matchingEntry(in: sites, for: url)
+        guard incognito else { return normal?.entry ?? Entry() }
+        let overlay = matchingEntry(in: incognitoSites, for: url)
+        if let overlay, let normal {
+            let overlayPattern = ContentSettingPattern(pattern: overlay.key)?.specificity ?? 0
+            let normalPattern = ContentSettingPattern(pattern: normal.key)?.specificity ?? 0
+            return overlayPattern >= normalPattern ? overlay.entry : normal.entry
+        }
+        return (overlay ?? normal)?.entry ?? Entry()
     }
 
     func update(_ url: URL?, incognito: Bool, _ change: (inout Entry) -> Void) {
         guard let key = Self.key(for: url) else { return }
+        update(key: key, incognito: incognito, change)
+    }
+
+    func update(key: String, incognito: Bool, _ change: (inout Entry) -> Void) {
         if incognito {
             var entry = incognitoSites[key] ?? sites[key] ?? Entry()
             change(&entry)

@@ -82,17 +82,20 @@ underlying data/capability to make it real. Implement natively, then remove the 
 `missing` list (or have the shim defer to a real implementation).
 
 - [x] **[P1]** `chrome.history` → wired to `HistoryStore`: `search`, `getVisits`, `addUrl`, `deleteUrl`,
-      `deleteRange`, `deleteAll` implemented via the native bridge. `getVisits` reports the last visit
-      (the store keeps aggregates, not a per-visit log). **Events (`onVisited`/`onVisitRemoved`/
-      `onTitleChanged`) still inert** — need the event-push mechanism (below).
+      `deleteRange`, `deleteAll` implemented via the native bridge. `getVisits` reports every retained
+      visit, scoped to the current profile. Events (`onVisited`/`onVisitRemoved`/`onTitleChanged`) use
+      native event push.
 - [x] **[P1]** `chrome.downloads` → `ExtensionDownloads.swift` + `DownloadManager`: `download` (hidden web
       view on the profile store → `WKDownload`), `search`, `cancel`, `erase`, `open`, `show` implemented.
-      **`pause`/`resume` report an error (WKDownload has neither); `filename`/`saveAs`/`conflictAction` not
-      honoured yet; events inert.** Added `chromeID`/`url`/byte counts to `DownloadItem` (additive, UI-safe).
+      `pause`/`resume` use `DownloadManager` (WebKit resume data and multi-connection ranges), and
+      created/changed/erased events use native event push. 2026-11-18: `filename` (including safe relative
+      subfolders), `saveAs`, and `uniquify` / `overwrite` / `prompt` conflict handling work in both download
+      engines; a real extension download completed in the requested subfolder.
 - [x] **[P1]** `chrome.notifications` → `UNUserNotificationCenter` (`ExtensionNotifications.swift`):
-      `create` (title / message / silent), `clear`, `getAll`, `getPermissionLevel` implemented; prompts
-      for system permission on first use. **`update`, `iconUrl` attachments, and click/close events
-      still pending** (events need the push mechanism).
+      `create`, `clear`, `getAll`, `getPermissionLevel`, `update` implemented; IDs are isolated per extension.
+      Prompts for system permission on first use. 2026-11-18: `iconUrl` loads extension / web images, up to
+      two buttons use native actions, and `onButtonClicked` reports the index. Delivery wasn't runtime-tested
+      because macOS denied notification permission in the throwaway test profile.
 - [x] **[P1]** `chrome.identity` → `ExtensionIdentity.swift`: `getRedirectURL` (computed synchronously in
       the shim) + `launchWebAuthFlow` (presented web view intercepting the `chromiumapp.org` redirect)
       implemented — **unblocks OAuth sign-in**. Used a WKWebView rather than ASWebAuthenticationSession
@@ -103,8 +106,8 @@ underlying data/capability to make it real. Implement natively, then remove the 
       WebKit routes its runtime messaging. One per extension; cleaned up on unload. **Verify at runtime
       that messaging reaches the worker.**
 - [x] **[P1]** `chrome.management` → wired to `ExtensionManager.records`: `getAll`, `get`, `getSelf`,
-      `getPermissionWarningsById`, `setEnabled` implemented. **`uninstallSelf` + events still pending**
-      (uninstall needs a confirm card; events need the push mechanism).
+      `getPermissionWarningsById`, `setEnabled`, `uninstallSelf` and events implemented. `uninstallSelf`
+      uses the destructive confirmation card; runtime-verified 2026-11-18.
 - [x] **[P1]** `chrome.sessions` → wired to `BrowserState.closedTabs`: `getRecentlyClosed`, `restore`
       (by id, or most recent when omitted), `getDevices` (empty — no sync) implemented. Added stable
       `id` + `closedAt` to `ClosedTab` (optional, so old sessions still decode). `onChanged` fires on close,
@@ -149,9 +152,8 @@ underlying data/capability to make it real. Implement natively, then remove the 
       **Runtime-verified: `history.onVisited` + `history.onVisitRemoved` fire end-to-end and wake the worker.**
       Wired: `history.onVisited`/`onVisitRemoved`/`onTitleChanged`, `downloads.onCreated`/`onChanged`/`onErased`,
       `notifications.onClicked`/`onClosed`, `sessions.onChanged`, `management.onInstalled`/`onUninstalled`/
-      `onEnabled`/`onDisabled`, `tts.onEvent`, `idle.onStateChanged`.
-      Remaining: `notifications.onButtonClicked` (needs notification buttons), `identity.onSignInChanged`
-      (Chrome-account, N/A).
+      `onEnabled`/`onDisabled`, `tts.onEvent`, `idle.onStateChanged`, `notifications.onButtonClicked`.
+      Remaining: `identity.onSignInChanged` (Chrome-account, N/A).
 
 ## C. [P2] Other feasible inert namespaces
 
@@ -182,12 +184,12 @@ underlying data/capability to make it real. Implement natively, then remove the 
       `entireWord`, `matchDiacritics`, `rangeData` and `rectData`; highlights use the CSS Custom Highlight API.
       Runtime-verified.
 - [x] **[P2]** `chrome.search` → `query` implemented (opens the configured engine; CURRENT_TAB / NEW_TAB).
-      Firefox `browser.search.get` pending.
+      Firefox `browser.search.get` returns the configured engine and templates; runtime-verified 2026-11-18.
 - [x] **[P2]** `chrome.omnibox` → command-bar keyword integration: `setDefaultSuggestion`, `onInputStarted/Changed/Entered/Cancelled`.
       Done (2026-11-17): typing an extension's keyword and a space in the command bar turns it into a chip;
       the rest goes to `onInputChanged`, its `suggest()` results list under the field, ↩ sends
       `onInputEntered` (`newForegroundTab` from ⌘T, `currentTab` from ⌘L), and Esc / ⌫ on the chip cancels.
-      Runtime-verified. `onDeleteSuggestion` isn't offered yet.
+      Runtime-verified, including `onDeleteSuggestion`.
 - [x] **[P2]** `chrome.tts` → `ExtensionTTS.swift` (AVSpeechSynthesizer): `speak`, `stop`, `pause`, `resume`,
       `getVoices`, `isSpeaking` implemented (180 voices returned in test); `onEvent` (start/end/interrupted/
       paused/resumed) pushed via the event mechanism.
@@ -200,9 +202,9 @@ underlying data/capability to make it real. Implement natively, then remove the 
 - [x] **[P2]** Firefox `browser.contentScripts` → dynamic content-script registration: `register`, `unregister`
       (also Firefox MV2 `userScripts.register`). Isolated-world scripts get a world per extension without extension APIs.
 - [x] **[P2]** `chrome.proxy` → system/proxy config: `settings`, `onProxyError`. (Scope carefully; may be partial.)
-      Done (2026-11-17): `fixed_servers` (HTTP / HTTPS CONNECT and SOCKS5, with `bypassList`) and `system` /
-      `direct`, on every website data store through `WKWebsiteDataStore.proxyConfigurations`; Firefox's
-      `manual` shape too. `pac_script`, `auto_detect` and SOCKS4 are refused with an error. Kept across launches.
+      Done (2026-11-17): `fixed_servers` (HTTP / HTTPS CONNECT and SOCKS5, with `bypassList`) and `system`,
+      on every website data store through `WKWebsiteDataStore.proxyConfigurations`; Firefox's
+      `manual` shape too. `direct` / `none` is refused because WebKit can't bypass system proxies explicitly. `pac_script`, `auto_detect` and SOCKS4 are refused with an error. Kept across launches.
       Runtime-verified: a dead proxy blocks a new site, clearing it restores direct loads. `onProxyError` and
       proxy sign-in (`webRequest.onAuthRequired`) are inert.
 - [x] **[P2]** `chrome.fontSettings` → font prefs: `getFont`, `setFont`, `clearFont`, `getFontList`, `onFontChanged`.
@@ -433,16 +435,21 @@ problems from the same audit are fixed (see BUGS.md).
 - [ ] **[P3]** Web Push (notifications only arrive while Tuff is running).
 
 ### History, search and tabs
-- [ ] **[P2]** **History keeps one entry per page** (last visit only), so a page seen yesterday and
+- [x] **[P2]** **History keeps one entry per page** (last visit only), so a page seen yesterday and
       today shows under today only. Keep a per-visit log.
-- [ ] **[P2]** **History per profile.** School's command bar suggests Home's history today.
+      Done (2026-11-18): visit dates persist alongside each page; History shows one row per visit, date-range
+      deletion preserves other visits, and `history.getVisits` returns them. Unit-tested and runtime-verified.
+- [x] **[P2]** **History per profile.** School's command bar suggests Home's history today.
+      Done (2026-11-18): entries, imports, suggestions, top sites and extension APIs are profile-scoped;
+      existing history moves to the original profile. Runtime-verified with an empty School space.
 - [x] **[P2]** History menu: **Recently Closed** and **recent pages** submenus.
       Done (2026-11-17): `App/HistoryMenu.swift` fills them as the menu opens (⌘-choose opens in a new tab). Runtime-verified.
-- [ ] **[P2]** Command bar **zero state** (⌘T on an empty field: top sites, recent tabs) and
+- [x] **[P2]** Command bar **zero state** (⌘T on an empty field: top sites, recent tabs) and
       **Paste and Go** in the address pill's menu.
-      Paste and Go done (2026-11-17) (address bar's right-click menu, plus Edit → Paste and Go). Zero state still to do.
+      Done: Paste and Go (2026-11-17) in the address bar's right-click menu and Edit menu; zero state
+      (2026-11-18) shows recent tabs and this profile's top sites, with Return activating the selection.
 - [ ] **[P2]** **Translate page** (Apple's Translation framework).
-- [ ] **[P3]** Per-site user agent; ⌥-click a link to download it; text-only zoom.
+- [ ] **[P3]** Per-site user agent; text-only zoom. ⌥-click a link to download it done (2026-11-18).
 - [ ] **[P3]** A quick "save for later" / bookmarks manager (favourites and pinned tabs cover most of it).
 
 ### Quality
@@ -452,9 +459,10 @@ problems from the same audit are fixed (see BUGS.md).
       horizontal tabs and favourite tiles read title + state (playing, muted, camera, loading, unloaded) and are selectable.
 - [x] **[P2]** **Unit tests.** No test target. Start with `BrowserState.resolve`, `Tab.samePage`,
       `Tab.zoomStep`, `AdvancedSettings.currentMajorVersion`, `SitePermissions.decision`.
-      Done (2026-11-17): `TuffBrowserTests` target, `make test` (12 tests: resolve, samePage, zoomStep, version maths,
-      extension version compare, Gecko detection, store URL, shim insertion, update-check parsing). The host app
-      opens no window and loads no profile under XCTest. `SitePermissions.decision` not covered yet.
+      Done (2026-11-17): `TuffBrowserTests` target, `make test`. Expanded on 2026-11-18 to 54 tests covering
+      the CDL handoff's permission, metadata, download, torrent, extension, cookie and browser regressions. The host app
+      opens no window and loads no profile under XCTest. 2026-11-18: added `SitePermissions.decision`, per-visit /
+      per-profile history and extension-download destination coverage.
 - [ ] **[P3]** Localization (no strings are localizable yet).
 
 ---

@@ -30,7 +30,10 @@ extension Tab: WKNavigationDelegate {
         // Magnet links open Tuff's own torrent client (its add sheet asks before anything starts).
         if url.scheme?.lowercased() == "magnet" {
             decisionHandler(.cancel, preferences)
-            DispatchQueue.main.async { TorrentBridge.offer(magnet: url) }
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                TorrentBridge.offer(magnet: url, isPrivate: self.browser?.isPrivate ?? false)
+            }
             return
         }
 
@@ -64,8 +67,13 @@ extension Tab: WKNavigationDelegate {
             return
         }
 
-        // ⌘-click or middle-click opens a background tab.
         let isLink = navigationAction.navigationType == .linkActivated
+        if isLink, navigationAction.modifierFlags.contains(.option), url.scheme == "http" || url.scheme == "https" {
+            decisionHandler(.download, preferences)
+            return
+        }
+
+        // ⌘-click or middle-click opens a background tab.
         let wantsNewTab = navigationAction.modifierFlags.contains(.command) || navigationAction.buttonNumber == 4
         if isLink, wantsNewTab, let browser {
             let foreground = navigationAction.modifierFlags.contains(.shift) != AppSettings.shared.tabs.foregroundLinks
@@ -230,7 +238,7 @@ extension Tab: WKNavigationDelegate {
             refreshHeaderColor()
             return
         }
-        if !incognito { HistoryStore.shared.record(url: u, title: webView.title ?? "") }
+        if !incognito { HistoryStore.shared.record(url: u, title: webView.title ?? "", profileID: browser?.profile(containing: self)?.id) }
         // A PDF's placeholder page has no header or icon of its own to find.
         if let pdf {
             // WebKit hands the keyboard to a page it brings back from the back / forward
@@ -240,6 +248,10 @@ extension Tab: WKNavigationDelegate {
             return
         }
         refreshHeaderColor()
+        if readerModeRequested {
+            readerModeRequested = false
+            openReader()
+        }
         // Late styles (a header painted by script, a banner slid in) can change it again.
         refreshHeaderColor(after: 0.8)
         refreshHeaderColor(after: 2.5)
@@ -266,7 +278,7 @@ extension Tab: WKNavigationDelegate {
             reportSameDocumentNavigation(to: u, type: type)
         }
         guard type == 1 || type == 3, !(browser?.isPrivate ?? false), pdf == nil, let u = webView.url else { return }
-        HistoryStore.shared.record(url: u, title: webView.title ?? "")
+        HistoryStore.shared.record(url: u, title: webView.title ?? "", profileID: browser?.profile(containing: self)?.id)
     }
 
     /// webNavigation has these in Chrome and Firefox but not in WebKit: a single-page app

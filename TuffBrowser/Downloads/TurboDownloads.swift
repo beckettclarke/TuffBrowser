@@ -84,13 +84,7 @@ extension DownloadManager {
     /// The cookies a request to `url` would carry, from that website data.
     static func cookieHeader(for url: URL, store: WKWebsiteDataStore, done: @escaping (String?) -> Void) {
         store.httpCookieStore.getAllCookies { cookies in
-            let host = url.host(percentEncoded: false)?.lowercased() ?? ""
-            let secure = url.scheme?.lowercased() == "https"
-            let matching = cookies.filter { cookie in
-                let domain = cookie.domain.lowercased()
-                let domainMatches = domain.hasPrefix(".") ? (host == domain.dropFirst() || host.hasSuffix(domain)) : host == domain
-                return domainMatches && url.path.hasPrefix(cookie.path) && (!cookie.isSecure || secure)
-            }
+            let matching = FaviconStore.cookies(cookies, for: url)
             done(HTTPCookie.requestHeaderFields(with: matching)["Cookie"])
         }
     }
@@ -142,6 +136,7 @@ extension DownloadManager {
         let store = isPrivate ? (BrowserState.all.last { $0.isPrivate }?.currentProfile.dataStore ?? DataStores.website) : BrowserState.shared.currentProfile.dataStore
         item.dataStore = store
         items.insert(item, at: 0)
+        ExtensionDownloads.shared.created(item)
         bumpPulse(isPrivate: isPrivate)
         var state = HTTPTransfer.State(url: url)
         state.headers = ["User-Agent": Self.userAgent]
@@ -163,16 +158,25 @@ extension DownloadManager {
         item.resumeData = nil
         guard runningTransfers < Self.httpSettings.maxActive else {
             item.state = .failed(DownloadItem.queuedReason)
+            ExtensionDownloads.shared.changed(item)
             scheduleSave()
             return
         }
-        let transfer = HTTPTransfer(state: state, connections: Self.httpSettings.connections, limiter: Self.limiter)
+        let store = item.dataStore
+        let transfer = HTTPTransfer(
+            state: state, connections: Self.httpSettings.connections, limiter: Self.limiter,
+            cookieProvider: { url, done in
+                guard let store else { done(nil); return }
+                DispatchQueue.main.async { DownloadManager.cookieHeader(for: url, store: store, done: done) }
+            }
+        )
         item.transfer = transfer
         item.state = .running
         item.lastSampleTime = nil
         item.bytesPerSecond = nil
         item.bytesReceived = transfer.received
         item.totalBytes = state.total
+        ExtensionDownloads.shared.changed(item)
         if item.startedAt.timeIntervalSinceNow < -1, state.segments.isEmpty { item.startedAt = Date() }
         transfer.decideDestination = { [weak self, weak item] response, suggested in
             guard let self, let item else { return nil }
@@ -180,10 +184,12 @@ extension DownloadManager {
         }
         transfer.onProgress = { [weak item] got, total in
             guard let item else { return }
+            let totalChanged = item.totalBytes != total
             item.bytesReceived = got
             item.totalBytes = total
             item.fraction = total > 0 ? Double(got) / Double(total) : 0
             item.connections = item.transfer?.activeConnections ?? 0
+            if totalChanged { ExtensionDownloads.shared.changed(item) }
         }
         transfer.onFinish = { [weak self, weak item] result in
             guard let self, let item, item.transfer === transfer else { return }
@@ -196,6 +202,7 @@ extension DownloadManager {
                 let why = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
                 item.state = .failed(why)
                 if why == "Cancelled" { item.transferState = nil }
+                ExtensionDownloads.shared.changed(item)
                 self.scheduleSave()
             }
             self.runQueue()
@@ -205,17 +212,20 @@ extension DownloadManager {
         scheduleSave()
     }
 
-    /// Where an added-by-address download goes, once its name is known.
+    /// Where a multi-connection download goes, once its name is known.
     private func chooseDestination(for item: DownloadItem, suggested: String) -> URL? {
-        let destination = Self.uniqueDestination(for: suggested)
+        let destination = Self.preferredDestination(for: item, suggested: suggested)
         item.filename = destination.lastPathComponent
         item.destination = destination
-        guard AppSettings.shared.downloads.askWhereToSave else { return destination }
+        guard Self.shouldAsk(for: item, destination: destination) else {
+            return Self.prepareDestination(destination) ? destination : nil
+        }
+        Self.prepareDestination(destination)
         let panel = NSSavePanel()
         panel.directoryURL = destination.deletingLastPathComponent()
         panel.nameFieldStringValue = destination.lastPathComponent
         panel.canCreateDirectories = true
-        guard panel.runModal() == .OK, let url = panel.url else { return nil }
+        guard panel.runModal() == .OK, let url = panel.url, Self.prepareDestination(url) else { return nil }
         item.filename = url.lastPathComponent
         item.destination = url
         return url
@@ -233,9 +243,7 @@ extension DownloadManager {
         item.state = .finished
         item.transferState = nil
         scheduleSave()
-        if let id = item.chromeID {
-            ExtensionEventPush.shared.emit("downloads.onChanged", args: [["id": id, "state": ["current": "complete", "previous": "in_progress"]]])
-        }
+        ExtensionDownloads.shared.changed(item)
         DistributedNotificationCenter.default().post(name: Notification.Name("com.apple.DownloadFileFinished"), object: url.path)
         fileDidFinish(item)
     }
@@ -264,21 +272,30 @@ extension DownloadManager {
             item.connections = 0
             item.state = .failed(DownloadItem.pausedReason)
             item.bytesPerSecond = nil
+            ExtensionDownloads.shared.changed(item)
             scheduleSave()
             runQueue()
         } else if item.state == .running, let download = item.download {
             item.download = nil
             item.observation = nil
             item.state = .failed(DownloadItem.pausedReason)
+            ExtensionDownloads.shared.changed(item)
             download.cancel { [weak self, weak item] data in
                 DispatchQueue.main.async {
                     item?.resumeData = data
-                    if data == nil, let item { item.state = .failed("Stopped (this site can’t resume)") }
+                    if data == nil, let item {
+                        if item.partialFile != nil {
+                            Self.discardPartialFile(of: item)
+                        } else if let destination = item.destination {
+                            try? FileManager.default.removeItem(at: destination)
+                        }
+                    }
                     self?.scheduleSave()
                 }
             }
         } else if item.isQueued {
             item.state = .failed(DownloadItem.pausedReason)
+            ExtensionDownloads.shared.changed(item)
         }
     }
 

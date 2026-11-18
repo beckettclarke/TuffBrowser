@@ -97,22 +97,25 @@ enum TorrentBridge {
         return false
     }
 
-    static func offer(magnet: URL) {
+    static func offer(magnet: URL, isPrivate: Bool = false) {
+        guard !isPrivate else { declineIncognito(); return }
         route(magnet) {
             do { queue(try TorrentSource.load(magnet: magnet.absoluteString)) } catch { complain(error) }
         }
     }
 
     static func offer(file: URL, isPrivate: Bool) {
+        guard !isPrivate else { declineIncognito(); return }
         route(file) {
             do { queue(try TorrentSource.load(torrent: Data(contentsOf: file))) } catch { complain(error) }
         }
     }
 
     /// A .torrent on the web: fetched first (with the torrent proxy, if any).
-    static func offer(remote url: URL) {
+    static func offer(remote url: URL, isPrivate: Bool = false) {
         // With torrents off, it's just a file: download it, and the finished file asks.
-        guard enabled else { DownloadManager.shared.addURL(url, isPrivate: false); return }
+        guard enabled else { DownloadManager.shared.addURL(url, isPrivate: isPrivate); return }
+        guard !isPrivate else { declineIncognito(); return }
         route(url) {
             TorrentSession.shared.fetchTorrent(url) { result in
                 switch result {
@@ -120,6 +123,20 @@ enum TorrentBridge {
                 case .failure(let error): complain(error)
                 }
             }
+        }
+    }
+
+    private static func declineIncognito() {
+        Task { @MainActor in
+            var prompt = Prompt(
+                symbol: "magnet",
+                title: "Torrents aren’t available in Incognito",
+                message: "Tuff’s torrent list and resume data are saved on disk. Open this magnet link or torrent file in a regular window instead.",
+                confirmTitle: "OK",
+                cancelTitle: nil
+            )
+            prompt.browser = BrowserState.active
+            _ = await PromptPresenter.present(prompt)
         }
     }
 

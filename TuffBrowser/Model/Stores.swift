@@ -10,6 +10,35 @@ struct HistoryEntry: Codable {
     var title: String
     var lastVisit: Date
     var visits: Int
+    var visitDates: [Date]
+    var profileID: UUID?
+
+    init(url: URL, title: String, lastVisit: Date, visits: Int, visitDates: [Date] = [], profileID: UUID? = nil) {
+        self.url = url
+        self.title = title
+        self.lastVisit = lastVisit
+        self.visits = visits
+        self.visitDates = visitDates.isEmpty ? [lastVisit] : visitDates
+        self.profileID = profileID
+    }
+
+    private enum CodingKeys: String, CodingKey { case url, title, lastVisit, visits, visitDates, profileID }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        url = try values.decode(URL.self, forKey: .url)
+        title = try values.decode(String.self, forKey: .title)
+        lastVisit = try values.decode(Date.self, forKey: .lastVisit)
+        visits = try values.decode(Int.self, forKey: .visits)
+        visitDates = try values.decodeIfPresent([Date].self, forKey: .visitDates) ?? [lastVisit]
+        profileID = try values.decodeIfPresent(UUID.self, forKey: .profileID)
+    }
+
+    var storageKey: String { Self.storageKey(url: url, profileID: profileID) }
+
+    static func storageKey(url: URL, profileID: UUID?) -> String {
+        (profileID?.uuidString ?? "legacy") + "|" + url.absoluteString
+    }
 }
 
 /// A small in-memory history index, persisted as JSON. Used for command bar suggestions and
@@ -18,21 +47,39 @@ struct HistoryEntry: Codable {
 /// The file is read on a background queue at launch, so a long history (an import can bring
 /// tens of thousands of pages) doesn't block the first page. Visits recorded before it is in
 /// are merged with it; anything that needs the whole history first calls `ensureLoaded()`.
+final class HistoryWriter {
+    private let queue: DispatchQueue
+
+    init(label: String = "tuff.history-save") {
+        queue = DispatchQueue(label: label, qos: .utility)
+    }
+
+    func write(synchronously: Bool = false, _ body: @escaping () -> Void) {
+        if synchronously { queue.sync(execute: body) } else { queue.async(execute: body) }
+    }
+}
+
 final class HistoryStore {
     static let shared = HistoryStore()
 
     private var entries: [String: HistoryEntry] = [:]
-    private let file = Paths.appSupport.appendingPathComponent("history.json")
+    private let file: URL
     private let saver = Debouncer(delay: 3)
+    private let writer = HistoryWriter()
     private let limit = 20000
     private var loaded = false
 
-    private init() {
-        let file = self.file
+    init(file: URL = Paths.appSupport.appendingPathComponent("history.json"), loadInBackground: Bool = true) {
+        self.file = file
+        guard loadInBackground else { return }
         DispatchQueue.global(qos: .userInitiated).async {
             let list = Self.read(file)
             DispatchQueue.main.async { self.absorb(list) }
         }
+    }
+
+    deinit {
+        saver.cancel()
     }
 
     private static func read(_ file: URL) -> [HistoryEntry] {
@@ -51,9 +98,11 @@ final class HistoryStore {
         guard !loaded else { return }
         loaded = true
         for old in list {
-            let key = old.url.absoluteString
+            let key = old.storageKey
             if var e = entries[key] {
                 e.visits += old.visits
+                e.lastVisit = max(e.lastVisit, old.lastVisit)
+                e.visitDates = Array(Set(e.visitDates + old.visitDates)).sorted()
                 if e.title.isEmpty { e.title = old.title }
                 entries[key] = e
             } else {
@@ -62,17 +111,41 @@ final class HistoryStore {
         }
     }
 
-    func record(url: URL, title: String) {
+    /// History saved before per-profile storage belongs to the original profile.
+    func adoptLegacyEntries(profileID: UUID) {
+        ensureLoaded()
+        let legacy = entries.values.filter { $0.profileID == nil }
+        guard !legacy.isEmpty else { return }
+        for var old in legacy {
+            entries.removeValue(forKey: old.storageKey)
+            old.profileID = profileID
+            let key = old.storageKey
+            if var existing = entries[key] {
+                existing.visits += old.visits
+                existing.lastVisit = max(existing.lastVisit, old.lastVisit)
+                existing.visitDates = Array(Set(existing.visitDates + old.visitDates)).sorted()
+                if existing.title.isEmpty { existing.title = old.title }
+                entries[key] = existing
+            } else {
+                entries[key] = old
+            }
+        }
+        saveNow()
+    }
+
+    func record(url: URL, title: String, profileID: UUID?) {
         guard AppSettings.shared.privacy.saveHistory else { return }
         guard let scheme = url.scheme, scheme == "http" || scheme == "https" else { return }
-        let key = url.absoluteString
+        let key = HistoryEntry.storageKey(url: url, profileID: profileID)
+        let now = Date()
         if var e = entries[key] {
             e.visits += 1
-            e.lastVisit = Date()
+            e.lastVisit = now
+            e.visitDates.append(now)
             if !title.isEmpty { e.title = title }
             entries[key] = e
         } else {
-            entries[key] = HistoryEntry(url: url, title: title, lastVisit: Date(), visits: 1)
+            entries[key] = HistoryEntry(url: url, title: title, lastVisit: now, visits: 1, visitDates: [now], profileID: profileID)
         }
         saver.schedule { [weak self] in self?.saveNow() }
         if let e = entries[key] {
@@ -89,8 +162,8 @@ final class HistoryStore {
 
     /// Gives a page already in history the title it settled on. Single-page apps change their
     /// title after their address, so the visit is recorded with the old one first.
-    func updateTitle(url: URL, title: String) {
-        let key = url.absoluteString
+    func updateTitle(url: URL, title: String, profileID: UUID?) {
+        let key = HistoryEntry.storageKey(url: url, profileID: profileID)
         guard !title.isEmpty, var e = entries[key], e.title != title else { return }
         e.title = title
         entries[key] = e
@@ -101,18 +174,20 @@ final class HistoryStore {
     /// visit and the higher count, so importing the same browser twice doesn't double anything.
     /// Returns how many pages were new.
     @discardableResult
-    func merge(_ imported: [HistoryEntry]) -> Int {
+    func merge(_ imported: [HistoryEntry], profileID: UUID) -> Int {
         ensureLoaded()
         var added = 0
-        for item in imported {
+        for var item in imported {
             guard let scheme = item.url.scheme?.lowercased(), scheme == "http" || scheme == "https" else { continue }
-            let key = item.url.absoluteString
+            item.profileID = profileID
+            let key = item.storageKey
             if var e = entries[key] {
                 if item.lastVisit > e.lastVisit {
                     e.lastVisit = item.lastVisit
                     if !item.title.isEmpty { e.title = item.title }
                 }
                 e.visits = max(e.visits, item.visits)
+                e.visitDates = Array(Set(e.visitDates + item.visitDates)).sorted()
                 if e.title.isEmpty { e.title = item.title }
                 entries[key] = e
             } else {
@@ -142,27 +217,38 @@ final class HistoryStore {
         }
     }
 
-    /// One page of the History page's list: newest first, filtered. Every word of the query has
-    /// to appear in the title or the address.
-    func browse(_ filter: Filter, offset: Int, limit: Int) -> (items: [HistoryEntry], total: Int) {
+    /// One page of the History page's list: one row per visit, newest first, filtered. Every word
+    /// of the query has to appear in the title or the address.
+    func browse(_ filter: Filter, offset: Int, limit: Int, profileID: UUID) -> (items: [HistoryEntry], total: Int) {
         ensureLoaded()
         let words = filter.query.lowercased().split(whereSeparator: \.isWhitespace).map(String.init)
-        var list = entries.values.filter { filter.matches($0, words: words) }
+        var list: [HistoryEntry] = []
+        for entry in entries.values where entry.profileID == profileID {
+            for date in entry.visitDates {
+                var visit = entry
+                visit.lastVisit = date
+                visit.visitDates = [date]
+                if filter.matches(visit, words: words) { list.append(visit) }
+            }
+        }
         list.sort { $0.lastVisit > $1.lastVisit }
         let start = min(max(0, offset), list.count)
         let end = min(list.count, start + max(0, limit))
         return (Array(list[start..<end]), list.count)
     }
 
-    /// For the History page's sidebar: how many pages fall in each named stretch of time, and
+    /// For the History page's sidebar: how many visits fall in each named stretch of time, and
     /// the sites visited most.
-    func overview(ranges: [String: (start: Date, end: Date)], siteLimit: Int) -> (total: Int, counts: [String: Int], sites: [(host: String, pages: Int, visits: Int)]) {
+    func overview(ranges: [String: (start: Date, end: Date)], siteLimit: Int, profileID: UUID) -> (total: Int, counts: [String: Int], sites: [(host: String, pages: Int, visits: Int)]) {
         ensureLoaded()
+        let scoped = entries.values.filter { $0.profileID == profileID }
         var counts = ranges.mapValues { _ in 0 }
         var sites: [String: (pages: Int, visits: Int)] = [:]
-        for e in entries.values {
-            for (name, range) in ranges where e.lastVisit >= range.start && e.lastVisit <= range.end {
-                counts[name, default: 0] += 1
+        for e in scoped {
+            for date in e.visitDates {
+                for (name, range) in ranges where date >= range.start && date <= range.end {
+                    counts[name, default: 0] += 1
+                }
             }
             let host = e.url.displayHost.lowercased()
             let old = sites[host] ?? (0, 0)
@@ -171,37 +257,57 @@ final class HistoryStore {
         let top = sites.sorted { $0.value.visits != $1.value.visits ? $0.value.visits > $1.value.visits : $0.key < $1.key }
             .prefix(siteLimit)
             .map { (host: $0.key, pages: $0.value.pages, visits: $0.value.visits) }
-        return (entries.count, counts, Array(top))
+        return (scoped.reduce(0) { $0 + $1.visitDates.count }, counts, Array(top))
     }
 
     /// Removes every page from one site (`URL.displayHost`). Returns how many went.
     @discardableResult
-    func deleteHost(_ host: String) -> Int {
+    func deleteHost(_ host: String, profileID: UUID) -> Int {
         ensureLoaded()
         let host = host.lowercased()
-        let urls = entries.values.filter { $0.url.displayHost.lowercased() == host }.map(\.url)
-        delete(urls)
+        let urls = entries.values.filter { $0.profileID == profileID && $0.url.displayHost.lowercased() == host }.map(\.url)
+        delete(urls, profileID: profileID)
         return urls.count
     }
 
     /// Removes these pages, for the History page's delete buttons.
-    func delete(_ urls: [URL]) {
+    func delete(_ urls: [URL], profileID: UUID) {
         ensureLoaded()
-        let keys = urls.map(\.absoluteString).filter { entries[$0] != nil }
+        let keys = urls.map { HistoryEntry.storageKey(url: $0, profileID: profileID) }.filter { entries[$0] != nil }
         guard !keys.isEmpty else { return }
         keys.forEach { entries.removeValue(forKey: $0) }
         saver.schedule { [weak self] in self?.saveNow() }
-        ExtensionEventPush.shared.emit("history.onVisitRemoved", args: [["allHistory": false, "urls": keys]])
+        ExtensionEventPush.shared.emit("history.onVisitRemoved", args: [["allHistory": false, "urls": urls.map(\.absoluteString)]])
+    }
+
+    func deleteVisit(url: URL, at time: Double, profileID: UUID) {
+        ensureLoaded()
+        let key = HistoryEntry.storageKey(url: url, profileID: profileID)
+        guard var entry = entries[key] else { return }
+        let date = Date(timeIntervalSince1970: time / 1000)
+        let oldCount = entry.visitDates.count
+        entry.visitDates.removeAll { abs($0.timeIntervalSince(date)) < 0.001 }
+        guard entry.visitDates.count != oldCount else { return }
+        entry.visits = max(entry.visitDates.count, entry.visits - 1)
+        if entry.visitDates.isEmpty {
+            entries.removeValue(forKey: key)
+            ExtensionEventPush.shared.emit("history.onVisitRemoved", args: [["allHistory": false, "urls": [url.absoluteString]]])
+        } else {
+            entry.lastVisit = entry.visitDates.max() ?? entry.lastVisit
+            entries[key] = entry
+        }
+        saver.schedule { [weak self] in self?.saveNow() }
     }
 
     /// The site to complete a partly typed address to, inline in the command bar: the most
     /// visited host (without "www.") that starts with what was typed. Only for something that
     /// could be the start of a host (no spaces or slashes).
-    func hostCompletion(for typed: String) -> String? {
+    func hostCompletion(for typed: String, profileID: UUID) -> String? {
+        ensureLoaded()
         let prefix = typed.lowercased()
         guard !prefix.isEmpty, !prefix.contains(" "), !prefix.contains("/"), !prefix.contains(":") else { return nil }
         var visits: [String: Int] = [:]
-        for e in entries.values {
+        for e in entries.values where e.profileID == profileID {
             let host = e.url.displayHost.lowercased()
             guard host.count > prefix.count, host.hasPrefix(prefix) else { continue }
             visits[host, default: 0] += e.visits
@@ -209,12 +315,13 @@ final class HistoryStore {
         return visits.max { $0.value != $1.value ? $0.value < $1.value : $0.key > $1.key }?.key
     }
 
-    func search(_ query: String, limit: Int = 4) -> [HistoryEntry] {
+    func search(_ query: String, limit: Int = 4, profileID: UUID) -> [HistoryEntry] {
+        ensureLoaded()
         let q = query.lowercased().trimmed
         guard !q.isEmpty else { return [] }
         let now = Date()
         var scored: [(Double, HistoryEntry)] = []
-        for e in entries.values {
+        for e in entries.values where e.profileID == profileID {
             let host = e.url.displayHost.lowercased()
             let full = e.url.absoluteString.lowercased()
             let title = e.title.lowercased()
@@ -238,6 +345,18 @@ final class HistoryStore {
         return entries.count
     }
 
+    func count(profileID: UUID) -> Int {
+        ensureLoaded()
+        return entries.values.filter { $0.profileID == profileID }.count
+    }
+
+    func clear(profileID: UUID, synchronously: Bool = false) {
+        ensureLoaded()
+        entries = entries.filter { $0.value.profileID != profileID }
+        saveNow(synchronously: synchronously)
+        ExtensionEventPush.shared.emit("history.onVisitRemoved", args: [["allHistory": true, "urls": [String]()]])
+    }
+
     func clear(synchronously: Bool = false) {
         // Whatever is still on disk is about to go anyway.
         loaded = true
@@ -253,33 +372,32 @@ final class HistoryStore {
         if list.count > limit {
             list.sort { $0.lastVisit > $1.lastVisit }
             list = Array(list.prefix(limit))
-            entries = Dictionary(uniqueKeysWithValues: list.map { ($0.url.absoluteString, $0) })
+            entries = Dictionary(uniqueKeysWithValues: list.map { ($0.storageKey, $0) })
         }
         let file = self.file
         let write = { if let data = try? JSONEncoder().encode(list) { try? data.write(to: file, options: .atomic) } }
-        // At quit the process may exit before a background write runs.
-        if synchronously { write() } else { DispatchQueue.global(qos: .utility).async(execute: write) }
+        writer.write(synchronously: synchronously, write)
     }
 
     // MARK: WebExtension API shapes (chrome.history / chrome.topSites)
 
     /// Most-visited pages, for `chrome.topSites.get`.
-    func topSites(limit: Int = 20) -> [[String: Any]] {
+    func topSites(limit: Int = 20, profileID: UUID) -> [[String: Any]] {
         ensureLoaded()
-        return entries.values.sorted { $0.visits > $1.visits }
+        return entries.values.filter { $0.profileID == profileID }.sorted { $0.visits > $1.visits }
             .prefix(limit)
             .map { ["url": $0.url.absoluteString, "title": $0.title] }
     }
 
     /// `chrome.history.search`: text match over url / title within a time range, newest first.
-    func chromeSearch(text: String, startTime: Double?, endTime: Double?, maxResults: Int) -> [[String: Any]] {
+    func chromeSearch(text: String, startTime: Double?, endTime: Double?, maxResults: Int, profileID: UUID) -> [[String: Any]] {
         ensureLoaded()
         let q = text.lowercased().trimmed
         let start = startTime.map { Date(timeIntervalSince1970: $0 / 1000) } ?? .distantPast
         let end = endTime.map { Date(timeIntervalSince1970: $0 / 1000) } ?? .distantFuture
         return entries.values
             .filter { e in
-                guard e.lastVisit >= start, e.lastVisit <= end else { return false }
+                guard e.profileID == profileID, e.lastVisit >= start, e.lastVisit <= end else { return false }
                 if q.isEmpty { return true }
                 return e.url.absoluteString.lowercased().contains(q) || e.title.lowercased().contains(q)
             }
@@ -288,18 +406,19 @@ final class HistoryStore {
             .map(chromeItem)
     }
 
-    /// `chrome.history.getVisits`. The store keeps aggregates, not a per-visit log, so report the
-    /// last visit as a single entry.
-    func chromeVisits(for url: URL) -> [[String: Any]] {
+    /// `chrome.history.getVisits`: every visit still retained for this page, newest first.
+    func chromeVisits(for url: URL, profileID: UUID) -> [[String: Any]] {
         ensureLoaded()
-        guard let e = entries[url.absoluteString] else { return [] }
-        return [[
-            "id": e.url.absoluteString,
-            "visitId": "0",
-            "visitTime": e.lastVisit.timeIntervalSince1970 * 1000,
-            "referringVisitId": "0",
-            "transition": "link",
-        ]]
+        guard let e = entries[HistoryEntry.storageKey(url: url, profileID: profileID)] else { return [] }
+        return e.visitDates.sorted(by: >).map { date in
+            [
+                "id": e.url.absoluteString,
+                "visitId": String(Int(date.timeIntervalSince1970 * 1000)),
+                "visitTime": date.timeIntervalSince1970 * 1000,
+                "referringVisitId": "0",
+                "transition": "link",
+            ]
+        }
     }
 
     private func chromeItem(_ e: HistoryEntry) -> [String: Any] {
@@ -313,19 +432,35 @@ final class HistoryStore {
         ]
     }
 
-    func deleteUrl(_ url: URL) {
+    func deleteUrl(_ url: URL, profileID: UUID) {
         ensureLoaded()
-        entries.removeValue(forKey: url.absoluteString)
+        entries.removeValue(forKey: HistoryEntry.storageKey(url: url, profileID: profileID))
         saver.schedule { [weak self] in self?.saveNow() }
         ExtensionEventPush.shared.emit("history.onVisitRemoved", args: [["allHistory": false, "urls": [url.absoluteString]]])
     }
 
-    func deleteRange(startTime: Double, endTime: Double) {
+    func deleteRange(startTime: Double, endTime: Double, profileID: UUID? = nil) {
         ensureLoaded()
         let start = Date(timeIntervalSince1970: startTime / 1000)
         let end = Date(timeIntervalSince1970: endTime / 1000)
-        let removed = entries.filter { $0.value.lastVisit >= start && $0.value.lastVisit <= end }.map { $0.key }
-        entries = entries.filter { !($0.value.lastVisit >= start && $0.value.lastVisit <= end) }
+        var removed: [String] = []
+        var changed = false
+        for (key, var entry) in entries where profileID == nil || entry.profileID == profileID {
+            let remaining = entry.visitDates.filter { $0 < start || $0 > end }
+            let count = entry.visitDates.count - remaining.count
+            guard count > 0 else { continue }
+            changed = true
+            if remaining.isEmpty {
+                entries.removeValue(forKey: key)
+                removed.append(entry.url.absoluteString)
+            } else {
+                entry.visitDates = remaining
+                entry.visits = max(remaining.count, entry.visits - count)
+                entry.lastVisit = remaining.max() ?? entry.lastVisit
+                entries[key] = entry
+            }
+        }
+        guard changed else { return }
         saver.schedule { [weak self] in self?.saveNow() }
         if !removed.isEmpty {
             ExtensionEventPush.shared.emit("history.onVisitRemoved", args: [["allHistory": false, "urls": removed]])
@@ -573,10 +708,9 @@ final class FaviconStore {
     static func cookies(_ cookies: [HTTPCookie], for url: URL, now: Date = Date()) -> [HTTPCookie] {
         guard let host = url.host(percentEncoded: false)?.lowercased(), !host.isEmpty else { return [] }
         let path = url.path.isEmpty ? "/" : url.path
-        let secure = url.scheme == "https"
         return cookies.filter { cookie in
-            if let expires = cookie.expiresDate, expires < now { return false }
-            if cookie.isSecure && !secure { return false }
+            if let expires = cookie.expiresDate, expires <= now { return false }
+            if cookie.isSecure && url.scheme?.lowercased() != "https" { return false }
             let domain = cookie.domain.lowercased()
             let domainOK: Bool
             if domain.hasPrefix(".") {
@@ -615,6 +749,10 @@ final class FaviconStore {
 
 // MARK: - Downloads
 
+enum DownloadConflictAction: String {
+    case uniquify, overwrite, prompt
+}
+
 @Observable
 final class DownloadItem: Identifiable {
     enum State: Equatable { case running, finished, failed(String) }
@@ -634,8 +772,10 @@ final class DownloadItem: Identifiable {
     /// When bytes started flowing (reset once the destination is chosen), and when it finished.
     var startedAt = Date()
     var finishedAt: Date?
-    /// Where this download goes: the Settings choice, or what the context menu item said.
+    /// Where this download goes: the Settings choice, a context menu item, or an extension.
     @ObservationIgnored var saveLocation: DownloadManager.SaveLocation = .settings
+    @ObservationIgnored var requestedFilename: String?
+    @ObservationIgnored var conflictAction = DownloadConflictAction.uniquify
     /// The temporary file WebKit writes while replacing a file that is already there (WebKit
     /// won't overwrite); it takes the destination's place once the download has finished.
     @ObservationIgnored var partialFile: URL?
@@ -789,17 +929,7 @@ final class DownloadManager: NSObject {
         item.isPrivate = isPrivate
         attach(download, to: item)
         items.insert(item, at: 0)
-        if let id = item.chromeID {
-            ExtensionEventPush.shared.emit("downloads.onCreated", args: [[
-                "id": id,
-                "url": item.url?.absoluteString ?? "",
-                "filename": item.filename,
-                "state": "in_progress",
-                "bytesReceived": 0,
-                "totalBytes": -1,
-                "paused": false,
-            ]])
-        }
+        ExtensionDownloads.shared.created(item)
         bumpPulse(isPrivate: isPrivate)
         let state = Self.window(isPrivate: isPrivate)
         if AppSettings.shared.downloads.showPanelOnStart, state.downloadsButtonShowing {
@@ -833,13 +963,16 @@ final class DownloadManager: NSObject {
             let value = progress.fractionCompleted
             let received = progress.completedUnitCount
             let total = progress.totalUnitCount
+            let totalChanged = item?.totalBytes != total
             DispatchQueue.main.async {
                 item?.fraction = value
                 item?.bytesReceived = received
                 item?.totalBytes = total
+                if totalChanged, let item { ExtensionDownloads.shared.changed(item) }
             }
         }
         startSpeedSampling()
+        ExtensionDownloads.shared.changed(item)
     }
 
     /// Stops a download, keeping what has arrived when the server allows it, so Resume can carry on.
@@ -847,12 +980,14 @@ final class DownloadManager: NSObject {
         if item.transfer != nil || item.isQueued {
             pause(item)
             item.state = .failed("Cancelled")
+            ExtensionDownloads.shared.changed(item)
             return
         }
         let download = item.download
         item.state = .failed("Cancelled")
         item.download = nil
         item.observation = nil
+        ExtensionDownloads.shared.changed(item)
         guard let download else { Self.discardPartialFile(of: item); scheduleSave(); return }
         download.cancel { [weak self, weak item] data in
             DispatchQueue.main.async {
@@ -881,7 +1016,7 @@ final class DownloadManager: NSObject {
     }
 
     /// Deletes what a download that was replacing a file had written so far.
-    fileprivate static func discardPartialFile(of item: DownloadItem) {
+    static func discardPartialFile(of item: DownloadItem) {
         guard let temp = item.partialFile else { return }
         item.partialFile = nil
         try? FileManager.default.removeItem(at: temp)
@@ -910,29 +1045,62 @@ final class DownloadManager: NSObject {
         }
     }
 
-    static func uniqueDestination(for filename: String) -> URL {
-        var downloads = AppSettings.shared.downloads.folder
+    static func downloadsFolder() -> URL {
+        let downloads = AppSettings.shared.downloads.folder
         var isDirectory: ObjCBool = false
         if !FileManager.default.fileExists(atPath: downloads.path, isDirectory: &isDirectory) || !isDirectory.boolValue {
-            downloads = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask)[0]
+            return FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask)[0]
         }
+        return downloads
+    }
+
+    static func cleanFilename(_ filename: String) -> String {
         var clean = filename.replacingOccurrences(of: "/", with: "_").replacingOccurrences(of: ":", with: "_")
         // No name (or only dots and spaces, which would make a hidden or empty one): "Download".
         while clean.first == "." || clean.first?.isWhitespace == true { clean.removeFirst() }
         clean = clean.trimmed
-        if clean.isEmpty { clean = "Download" }
+        return clean.isEmpty ? "Download" : clean
+    }
+
+    static func uniqueDestination(for filename: String) -> URL {
+        uniqueDestination(at: downloadsFolder().appendingPathComponent(cleanFilename(filename)))
+    }
+
+    static func uniqueDestination(at candidate: URL) -> URL {
+        let clean = candidate.lastPathComponent
         let base = (clean as NSString).deletingPathExtension
         let ext = (clean as NSString).pathExtension
-        var candidate = downloads.appendingPathComponent(clean)
+        var candidate = candidate
         var n = 2
         // Downloads still running hold their names too: their files may not exist yet.
         let taken = Set(shared.items.filter { $0.state == .running }.compactMap { $0.destination?.standardizedFileURL.path })
         while FileManager.default.fileExists(atPath: candidate.path) || taken.contains(candidate.standardizedFileURL.path) {
             let name = ext.isEmpty ? "\(base) \(n)" : "\(base) \(n).\(ext)"
-            candidate = downloads.appendingPathComponent(name)
+            candidate = candidate.deletingLastPathComponent().appendingPathComponent(name)
             n += 1
         }
         return candidate
+    }
+
+    static func preferredDestination(for item: DownloadItem?, suggested: String) -> URL {
+        guard let requested = item?.requestedFilename else { return uniqueDestination(for: suggested) }
+        let parts = requested.split(separator: "/").map { cleanFilename(String($0)) }
+        let destination = parts.reduce(downloadsFolder()) { $0.appendingPathComponent($1) }
+        return item?.conflictAction == .uniquify ? uniqueDestination(at: destination) : destination
+    }
+
+    static func shouldAsk(for item: DownloadItem?, destination: URL) -> Bool {
+        let asks = switch item?.saveLocation ?? .settings {
+        case .settings: AppSettings.shared.downloads.askWhereToSave
+        case .downloadsFolder: false
+        case .ask: true
+        }
+        return asks || item?.conflictAction == .prompt && FileManager.default.fileExists(atPath: destination.path)
+    }
+
+    @discardableResult
+    static func prepareDestination(_ url: URL) -> Bool {
+        (try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)) != nil
     }
 }
 
@@ -941,13 +1109,20 @@ extension DownloadManager: WKDownloadDelegate {
         _ download: WKDownload, decideDestinationUsing response: URLResponse, suggestedFilename: String,
         completionHandler: @escaping (URL?) -> Void
     ) {
-        let destination = Self.uniqueDestination(for: suggestedFilename)
         let item = item(for: download)
+        let destination = Self.preferredDestination(for: item, suggested: suggestedFilename)
         let accept: (URL) -> Void = { url in
+            guard Self.prepareDestination(url) else {
+                item?.state = .failed("Couldn’t create the destination folder")
+                if let item { ExtensionDownloads.shared.changed(item) }
+                completionHandler(nil)
+                return
+            }
             item?.filename = url.lastPathComponent
             item?.destination = url
             // Time spent in the save panel isn't download time.
             item?.startedAt = Date()
+            if let item { ExtensionDownloads.shared.changed(item) }
             // Big files from servers that take ranges go to the multi-connection engine instead.
             if let item, self.takeOver(download, item: item, response: response, destination: url) {
                 completionHandler(nil)
@@ -965,15 +1140,11 @@ extension DownloadManager: WKDownloadDelegate {
                 completionHandler(url)
             }
         }
-        let asks = switch item?.saveLocation ?? .settings {
-        case .settings: AppSettings.shared.downloads.askWhereToSave
-        case .downloadsFolder: false
-        case .ask: true
-        }
-        guard asks else {
+        guard Self.shouldAsk(for: item, destination: destination) else {
             accept(destination)
             return
         }
+        Self.prepareDestination(destination)
         let panel = NSSavePanel()
         panel.directoryURL = destination.deletingLastPathComponent()
         panel.nameFieldStringValue = destination.lastPathComponent
@@ -985,6 +1156,7 @@ extension DownloadManager: WKDownloadDelegate {
                 item?.state = .failed("Cancelled")
                 item?.download = nil
                 item?.observation = nil
+                if let item { ExtensionDownloads.shared.changed(item) }
                 completionHandler(nil)
             }
         }
@@ -1006,6 +1178,8 @@ extension DownloadManager: WKDownloadDelegate {
                 item.state = .failed("Couldn’t replace \(destination.lastPathComponent)")
                 item.download = nil
                 item.observation = nil
+                ExtensionDownloads.shared.changed(item)
+                self.scheduleSave()
                 return
             }
         }
@@ -1022,9 +1196,7 @@ extension DownloadManager: WKDownloadDelegate {
         item.observation = nil
         item.resumeData = nil
         scheduleSave()
-        if let id = item.chromeID {
-            ExtensionEventPush.shared.emit("downloads.onChanged", args: [["id": id, "state": ["current": "complete", "previous": "in_progress"]]])
-        }
+        ExtensionDownloads.shared.changed(item)
         if let path = item.destination?.path {
             // Makes the Downloads stack in the Dock bounce, like other browsers.
             DistributedNotificationCenter.default().post(
@@ -1047,8 +1219,6 @@ extension DownloadManager: WKDownloadDelegate {
         item.download = nil
         item.observation = nil
         scheduleSave()
-        if let id = item.chromeID {
-            ExtensionEventPush.shared.emit("downloads.onChanged", args: [["id": id, "state": ["current": "interrupted", "previous": "in_progress"]]])
-        }
+        ExtensionDownloads.shared.changed(item)
     }
 }

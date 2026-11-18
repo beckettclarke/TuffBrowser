@@ -65,6 +65,24 @@ enum Merkle {
 
 /// A torrent's info dictionary: what the info hash covers.
 final class TorrentInfo {
+    static let maximumTotalLength: Int64 = 1 << 50
+    static let maximumPieceCount = 1_000_000
+    static let maximumFileCount = 100_000
+    private static let maximumMetadataBytes = 128 * 1024 * 1024
+
+    private static func adding(_ length: Int64, to offset: Int64) throws -> Int64 {
+        let (total, overflow) = offset.addingReportingOverflow(length)
+        guard !overflow, total <= maximumTotalLength else { throw TorrentError.invalid("The torrent is too large") }
+        return total
+    }
+
+    private static func pieces(for total: Int64, pieceLength: Int64) throws -> Int64 {
+        guard total > 0 else { throw TorrentError.invalid("The torrent is empty") }
+        let count = (total - 1) / pieceLength + 1
+        guard count <= Int64(maximumPieceCount) else { throw TorrentError.invalid("The torrent has too many pieces") }
+        return count
+    }
+
     /// The hash peers, trackers and the DHT know the torrent by: SHA-1 for v1 and hybrid,
     /// SHA-256 cut to 20 bytes for v2-only torrents.
     let infoHash: Data
@@ -89,6 +107,7 @@ final class TorrentInfo {
     var creationDate: Date?
 
     init(raw: Data) throws {
+        guard raw.count <= Self.maximumMetadataBytes else { throw TorrentError.invalid("The torrent’s metadata is too large") }
         guard let info = try? BDecoder.decode(raw).0, info.dict != nil else { throw TorrentError.invalid("The torrent’s info isn’t readable") }
         self.raw = raw
         guard let pieceLength = info["piece length"]?.int, pieceLength >= 1024, pieceLength <= 1 << 28 else {
@@ -96,6 +115,11 @@ final class TorrentInfo {
         }
         self.pieceLength = Int(pieceLength)
         let v2 = info["meta version"]?.int == 2 && info["file tree"]?.dict != nil
+        if v2 {
+            guard pieceLength >= Int64(Merkle.blockSize), pieceLength & (pieceLength - 1) == 0 else {
+                throw TorrentError.invalid("The v2 torrent has an invalid piece length")
+            }
+        }
         let v1Hashes = info["pieces"]?.data
         guard v2 || v1Hashes != nil else { throw TorrentError.invalid("The torrent has no pieces") }
         infoHashV1 = v1Hashes != nil ? sha1(raw) : nil
@@ -112,23 +136,24 @@ final class TorrentInfo {
             func walk(_ node: BValue, _ path: [String], depth: Int) throws {
                 guard depth < 64, let d = node.dict else { throw TorrentError.invalid("Bad file tree") }
                 if let leaf = d[Data()], let length = leaf["length"]?.int, length >= 0 {
+                    guard tree.count < Self.maximumFileCount else { throw TorrentError.invalid("Too many files") }
                     tree.append((path, length, leaf["pieces root"]?.data, leaf["attr"]?.string ?? ""))
                     return
                 }
                 for key in d.keys.sorted(by: { $0.lexicographicallyPrecedes($1) }) {
                     let part = TorrentInfo.clean(String(data: key, encoding: .utf8) ?? "")
-                    guard !part.isEmpty else { throw TorrentError.invalid("A file in the torrent has no name") }
-                    try walk(d[key]!, path + [part], depth: depth + 1)
+                    guard !part.isEmpty, let child = d[key] else { throw TorrentError.invalid("A file in the torrent has no name") }
+                    try walk(child, path + [part], depth: depth + 1)
                 }
             }
             try walk(ft, [], depth: 0)
-            if tree.count > 1_000_000 { throw TorrentError.invalid("Too many files") }
         }
 
         var files: [TorrentFile] = []
         var offset: Int64 = 0
         if v1Hashes != nil {
             if let list = info["files"]?.list {
+                guard list.count <= Self.maximumFileCount else { throw TorrentError.invalid("Too many files") }
                 isSingleFile = false
                 for entry in list {
                     guard let length = entry["length"]?.int, length >= 0 else { throw TorrentError.invalid("A file in the torrent has no size") }
@@ -141,12 +166,12 @@ final class TorrentInfo {
                     file.hidden = attr.contains("h")
                     if attr.contains("l") { file.symlink = (entry["symlink path"]?.list ?? []).compactMap { $0.string }.map(TorrentInfo.clean).filter { !$0.isEmpty } }
                     files.append(file)
-                    offset += length
+                    offset = try Self.adding(length, to: offset)
                 }
             } else if let length = info["length"]?.int, length >= 0 {
                 isSingleFile = true
                 files = [TorrentFile(path: [name], length: length, offset: 0, isPad: false)]
-                offset = length
+                offset = try Self.adding(length, to: 0)
             } else {
                 throw TorrentError.invalid("The torrent lists no files")
             }
@@ -158,28 +183,28 @@ final class TorrentInfo {
                     if entry.length == files[i].length { files[i].root = entry.root }
                 }
             }
-            let expected = (offset + pieceLength - 1) / pieceLength
-            guard Int64(hashes.count / 20) == expected, hashes.count % 20 == 0, offset > 0 else { throw TorrentError.invalid("The torrent’s pieces don’t match its files") }
-            pieceCount = hashes.count / 20
+            let expected = try Self.pieces(for: offset, pieceLength: pieceLength)
+            guard Int64(hashes.count / 20) == expected, hashes.count % 20 == 0 else { throw TorrentError.invalid("The torrent’s pieces don’t match its files") }
+            pieceCount = Int(expected)
         } else {
             // v2 only: every file starts on a piece boundary; the gaps act as padding.
             isSingleFile = tree.count == 1 && tree[0].path.count == 1 && info["file tree"]?.dict?.count == 1
             for (i, entry) in tree.enumerated() {
+                guard files.count < Self.maximumFileCount * 2 else { throw TorrentError.invalid("Too many files") }
                 var file = TorrentFile(path: isSingleFile ? [name] : entry.path, length: entry.length, offset: offset, isPad: false)
                 file.root = entry.root
                 file.executable = entry.attr.contains("x")
                 file.hidden = entry.attr.contains("h")
                 if entry.length > 0, entry.root?.count != 32 { throw TorrentError.invalid("A file in the torrent has no hash") }
                 files.append(file)
-                offset += entry.length
+                offset = try Self.adding(entry.length, to: offset)
                 let gap = (pieceLength - offset % pieceLength) % pieceLength
                 if gap > 0, i < tree.count - 1 {
                     files.append(TorrentFile(path: [".pad", String(gap)], length: gap, offset: offset, isPad: true))
-                    offset += gap
+                    offset = try Self.adding(gap, to: offset)
                 }
             }
-            guard offset > 0 else { throw TorrentError.invalid("The torrent is empty") }
-            pieceCount = Int((offset + pieceLength - 1) / pieceLength)
+            pieceCount = Int(try Self.pieces(for: offset, pieceLength: pieceLength))
         }
         self.files = files
         totalLength = offset
@@ -223,10 +248,14 @@ final class TorrentInfo {
     /// Checks a piece layer against its file's root and keeps it.
     @discardableResult
     func accept(layer: Data, forFile i: Int) -> Bool {
+        guard files.indices.contains(i) else { return false }
         let f = files[i]
-        guard let root = f.root else { return false }
-        let count = Int((f.length + Int64(pieceLength) - 1) / Int64(pieceLength))
-        guard layer.count == count * 32 else { return false }
+        guard let root = f.root, f.length > 0 else { return false }
+        let count64 = (f.length - 1) / Int64(pieceLength) + 1
+        guard count64 <= Int64(Self.maximumPieceCount) else { return false }
+        let count = Int(count64)
+        let (byteCount, overflow) = count.multipliedReportingOverflow(by: 32)
+        guard !overflow, layer.count == byteCount else { return false }
         let nodes = stride(from: 0, to: layer.count, by: 32).map { layer.subdata(in: $0..<$0 + 32) }
         let pad = Merkle.zeroRoot(levels: Merkle.log2(pieceLength / Merkle.blockSize))
         guard Merkle.root(nodes, width: Merkle.nextPow2(count), pad: pad) == root else { return false }

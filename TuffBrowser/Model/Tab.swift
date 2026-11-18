@@ -87,6 +87,7 @@ final class Tab: NSObject, Identifiable {
     /// `tabs.create({openerTabId})`). Surfaced to extensions as `openerTabId`. Weak, so it goes
     /// nil on its own if the opener is closed.
     @ObservationIgnored weak var openerTab: Tab?
+    @ObservationIgnored var readerModeRequested = false
     /// The address last reported to extensions for a same-document navigation (or the page's
     /// committed address), so WebKit's duplicate reports aren't sent twice.
     @ObservationIgnored var lastSameDocumentURL: URL?
@@ -410,12 +411,46 @@ final class Tab: NSObject, Identifiable {
         }
     }
 
-    private static let unsavedInputScript = """
+    static func installUnsavedInputTracking(into controller: WKUserContentController) {
+        controller.addUserScript(WKUserScript(
+            source: contentEditableTrackingSource, injectionTime: .atDocumentStart,
+            forMainFrameOnly: true, in: .defaultClient
+        ))
+    }
+
+    private static let contentEditableTrackingSource = """
+    (() => {
+      const initial = new WeakMap(), dirty = new WeakSet();
+      const editor = (target) => {
+        let el = target instanceof Element ? target : null;
+        while (el && !el.isContentEditable) el = el.parentElement;
+        return el && el.isContentEditable ? el : null;
+      };
+      const remember = (event) => {
+        const el = editor(event.target);
+        if (el && !initial.has(el)) initial.set(el, el.innerHTML);
+      };
+      document.addEventListener('focusin', remember, true);
+      document.addEventListener('beforeinput', remember, true);
+      document.addEventListener('input', (event) => {
+        const el = editor(event.target);
+        if (!el) return;
+        if (!initial.has(el) || el.innerHTML !== initial.get(el)) dirty.add(el);
+        else dirty.delete(el);
+      }, true);
+      Object.defineProperty(window, '__tuffContentEditableDirty', { value: (el) => dirty.has(el) });
+    })()
+    """
+
+    static let unsavedInputScript = """
     (() => {
       const skip = new Set(['hidden', 'submit', 'button', 'reset', 'image', 'file', 'checkbox', 'radio', 'range', 'color']);
       for (const el of document.querySelectorAll('textarea, input')) {
         if (skip.has((el.type || '').toLowerCase()) || el.disabled || el.readOnly) continue;
         if (el.value && el.value !== el.defaultValue) return true;
+      }
+      for (const el of document.querySelectorAll('[contenteditable]')) {
+        if (el.isContentEditable && window.__tuffContentEditableDirty && window.__tuffContentEditableDirty(el)) return true;
       }
       return false;
     })()
@@ -521,7 +556,7 @@ final class Tab: NSObject, Identifiable {
                     if let u = self.url, let scheme = u.scheme, scheme == "http" || scheme == "https" {
                         // Incognito pages stay out of History, and extensions never hear of them.
                         if self.browser?.isPrivate == false, !self.showingErrorPage {
-                            HistoryStore.shared.updateTitle(url: u, title: t)
+                            HistoryStore.shared.updateTitle(url: u, title: t, profileID: self.browser?.profile(containing: self)?.id)
                             ExtensionEventPush.shared.emit("history.onTitleChanged", args: [["url": u.absoluteString, "title": t]])
                         }
                     }

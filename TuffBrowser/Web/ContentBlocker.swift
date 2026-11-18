@@ -78,7 +78,7 @@ final class ContentBlocker {
 
     /// Before a tab's main frame navigates: lists off on sites the user allowed ads on.
     func prepare(_ controller: WKUserContentController, for url: URL) {
-        guard enabled, !active.isEmpty else { return }
+        guard enabled else { return }
         let allowed = isAllowed(host: url.host)
         if allowed, !skipped.contains(controller) {
             active.forEach(controller.remove)
@@ -88,6 +88,8 @@ final class ContentBlocker {
             skipped.remove(controller)
         }
     }
+
+    func isSkipping(_ controller: WKUserContentController) -> Bool { skipped.contains(controller) }
 
     // MARK: Sites the user allows ads on
 

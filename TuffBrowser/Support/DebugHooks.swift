@@ -320,7 +320,7 @@ enum DebugHooks {
                 if words.first == "js" { entry.javaScript = value } else { entry.popups = value }
             }
         case "complete":
-            log("complete \(argument) => \(HistoryStore.shared.hostCompletion(for: argument) ?? "-")")
+            log("complete \(argument) => \(HistoryStore.shared.hostCompletion(for: argument, profileID: BrowserState.shared.currentProfile.id) ?? "-")")
         case "forward":
             state.selectedTab?.goForward()
         case "reload":

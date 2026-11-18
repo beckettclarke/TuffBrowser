@@ -53,6 +53,7 @@ extension DownloadManager {
             }
             return item
         }
+        items.forEach { ExtensionDownloads.shared.observed($0) }
     }
 
     func scheduleSave() {

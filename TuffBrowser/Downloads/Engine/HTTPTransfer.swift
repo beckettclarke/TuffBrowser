@@ -60,6 +60,7 @@ final class HTTPTransfer: NSObject, URLSessionDataDelegate {
     private(set) var status = Status.idle
     var maxConnections: Int
     let limiter: SharedLimiter?
+    let cookieProvider: ((URL, @escaping (String?) -> Void) -> Void)?
     /// The server's first answer arrived: say where the file goes (only asked when no
     /// destination is known yet). Called on the main thread; nil cancels.
     var decideDestination: ((HTTPURLResponse, String) -> URL?)?
@@ -97,10 +98,11 @@ final class HTTPTransfer: NSObject, URLSessionDataDelegate {
     private var deciding = false
     private static let minSplit: Int64 = 1 << 20
 
-    init(state: State, connections: Int, limiter: SharedLimiter?) {
+    init(state: State, connections: Int, limiter: SharedLimiter?, cookieProvider: ((URL, @escaping (String?) -> Void) -> Void)? = nil) {
         self.state = state
         maxConnections = max(1, min(connections, 32))
         self.limiter = limiter
+        self.cookieProvider = cookieProvider
     }
 
     var received: Int64 { state.segments.reduce(0) { $0 + ($1.pos - $1.start) } }
@@ -218,6 +220,20 @@ final class HTTPTransfer: NSObject, URLSessionDataDelegate {
     }
 
     // MARK: URLSessionDataDelegate
+
+    func urlSession(
+        _ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse,
+        newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void
+    ) {
+        guard let url = request.url else { completionHandler(nil); return }
+        var redirected = request
+        redirected.setValue(nil, forHTTPHeaderField: "Cookie")
+        guard let cookieProvider else { completionHandler(redirected); return }
+        cookieProvider(url) { cookie in
+            if let cookie { redirected.setValue(cookie, forHTTPHeaderField: "Cookie") }
+            completionHandler(redirected)
+        }
+    }
 
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive response: URLResponse, completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
         guard status == .running, let worker = workers[key(dataTask, session)], let http = response as? HTTPURLResponse else {

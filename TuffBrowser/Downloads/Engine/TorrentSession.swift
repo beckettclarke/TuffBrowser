@@ -348,10 +348,15 @@ final class TorrentSession {
         engineQueue.async { [self] in
             let id = source.infoHash.tHex
             if let existing = torrents.first(where: { $0.wireHashes.contains(source.infoHash) }) {
+                if existing.info == nil, source.info != nil, !existing.adoptMetadata(source) {
+                    DispatchQueue.main.async { done(.failure(TorrentError.invalid("The torrent metadata doesn’t match the magnet’s info hash"))) }
+                    return
+                }
                 // Already here: take any new trackers and peers, like other clients do.
                 existing.setTrackers(source.trackers)
                 existing.addCandidates(source.peers.compactMap(PeerAddr.init), source: "Magnet")
                 save(existing)
+                publish()
                 DispatchQueue.main.async { done(.success(existing.infoHash.tHex)) }
                 return
             }

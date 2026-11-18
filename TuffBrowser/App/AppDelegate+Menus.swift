@@ -99,15 +99,15 @@ extension AppDelegate {
 
     // MARK: History
 
-    /// History → Clear History…: every page in History and the recently closed tabs. Cookies and
+    /// History → Clear History…: this profile's History and recently closed tabs. Cookies and
     /// website data stay (Settings → Privacy clears those).
     @objc func clearHistory(_ sender: Any?) {
-        let pages = HistoryStore.shared.count
+        let pages = HistoryStore.shared.count(profileID: state.currentProfile.id)
         let prompt = Prompt(
             symbol: "clock.arrow.circlepath",
             title: "Clear all history?",
             subtitle: pages == 1 ? "1 page" : "\(pages) pages",
-            message: "Removes every page from History and the list of recently closed tabs. Cookies and website data stay.",
+            message: "Removes this profile’s pages from History and its recently closed tabs. Cookies and website data stay.",
             confirmTitle: "Clear History",
             destructive: true,
             checkbox: "Also clear the downloads list"
@@ -115,8 +115,8 @@ extension AppDelegate {
         Task { @MainActor in
             let result = await PromptPresenter.ask(prompt)
             guard result.confirmed else { return }
-            HistoryStore.shared.clear()
-            BrowserState.all.forEach { $0.forgetClosedTabs() }
+            HistoryStore.shared.clear(profileID: state.currentProfile.id)
+            state.forgetClosedTabs()
             if result.checked { DownloadManager.shared.clearFinished() }
             state.show(Toast(symbol: "checkmark", text: "History cleared"))
         }
@@ -171,7 +171,7 @@ extension AppDelegate {
         case #selector(pasteAndGo(_:)):
             return state.pasteAndGoText != nil
         case #selector(clearHistory(_:)):
-            return HistoryStore.shared.count > 0 || state.hasClosedTabs
+            return HistoryStore.shared.count(profileID: state.currentProfile.id) > 0 || state.hasClosedTabs
         default:
             return true
         }

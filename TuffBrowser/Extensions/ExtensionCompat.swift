@@ -676,8 +676,8 @@ enum ExtensionCompat {
 
       // WebKit throws, synchronously, when permissions.contains / request / remove names a
       // permission it does not know (clipboardRead, say); Chrome and Firefox answer. Thrown at
-      // the top of a module, that stops the whole page. A permission WebKit does not know is
-      // one the extension can never hold: `contains` answers false, and `request` / `remove`
+      // the top of a module, that stops the whole page. A permission neither WebKit nor Tuff
+      // implements can never be held: `contains` answers false, and `request` / `remove`
       // go ahead with the rest and answer false (Chrome's answer when not all were granted).
       const unknownPermission = (error) => {
         const match = /'([^']+)' is not a valid permission/.exec(String((error && error.message) || ''));
@@ -842,8 +842,14 @@ enum ExtensionCompat {
       // Native implementations for APIs WebKit lacks but Tuff can provide (topSites, history,
       // browsingData, management). They reach Tuff through the same tabs.create bridge as the side
       // panel, with a private tuff-api:// URL; the answer comes back in the call's error. The methods
-      // are real; their events are inert stand-ins for now (see TODOS.md).
+      // are real; their events arrive through the native event relay below.
       if (privileged) {
+        const nativePermissionNames = new Set([
+          'topSites', 'history', 'browsingData', 'management', 'sessions', 'notifications', 'offscreen',
+          'identity', 'downloads', 'system.cpu', 'system.memory', 'system.storage', 'power', 'idle', 'tts',
+          'search', 'userScripts', 'tabGroups', 'contextualIdentities', 'contentSettings', 'find', 'omnibox',
+          'theme', 'privacy', 'proxy', 'fontSettings', 'browserSettings',
+        ]);
         for (const { root, label } of roots) {
           let tabs;
           try { tabs = root.tabs; } catch (e) { continue; }
@@ -872,6 +878,27 @@ enum ExtensionCompat {
             promise.then((value) => { try { callback(value); } catch (e) {} }, () => { try { callback(); } catch (e) {} });
             return undefined;
           };
+          let permissionAPI;
+          try { permissionAPI = root.permissions; } catch (e) {}
+          if (permissionAPI && typeof permissionAPI === 'object') {
+            for (const name of ['contains', 'request', 'remove']) {
+              const original = permissionAPI[name];
+              if (typeof original !== 'function') continue;
+              add(permissionAPI, name, api(async (details) => {
+                const requested = details && Array.isArray(details.permissions) ? details.permissions : [];
+                const native = requested.filter((p) => nativePermissionNames.has(p));
+                const standard = requested.filter((p) => !nativePermissionNames.has(p));
+                const origins = details && Array.isArray(details.origins) ? details.origins : [];
+                let answer = true;
+                if (standard.length || origins.length || !native.length) {
+                  answer = !!(await original(Object.assign({}, details, { permissions: standard, origins })));
+                }
+                if (answer && native.length) answer = !!(await call('__permissions', name, { permissions: native }));
+                return answer;
+              }));
+            }
+            pins.push(permissionAPI);
+          }
           // Real events for the native APIs. Tuff pushes them through a relay page's
           // runtime.sendMessage (a wake event for the worker); dispatch to listeners here. Adding the
           // first listener subscribes with Tuff so it only wakes extensions that actually listen.
@@ -952,9 +979,18 @@ enum ExtensionCompat {
             }
             return args;
           };
+          const seenDeliveries = new Set();
+          const deliveryOrder = [];
           try {
             root.runtime.onMessage.addListener((msg) => {
               if (msg && typeof msg === 'object' && msg.__tuffEvent && nativeEvents[msg.__tuffEvent]) {
+                const delivery = msg.__tuffDelivery;
+                if (typeof delivery === 'string') {
+                  if (seenDeliveries.has(delivery)) return;
+                  seenDeliveries.add(delivery);
+                  deliveryOrder.push(delivery);
+                  if (deliveryOrder.length > 1000) seenDeliveries.delete(deliveryOrder.shift());
+                }
                 const listeners = nativeEvents[msg.__tuffEvent];
                 resolve(msg).then((args) => {
                   for (const [fn, filter] of [...listeners]) {
@@ -1010,6 +1046,7 @@ enum ExtensionCompat {
             getSelf: api(() => call('management', 'getSelf', {})),
             getPermissionWarningsById: api((id) => call('management', 'getPermissionWarningsById', { id: id })),
             setEnabled: api((id, enabled) => call('management', 'setEnabled', { id: id, enabled: enabled })),
+            uninstallSelf: api((options) => call('management', 'uninstallSelf', options || {})),
             onInstalled: event('management.onInstalled'),
             onUninstalled: event('management.onUninstalled'),
             onEnabled: event('management.onEnabled'),
@@ -1028,6 +1065,7 @@ enum ExtensionCompat {
               return call('notifications', 'create', { notificationId: notificationId, options: options });
             }),
             clear: api((notificationId) => call('notifications', 'clear', { notificationId: notificationId })),
+            update: api((notificationId, options) => call('notifications', 'update', { notificationId: notificationId, options: options })),
             getAll: api(() => call('notifications', 'getAll', {})),
             getPermissionLevel: api(() => call('notifications', 'getPermissionLevel', {})),
             onClicked: event('notifications.onClicked'),
@@ -1096,6 +1134,7 @@ enum ExtensionCompat {
           });
           implement('search', {
             query: api((query) => call('search', 'query', query)),
+            get: api(() => call('search', 'get', {})),
           });
           // Tab ids <-> Tuff's indexes in the window (Tuff can't know WebKit's ids).
           const indexOf = async (tabId) => (await root.tabs.get(tabId)).index;

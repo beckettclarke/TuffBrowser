@@ -94,10 +94,10 @@ final class ExtensionContentSettings {
                 AppSettings.shared.privacy = privacy
                 record(Change(type: type, key: "*", incognito: false, previous: previous), extensionID: extensionID)
             } else if let site {
-                SiteSettings.shared.update(URL(string: "https://" + site.host), incognito: incognito) { entry in
+                SiteSettings.shared.update(key: site.key, incognito: incognito) { entry in
                     if type == "javascript" { entry.javaScript = allow } else { entry.popups = allow }
                 }
-                record(Change(type: type, key: site.host, incognito: incognito), extensionID: extensionID)
+                record(Change(type: type, key: site.key, incognito: incognito), extensionID: extensionID)
             }
         default:
             guard let kind = Self.permissionKinds[type] else {
@@ -105,12 +105,12 @@ final class ExtensionContentSettings {
                 throw Failure("Unknown content type: \(type).")
             }
             guard let site else { throw Failure("\(type) can only be set for a site, not every site.") }
-            let origin = "\(site.scheme)://\(site.host)"
+            let origin = site.key + (site.port == nil ? ":*" : "")
             switch setting {
             case "allow", "block":
                 SitePermissions.shared.record(origin: origin, kind: kind, granted: setting == "allow", remember: true, incognito: incognito)
             case "ask":
-                forget(origin: origin, kind: kind)
+                forget(origin: origin, kind: kind, incognito: incognito)
             default:
                 throw Failure("Tuff can’t use “\(setting)” for \(type).")
             }
@@ -151,40 +151,36 @@ final class ExtensionContentSettings {
                 if change.type == "javascript" { privacy.javaScript = previous } else { privacy.blockPopups = !previous }
                 AppSettings.shared.privacy = privacy
             } else {
-                SiteSettings.shared.update(URL(string: "https://" + change.key), incognito: change.incognito) { entry in
+                SiteSettings.shared.update(key: change.key, incognito: change.incognito) { entry in
                     if change.type == "javascript" { entry.javaScript = nil } else { entry.popups = nil }
                 }
             }
         default:
-            if let kind = Self.permissionKinds[change.type] { forget(origin: change.key, kind: kind) }
+            if let kind = Self.permissionKinds[change.type] { forget(origin: change.key, kind: kind, incognito: change.incognito) }
         }
     }
 
-    private func forget(origin: String, kind: SitePermissionKind) {
+    private func forget(origin: String, kind: SitePermissionKind, incognito: Bool = false) {
         for granted in [true, false] {
-            SitePermissions.shared.remove(SitePermissions.Entry(origin: origin, kind: kind, granted: granted))
+            SitePermissions.shared.remove(SitePermissions.Entry(origin: origin, kind: kind, granted: granted), incognito: incognito)
         }
     }
 
     private static func origin(of url: URL) -> String? {
         guard let scheme = url.scheme?.lowercased(), let host = url.host(percentEncoded: false)?.lowercased() else { return nil }
-        let port = url.port.map { ":\($0)" } ?? ""
+        let port = url.port.flatMap { explicit in
+            explicit != (scheme == "https" ? 443 : 80) ? ":\(explicit)" : nil
+        } ?? ""
         return "\(scheme)://\(host)\(port)"
     }
 
     /// The site a content-settings pattern names, or nil for every site.
-    static func parse(_ pattern: String) throws -> (scheme: String, host: String)? {
+    static func parse(_ pattern: String) throws -> ContentSettingPattern? {
         if pattern == "<all_urls>" { return nil }
-        let regex = try NSRegularExpression(pattern: #"^(\*|https?)://(\*|(?:\*\.)?([^/:*]+))(:[0-9*]+)?(/.*)?$"#)
-        guard let match = regex.firstMatch(in: pattern, range: NSRange(pattern.startIndex..., in: pattern)),
-              let schemeRange = Range(match.range(at: 1), in: pattern) else {
+        guard let parsed = ContentSettingPattern(pattern: pattern) else {
             throw Failure("Tuff can’t use the pattern “\(pattern)”.")
         }
-        // A host of just "*" (`*://*/*`): every site.
-        guard let hostRange = Range(match.range(at: 3), in: pattern) else { return nil }
-        let host = String(pattern[hostRange]).lowercased()
-        let scheme = String(pattern[schemeRange])
-        return (scheme == "*" ? "https" : scheme, host)
+        return parsed.isGlobal ? nil : parsed
     }
 }
 

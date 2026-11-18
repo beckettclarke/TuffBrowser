@@ -257,6 +257,7 @@ struct CommandBarView: View {
                 text = url.absoluteString
                 initialText = text
             }
+            refresh(for: text)
         }
         .onChange(of: text) { _, new in
             // "gh " — an extension's omnibox keyword and a space — hands the input to it.
@@ -321,7 +322,8 @@ struct CommandBarView: View {
             return
         }
         let hasInput = !text.trimmed.isEmpty || chip != nil
-        if items.indices.contains(selection), hasInput, text != initialText || selection > 0 || chip != nil {
+        if items.indices.contains(selection),
+           (hasInput && (text != initialText || selection > 0 || chip != nil) || !hasInput && mode == .newTab) {
             activate(items[selection])
         } else if hasInput {
             let input = chip.map { "!\($0.trigger) " + text } ?? text
@@ -342,7 +344,7 @@ struct CommandBarView: View {
     /// Removes a history suggestion's page from history and from the list.
     private func remove(_ item: Suggestion) {
         guard let url = item.historyURL else { return }
-        HistoryStore.shared.delete([url])
+        HistoryStore.shared.delete([url], profileID: state.currentProfile.id)
         let keep = selection
         refresh(for: text)
         selection = min(keep, max(0, suggestions.count - 1))
@@ -397,6 +399,32 @@ struct CommandBarView: View {
         }
     }
 
+    private func zeroStateSuggestions() -> [Suggestion] {
+        let recentTabs = state.allTabs
+            .filter { $0 !== state.selectedTab }
+            .sorted { $0.lastActive > $1.lastActive }
+            .prefix(4)
+        var items = recentTabs.map { tab in
+            Suggestion(
+                id: "tab:" + tab.id.uuidString, kind: .tab(tab.id), title: tab.displayTitle,
+                subtitle: "Recent Tab", symbol: "rectangle.on.rectangle", icon: tab.favicon
+            )
+        }
+        let openURLs = Set(recentTabs.compactMap(\.url))
+        if settings.search.historySuggestions {
+            for site in HistoryStore.shared.topSites(limit: 8, profileID: state.currentProfile.id) {
+                guard let address = site["url"] as? String, let url = URL(string: address), !openURLs.contains(url) else { continue }
+                let title = (site["title"] as? String)?.trimmed
+                items.append(Suggestion(
+                    id: "history:" + address, kind: .history(url),
+                    title: title?.isEmpty == false ? title! : url.displayHost,
+                    subtitle: "Top Site", symbol: "clock", icon: FaviconStore.shared.cachedIcon(for: url)
+                ))
+            }
+        }
+        return Array(items.prefix(8))
+    }
+
     private func refresh(for input: String) {
         if let keyword {
             refreshKeyword(keyword, input: input)
@@ -413,10 +441,10 @@ struct CommandBarView: View {
         completedText = nil
         if bang == nil, chip == nil, !suppressCompletion, settings.search.historySuggestions,
            input != initialText, input == input.trimmed {
-            completedText = HistoryStore.shared.hostCompletion(for: input)
+            completedText = HistoryStore.shared.hostCompletion(for: input, profileID: state.currentProfile.id)
         }
         guard bang != nil || (!query.isEmpty && input != initialText) else {
-            local = []
+            local = query.isEmpty && mode == .newTab ? zeroStateSuggestions() : []
             remote = []
             return
         }
@@ -472,7 +500,7 @@ struct CommandBarView: View {
         }
 
         let openURLs = Set(openTabs.prefix(2).compactMap { $0.url?.absoluteString })
-        let history = settings.search.historySuggestions ? HistoryStore.shared.search(query, limit: 3) : []
+        let history = settings.search.historySuggestions ? HistoryStore.shared.search(query, limit: 3, profileID: state.currentProfile.id) : []
         for entry in history where !openURLs.contains(entry.url.absoluteString) {
             items.append(Suggestion(
                 id: "history:" + entry.url.absoluteString, kind: .history(entry.url),
