@@ -8,10 +8,16 @@ struct PageMenu: View {
     @Environment(BrowserState.self) private var state
     @Environment(ExtensionManager.self) private var extensions
 
+    /// What the menu holds. The vertical layout has it all off the address bar; the horizontal
+    /// one keeps only the extensions there and puts the rest in the toolbar's ⋯ menu.
+    enum Kind { case full, extensions, toolbar }
+    var kind: Kind = .full
+
     enum Page { case main, screenshot, site }
     @State private var page: Page = .main
 
-    static let width: CGFloat = 248
+    /// Wider as the toolbar's menu, so its rows ("New Incognito Window  ⇧⌘N") fit.
+    private var width: CGFloat { kind == .toolbar ? 268 : 248 }
     /// The page the menu opens on next (tests open it straight on the screenshot options).
     static var openOn: Page = .main
 
@@ -30,7 +36,7 @@ struct PageMenu: View {
             }
         }
         .padding(12)
-        .frame(width: Self.width)
+        .frame(width: width)
         .clipped()
         .onAppear {
             page = Self.openOn
@@ -46,68 +52,80 @@ struct PageMenu: View {
         // Sized from the menu's width rather than left to the layout, which let the tiles shrink
         // to their icons after coming back from a sub-page.
         let count = AppSettings.shared.privacy.blockAds ? 5 : 4
-        let side = ((Self.width - 24) - 6 * CGFloat(count - 1)) / CGFloat(count)
+        let side = ((width - 24) - 6 * CGFloat(count - 1)) / CGFloat(count)
         return VStack(alignment: .leading, spacing: 14) {
-            HStack(spacing: 6) {
-                PageMenuTile(side: side, symbol: "camera", help: "Screenshot", disabled: !canCapture) {
-                    withAnimation(Motion.snappy) { page = .screenshot }
-                }
-                let reading = tab?.reader != nil
-                PageMenuTile(
-                    side: side,
-                    symbol: reading ? "doc.plaintext.fill" : "doc.plaintext",
-                    help: reading ? "Exit Reader Mode  ⌥⌘R" : "Reader Mode  ⌥⌘R",
-                    disabled: !reading && tab?.canUseReader != true,
-                    active: reading
-                ) {
-                    closeThen { tab?.toggleReader() }
-                }
-                let translated = tab?.translation != nil
-                PageMenuTile(
-                    side: side,
-                    symbol: "translate",
-                    help: translated ? "Show Original" : "Translate to \(PageTranslation.name(of: PageTranslation.preferredTarget))",
-                    disabled: !(tab?.isAwake ?? false) || tab?.pdf != nil || tab?.url == nil,
-                    active: translated
-                ) {
-                    closeThen { tab?.toggleTranslation() }
-                }
-                if AppSettings.shared.privacy.blockAds {
-                    let host = tab?.url?.host
-                    let allowed = ContentBlocker.shared.isAllowed(host: host)
-                    PageMenuTile(
-                        side: side,
-                        symbol: allowed ? "shield.slash" : "shield.lefthalf.filled",
-                        help: allowed ? "Block Ads on This Site" : "Allow Ads on This Site",
-                        disabled: host == nil || tab?.pdf != nil
-                    ) {
-                        closeThen {
-                            guard let host else { return }
-                            ContentBlocker.shared.toggleAllowed(host: host, reloading: tab)
-                            state.show(Toast(symbol: allowed ? "shield.lefthalf.filled" : "shield.slash",
-                                             text: allowed ? "Blocking ads on \(host)" : "Allowing ads on \(host)"))
-                        }
-                    }
-                }
-                PageMenuTile(
-                    side: side,
-                    symbol: tab?.isInPictureInPicture == true ? "pip.exit" : "pip.enter",
-                    help: tab?.isInPictureInPicture == true ? "Exit Picture in Picture" : "Picture in Picture",
-                    disabled: !(tab?.isAwake ?? false)
-                ) {
-                    closeThen {
-                        tab?.togglePictureInPicture { outcome in
-                            if outcome == .none { state.show(Toast(symbol: "pip", text: "No video to play in Picture in Picture")) }
-                        }
-                    }
-                }
+            if kind != .extensions {
+                pageActions(tab: tab, canCapture: canCapture, side: side)
             }
 
-            if !state.isPrivate {
+            if kind != .toolbar, !state.isPrivate {
                 PageMenuExtensions(close: closeThen)
             }
 
-            PageMenuFooter(tab: tab, openSite: { withAnimation(Motion.snappy) { page = .site } })
+            if kind != .extensions {
+                PageMenuFooter(tab: tab, openSite: { withAnimation(Motion.snappy) { page = .site } })
+            }
+
+            if kind == .toolbar {
+                ToolbarMenuRows(close: closeThen)
+            }
+        }
+    }
+
+    private func pageActions(tab: Tab?, canCapture: Bool, side: CGFloat) -> some View {
+        HStack(spacing: 6) {
+            PageMenuTile(side: side, symbol: "camera", help: "Screenshot", disabled: !canCapture) {
+                withAnimation(Motion.snappy) { page = .screenshot }
+            }
+            let reading = tab?.reader != nil
+            PageMenuTile(
+                side: side,
+                symbol: reading ? "doc.plaintext.fill" : "doc.plaintext",
+                help: reading ? "Exit Reader Mode  ⌥⌘R" : "Reader Mode  ⌥⌘R",
+                disabled: !reading && tab?.canUseReader != true,
+                active: reading
+            ) {
+                closeThen { tab?.toggleReader() }
+            }
+            let translated = tab?.translation != nil
+            PageMenuTile(
+                side: side,
+                symbol: "translate",
+                help: translated ? "Show Original" : "Translate to \(PageTranslation.name(of: PageTranslation.preferredTarget))",
+                disabled: !(tab?.isAwake ?? false) || tab?.pdf != nil || tab?.url == nil,
+                active: translated
+            ) {
+                closeThen { tab?.toggleTranslation() }
+            }
+            if AppSettings.shared.privacy.blockAds {
+                let host = tab?.url?.host
+                let allowed = ContentBlocker.shared.isAllowed(host: host)
+                PageMenuTile(
+                    side: side,
+                    symbol: allowed ? "shield.slash" : "shield.lefthalf.filled",
+                    help: allowed ? "Block Ads on This Site" : "Allow Ads on This Site",
+                    disabled: host == nil || tab?.pdf != nil
+                ) {
+                    closeThen {
+                        guard let host else { return }
+                        ContentBlocker.shared.toggleAllowed(host: host, reloading: tab)
+                        state.show(Toast(symbol: allowed ? "shield.lefthalf.filled" : "shield.slash",
+                                         text: allowed ? "Blocking ads on \(host)" : "Allowing ads on \(host)"))
+                    }
+                }
+            }
+            PageMenuTile(
+                side: side,
+                symbol: tab?.isInPictureInPicture == true ? "pip.exit" : "pip.enter",
+                help: tab?.isInPictureInPicture == true ? "Exit Picture in Picture" : "Picture in Picture",
+                disabled: !(tab?.isAwake ?? false)
+            ) {
+                closeThen {
+                    tab?.togglePictureInPicture { outcome in
+                        if outcome == .none { state.show(Toast(symbol: "pip", text: "No video to play in Picture in Picture")) }
+                    }
+                }
+            }
         }
     }
 
@@ -117,6 +135,7 @@ struct PageMenu: View {
     /// a share sheet, an extension's popup, the area picker — isn't fighting the popover).
     private func closeThen(_ action: @escaping () -> Void) {
         state.pageMenuVisible = false
+        state.toolbarMenuVisible = false
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.18, execute: action)
     }
 
@@ -310,6 +329,46 @@ private struct PageMenuAddTile: View {
         .onHover { hovering = $0 }
         .animation(Motion.quick, value: hovering)
         .help("Add Extensions…")
+    }
+}
+
+// MARK: - Toolbar menu
+
+/// What the toolbar's ⋯ menu always had, under the page actions.
+private struct ToolbarMenuRows: View {
+    @Environment(BrowserState.self) private var state
+    let close: (@escaping () -> Void) -> Void
+
+    var body: some View {
+        VStack(spacing: 2) {
+            StripMenuDivider()
+                .padding(.top, -6)
+            StripMenuRow(title: "New Tab", symbol: "plus", shortcut: "⌘T") {
+                close { state.openNewTab() }
+            }
+            StripMenuRow(title: "New Incognito Window", symbol: "eyeglasses", shortcut: "⇧⌘N") {
+                close { AppDelegate.shared?.openIncognitoWindow() }
+            }
+            if !state.isPrivate {
+                StripMenuRow(title: "New Space", symbol: "square.stack", shortcut: "⌃⌘N") {
+                    close { state.addSpace() }
+                }
+                StripMenuRow(title: "New Folder", symbol: "folder.badge.plus", shortcut: "⌥⌘N") {
+                    close { state.addFolder() }
+                }
+            }
+            StripMenuDivider()
+            if !state.isPrivate {
+                StripMenuRow(title: "Extensions…", symbol: "puzzlepiece.extension") {
+                    close { AppDelegate.shared?.showSettings(tab: .extensions) }
+                }
+            }
+            StripMenuRow(title: "Settings…", symbol: "gearshape", shortcut: "⌘,") {
+                close { AppDelegate.shared?.showSettings() }
+            }
+        }
+        .padding(.horizontal, -6)
+        .padding(.bottom, -6)
     }
 }
 

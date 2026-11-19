@@ -277,6 +277,7 @@ struct SiteSettingsPanel: View {
             if !incognito, let origin = SitePermissions.origin(of: url) {
                 Button {
                     state.pageMenuVisible = false
+                    state.toolbarMenuVisible = false
                     AppDelegate.shared?.showSettings(tab: .websites, site: origin)
                 } label: {
                     Label("All Site Settings…", systemImage: "gearshape")
@@ -310,6 +311,7 @@ struct SiteSettingsPanel: View {
     /// Removes this site's cookies and storage in every profile (after asking), then reloads.
     private func clearData(for url: URL?, tab: Tab?) {
         state.pageMenuVisible = false
+        state.toolbarMenuVisible = false
         WebsiteData.siteName(for: url) { name in
             let site = name ?? SiteSettings.key(for: url) ?? "this site"
             Task { @MainActor in

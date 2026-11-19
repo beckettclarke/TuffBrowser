@@ -763,10 +763,15 @@ enum DebugHooks {
             }
             return
         case "pagemenu":
-            // pagemenu [off|screenshot|site] — opens / closes the page menu off the address bar.
+            // pagemenu [off|screenshot|site] — opens / closes the page menu off the address bar
+            // (the toolbar's ⋯ menu in the horizontal layout, which has the page actions there).
             if argument == "screenshot" { PageMenu.openOn = .screenshot }
             if argument == "site" { PageMenu.openOn = .site }
-            state.pageMenuVisible = argument != "off"
+            if state.tabLayout == .horizontal {
+                state.toolbarMenuVisible = argument != "off"
+            } else {
+                state.pageMenuVisible = argument != "off"
+            }
         case "readersnap":
             // readersnap <path> — reader mode's article as WebKit draws it (works with the screen locked).
             let rest2 = rest

@@ -560,30 +560,13 @@ struct HorizontalToolbar: View {
                 SpaceMenuButton()
             }
 
-            Menu {
-                Button("New Tab") { state.openNewTab() }
-                Button("New Incognito Window") { AppDelegate.shared?.openIncognitoWindow() }
-                if !state.isPrivate {
-                    Button("New Space") { state.addSpace() }
-                    Button("New Folder") { state.addFolder() }
-                }
-                Divider()
-                if !state.isPrivate {
-                    Button("Extensions…") { AppDelegate.shared?.showSettings(tab: .extensions) }
-                }
-                Button("Settings…") { AppDelegate.shared?.showSettings() }
-            } label: {
-                Image(systemName: "ellipsis")
-                    .font(.system(size: 14, weight: .semibold))
-                    .foregroundStyle(.primary.opacity(0.62))
-                    .frame(width: 28, height: 28)
-                    .contentShape(Rectangle())
+            // The page menu's page actions, then New Tab, Settings and the rest.
+            IconButton(symbol: "ellipsis", size: 14, weight: .semibold, help: "Page Menu, New Tab, Settings…") {
+                state.toolbarMenuVisible.toggle()
             }
-            .menuStyle(.button)
-            .buttonStyle(.plain)
-            .menuIndicator(.hidden)
-            .fixedSize()
-            .help("New Tab, Settings…")
+            .popover(isPresented: $state.toolbarMenuVisible, arrowEdge: .bottom) {
+                PageMenu(kind: .toolbar)
+            }
         }
         .padding(.horizontal, 8)
     }

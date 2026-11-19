@@ -78,6 +78,8 @@ final class BrowserState {
     var downloadsVisible = false
     /// The page menu (screenshot, share, unpinned extensions…) off the address bar.
     var pageMenuVisible = false
+    /// The toolbar's ⋯ menu in the horizontal layout, which carries the page menu's page actions.
+    var toolbarMenuVisible = false
     /// Dragging out an area of the page to capture (see `ScreenshotOverlay`).
     var screenshotSelecting = false
     /// How far a full-page capture has got, 0…1, while one runs.

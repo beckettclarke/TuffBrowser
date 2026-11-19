@@ -126,15 +126,18 @@ struct URLPill: View {
                     }
                     .transition(.opacity.combined(with: .scale(scale: 0.8)))
                 }
-                if showButtons, tab != nil {
+                // The horizontal layout keeps only extensions here; the page actions are in the
+                // toolbar's ⋯ menu.
+                let horizontal = state.tabLayout == .horizontal
+                if showButtons, tab != nil, !(horizontal && state.isPrivate) {
                     PillButton(
-                        symbol: "slider.horizontal.3", size: 11.5, side: height > 32 ? 24 : 22,
-                        help: "Page Menu", active: state.pageMenuVisible
+                        symbol: horizontal ? "puzzlepiece.extension" : "slider.horizontal.3", size: 11.5, side: height > 32 ? 24 : 22,
+                        help: horizontal ? "Extensions" : "Page Menu", active: state.pageMenuVisible
                     ) {
                         state.pageMenuVisible.toggle()
                     }
                     .popover(isPresented: $state.pageMenuVisible, arrowEdge: .bottom) {
-                        PageMenu()
+                        PageMenu(kind: horizontal ? .extensions : .full)
                     }
                     .transition(.opacity.combined(with: .scale(scale: 0.8)))
                 }
