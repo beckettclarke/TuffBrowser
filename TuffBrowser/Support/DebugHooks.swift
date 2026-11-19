@@ -454,9 +454,11 @@ enum DebugHooks {
                 if let step { onboarding.go(to: step) } else { log("onboarding: no step \(argument)") }
             }
         case "prompt":
-            // prompt yes|no — answers the extension card on screen.
+            // prompt yes|no|alt — answers the card on screen (alt: its second way to say yes).
             log("prompt \(state.prompt?.title ?? "-") items=\(state.prompt?.items.map(\.text) ?? []) note=\(state.prompt?.note != nil)")
-            MainActor.assumeIsolated { PromptPresenter.resolve(argument != "no") }
+            MainActor.assumeIsolated {
+                if argument == "alt" { PromptPresenter.resolve(false, alternate: true) } else { PromptPresenter.resolve(argument != "no") }
+            }
         case "snapview":
             // snapview <path> [settings] — draws the window's views without screen capture (works
             // without Screen Recording permission; blur and web content come out blank).
@@ -533,6 +535,33 @@ enum DebugHooks {
                 ContentBlocker.shared.toggleAllowed(host: host, reloading: state.selectedTab)
             }
             log("blocker enabled=\(AppSettings.shared.privacy.blockAds) allowed=\(AppSettings.shared.privacy.adBlockAllowlist)")
+        case "https":
+            // https only|upgrade|off — "Always use secure connections", "Upgrade to HTTPS", or neither.
+            // https status — what the selected tab shows. https proceed — its warning page's "Continue to Site".
+            var privacy = AppSettings.shared.privacy
+            switch argument {
+            case "only", "upgrade", "off":
+                privacy.httpsOnly = argument == "only"
+                privacy.upgradeToHTTPS = argument != "off"
+                AppSettings.shared.privacy = privacy
+            case "proceed":
+                state.selectedTab?.webView?.evaluateJavaScript("tuffHTTPS()")
+            default:
+                break
+            }
+            let tab = state.selectedTab
+            log("https only=\(privacy.httpsOnly) upgrade=\(privacy.upgradeToHTTPS) url=\(tab?.webView?.url?.absoluteString ?? "-") warning=\(tab?.httpsWarningURL?.absoluteString ?? "-") title=\(tab?.webView?.title ?? "")")
+        case "translate":
+            // translate on|off|status — Translate Page / Show Original on the selected tab, or what it is doing.
+            let tab = state.selectedTab
+            if argument == "on" { Task { @MainActor in await tab?.translatePage() } }
+            if argument == "off" { tab?.showOriginal() }
+            let t = tab?.translation
+            log("translate \(t.map { "\($0.sourceName)→\($0.targetName) \($0.phase)" } ?? "none") keep=\(tab?.keepTranslating.map { $0.source.minimalIdentifier } ?? "-") title=\(tab?.webView?.title ?? "")")
+        case "passwords":
+            // passwords — the saved logins (sites and usernames) and what the selected tab suggests.
+            let suggestions = state.selectedTab?.passwordSuggestions
+            log("passwords saved=\(PasswordStore.shared.logins.map { "\($0.origin) \($0.username)" }) never=\(PasswordStore.shared.never) suggestions=\(suggestions.map { "\($0.field.rawValue) \($0.logins.map(\.username)) strong=\($0.strongPassword != nil) highlighted=\(String(describing: $0.highlighted)) rect=\(String(describing: $0.rect))" } ?? "none")")
         case "popups":
             // popups — what the pop-up blocker stopped on the selected tab.
             let tab = state.selectedTab
@@ -660,7 +689,7 @@ enum DebugHooks {
                 window.setFrame(frame, display: true, animate: true)
             }
         case "press":
-            // press [cmd+][shift+][opt+]<letter> — a real key press through the event queue, so it
+            // press [cmd+][shift+][opt+]<letter|tab|return|esc|down|up> — a real key press through the event queue, so it
             // takes the same path as the keyboard (the focused web view sees it first).
             var flags: NSEvent.ModifierFlags = []
             let words = argument.lowercased().split(separator: "+").map(String.init)
@@ -674,10 +703,20 @@ enum DebugHooks {
                 }
             }
             let letters = "asdfhgzxcv bqweryt123465=97-80]ou[ip lj'k;\\,/nm.\t"
-            guard let key = words.last.map({ $0 == "tab" ? "\t" : $0 }), key.count == 1,
-                  let index = letters.firstIndex(of: Character(key)),
-                  let window = state.window else { log("press: bad key \(argument)"); break }
-            let code = UInt16(letters.distance(from: letters.startIndex, to: index))
+            // Named keys: their key code and the character AppKit gives them.
+            let named: [String: (UInt16, String)] = [
+                "return": (36, "\r"), "esc": (53, "\u{1B}"), "down": (125, "\u{F701}"), "up": (126, "\u{F700}"),
+            ]
+            var key = words.last.map({ $0 == "tab" ? "\t" : $0 }) ?? ""
+            var code: UInt16
+            if let (namedCode, character) = named[key] {
+                code = namedCode
+                key = character
+            } else {
+                guard key.count == 1, let index = letters.firstIndex(of: Character(key)) else { log("press: bad key \(argument)"); break }
+                code = UInt16(letters.distance(from: letters.startIndex, to: index))
+            }
+            guard let window = state.window else { log("press: no window"); break }
             for type in [NSEvent.EventType.keyDown, .keyUp] {
                 if let event = NSEvent.keyEvent(
                     with: type, location: .zero, modifierFlags: flags, timestamp: ProcessInfo.processInfo.systemUptime,

@@ -469,7 +469,11 @@ struct WebCard: View {
         let shape = RoundedRectangle(cornerRadius: radius, style: .continuous)
 
         let newTabPage = tab?.showsNewTabPage ?? false
-        let pageShowing = (tab?.isAwake ?? false) && !newTabPage
+        // `isAwake` is read to refresh when the page wakes or sleeps, but the web view decides: SwiftUI can
+        // render in the middle of `isAwake = true`, when it still says false, and the card would never
+        // show a page that was woken along with another (the other side of a split).
+        let _ = tab?.isAwake
+        let pageShowing = tab?.webView != nil && !newTabPage
 
         ZStack(alignment: .top) {
             if tab == nil || newTabPage {
@@ -506,6 +510,7 @@ struct WebCard: View {
 
             if let tab {
                 LinkPreview(tab: tab)
+                TranslationHost(tab: tab)
             }
 
             if state.findVisible, focused, let tab {
@@ -533,6 +538,14 @@ struct WebCard: View {
                 ScreenshotAreaSelector()
                     .transition(.opacity)
                     .zIndex(3)
+            }
+
+            if focused, let tab, let suggestions = tab.passwordSuggestions {
+                PasswordSuggestionList(tab: tab, suggestions: suggestions)
+                    .offset(x: suggestions.rect.map { max(8, $0.minX) } ?? 0, y: suggestions.rect.map { $0.maxY + 4 } ?? 14)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: suggestions.rect == nil ? .top : .topLeading)
+                    .transition(.opacity)
+                    .zIndex(2)
             }
 
             if let tab, let request = tab.permissionRequest {

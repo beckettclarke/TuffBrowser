@@ -268,8 +268,13 @@ struct PromptCard: View {
                 .overlay(RoundedRectangle(cornerRadius: 11, style: .continuous).strokeBorder(Color.yellow.opacity(0.28), lineWidth: 0.5))
             }
 
+            // Three buttons leave no room beside them: the checkbox gets its own line.
+            if let checkbox = prompt.checkbox, prompt.alternateTitle != nil {
+                PromptCheckbox(title: checkbox, fill: confirmFill, mark: confirmText)
+            }
+
             HStack(spacing: 8) {
-                if let checkbox = prompt.checkbox {
+                if let checkbox = prompt.checkbox, prompt.alternateTitle == nil {
                     PromptCheckbox(title: checkbox, fill: confirmFill, mark: confirmText)
                 }
                 Spacer()

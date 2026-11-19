@@ -5,6 +5,9 @@ import WebKit
 
 enum SitePermissionKind: String, Codable, CaseIterable {
     case camera, microphone, cameraAndMicrophone, location, notifications
+    /// Sharing the screen or a window (`getDisplayMedia`). Asked every time, never remembered,
+    /// as in Chrome and Safari.
+    case screen
 
     init(_ type: WKMediaCaptureType) {
         switch type {
@@ -21,6 +24,7 @@ enum SitePermissionKind: String, Codable, CaseIterable {
         case .cameraAndMicrophone: "Camera & Microphone"
         case .location: "Location"
         case .notifications: "Notifications"
+        case .screen: "Screen Sharing"
         }
     }
 
@@ -32,6 +36,7 @@ enum SitePermissionKind: String, Codable, CaseIterable {
         case .cameraAndMicrophone: "wants to use your camera and microphone"
         case .location: "wants to know your location"
         case .notifications: "wants to send you notifications"
+        case .screen: "wants to see your screen"
         }
     }
 
@@ -43,6 +48,7 @@ enum SitePermissionKind: String, Codable, CaseIterable {
         case .cameraAndMicrophone: [("video.fill", "Camera"), ("mic.fill", "Microphone")]
         case .location: [("location.fill", "Location")]
         case .notifications: [("bell.badge.fill", "Notifications")]
+        case .screen: [("display", "Screen or window")]
         }
     }
 
@@ -54,6 +60,9 @@ enum SitePermissionKind: String, Codable, CaseIterable {
 
     /// The two answers a camera-and-microphone request is kept as.
     var parts: [SitePermissionKind] { self == .cameraAndMicrophone ? [.camera, .microphone] : [self] }
+
+    /// Whether an answer can be kept. Screen sharing is asked for each time.
+    var isRemembered: Bool { self != .screen }
 }
 
 /// What a site may do for one permission: ask each time, or always allow or deny.
@@ -343,12 +352,14 @@ struct PermissionCard: View {
             }
 
             HStack(spacing: 10) {
-                TuffSwitch(isOn: $remember)
-                Text(state.isPrivate ? "Remember while Incognito is open" : "Remember for this site")
-                    .font(.system(size: 12, weight: .medium))
-                    .fixedSize()
-                    .foregroundStyle(.primary.opacity(0.7))
-                    .onTapGesture { withAnimation(Motion.snappy) { remember.toggle() } }
+                if request.kind.isRemembered {
+                    TuffSwitch(isOn: $remember)
+                    Text(state.isPrivate ? "Remember while Incognito is open" : "Remember for this site")
+                        .font(.system(size: 12, weight: .medium))
+                        .fixedSize()
+                        .foregroundStyle(.primary.opacity(0.7))
+                        .onTapGesture { withAnimation(Motion.snappy) { remember.toggle() } }
+                }
                 Spacer(minLength: 8)
                 Button("Don’t Allow") { answer(false) }
                     .buttonStyle(TuffButtonStyle(kind: .plain))

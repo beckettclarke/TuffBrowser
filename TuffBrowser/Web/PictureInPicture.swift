@@ -28,6 +28,8 @@ enum PictureInPicture {
         /// Only a video that is playing with sound, and is big enough to be the point of the page.
         case auto
         case exit
+        /// Play on a video that WebKit paused as it left PiP (see `exitPaused` in the script).
+        case resume
     }
 
     static func enable(_ preferences: WKPreferences) {
@@ -73,11 +75,17 @@ enum PictureInPicture {
         return null;
       }
 
+      // A video in a tab that isn't on screen is paused by WebKit as it leaves PiP, whichever way
+      // it leaves (the window's "back to tab" button included). That pause comes with the video
+      // already out of PiP mode, unlike one the user makes with the PiP window's own controls
+      // (its close button pauses first), so it is remembered here: the video was still playing.
+      var exitPaused = null;
+
       // On leaving PiP no video is in it any more, so `playing` comes from the event's video.
       function report(e) {
         var v = pipVideo();
         var subject = v || (e && e.target && e.target.tagName === 'VIDEO' ? e.target : null);
-        post({ pip: !!v, playing: !!subject && !subject.paused });
+        post({ pip: !!v, playing: !!subject && (!subject.paused || subject === exitPaused) });
       }
 
       // `disablePictureInPicture` is ignored: sites (Netflix among them) set it to hide the
@@ -128,6 +136,13 @@ enum PictureInPicture {
 
       window.__tuffPiP = async function (mode) {
         try {
+          if (mode === 'resume') {
+            var paused = exitPaused;
+            exitPaused = null;
+            if (!paused || !paused.paused) return 'none';
+            await paused.play();
+            return 'entered';
+          }
           var current = pipVideo();
           if (current) {
             if (mode === 'auto') return 'none';
@@ -148,6 +163,11 @@ enum PictureInPicture {
       ['enterpictureinpicture', 'leavepictureinpicture', 'webkitpresentationmodechanged'].forEach(function (type) {
         document.addEventListener(type, function (e) { setTimeout(function () { report(e); }, 0); }, true);
       });
+      document.addEventListener('pause', function (e) {
+        var v = e.target;
+        if (v.tagName === 'VIDEO' && v === document.pictureInPictureElement && v.webkitPresentationMode !== 'picture-in-picture') exitPaused = v;
+      }, true);
+      document.addEventListener('play', function (e) { if (e.target === exitPaused) exitPaused = null; }, true);
       // Lets the app find a video that plays in a subframe (an embedded player).
       document.addEventListener('play', function (e) {
         if (e.target && e.target.tagName === 'VIDEO' && window !== window.top) post({ playing: true });
@@ -222,12 +242,16 @@ extension Tab {
         guard !active else { return }
         pictureInPictureFrame = nil
         enteredPictureInPictureAutomatically = false
-        // The PiP window's close button pauses the video; its "back to the page" button keeps it
-        // playing. For the second, show the page it went back to.
+        // The PiP window's close button pauses the video; its "back to the page" button leaves it
+        // playing (or, in a tab that was in the background, paused by WebKit on the way out: the
+        // page script knows). For the second, show the page it went back to, and carry on playing.
         if playing, let browser, !browser.isOnScreen(self) {
             browser.select(self)
             NSApp.activate()
             browser.window?.makeKeyAndOrderFront(nil)
+            if let webView {
+                PictureInPicture.run(.resume, in: webView, frame: frame) { _ in }
+            }
         }
     }
 }

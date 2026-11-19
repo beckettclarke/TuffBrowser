@@ -59,6 +59,7 @@ final class AppDelegate: NSObject {
                 SitePermissions.shared.forgetIncognito()
                 SiteSettings.shared.forgetIncognito()
                 ExternalAppLinks.forgetIncognito()
+                HTTPSUpgrade.forgetIncognito()
                 // Incognito downloads leave the list with the last Incognito window.
                 DownloadManager.shared.forgetPrivateItems()
             }
@@ -163,6 +164,7 @@ final class AppDelegate: NSObject {
     @objc func showImport(_ sender: Any?) { showSettings(tab: .importData) }
     @objc func copyLink(_ sender: Any?) { state.copyCurrentURL() }
     @objc func toggleReader(_ sender: Any?) { state.selectedTab?.toggleReader() }
+    @objc func toggleTranslation(_ sender: Any?) { state.selectedTab?.toggleTranslation() }
     @objc func nextTab(_ sender: Any?) { state.selectAdjacentTab(offset: 1) }
     @objc func previousTab(_ sender: Any?) { state.selectAdjacentTab(offset: -1) }
     @objc func nextSpace(_ sender: Any?) { state.switchSpace(by: 1) }
@@ -257,6 +259,11 @@ extension AppDelegate: NSMenuItemValidation {
         case #selector(toggleReader(_:)):
             menuItem.title = tab?.reader != nil ? "Exit Reader Mode" : "Enter Reader Mode"
             return tab?.reader != nil || tab?.canUseReader == true
+        case #selector(toggleTranslation(_:)):
+            menuItem.title = tab?.translation != nil
+                ? "Show Original"
+                : "Translate to \(PageTranslation.name(of: PageTranslation.preferredTarget))"
+            return tab?.translation != nil || (tab?.isAwake == true && tab?.pdf == nil && tab?.url != nil)
         case #selector(reopenClosedTab(_:)):
             return state.hasClosedTabs
         case #selector(togglePin(_:)):

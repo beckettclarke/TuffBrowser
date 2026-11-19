@@ -123,6 +123,7 @@ enum WebEngine {
         _ = cacheModel
         let config = WKWebViewConfiguration()
         config.websiteDataStore = dataStore
+        WebCryptoKey.attach(to: dataStore)
         SiteSettings.applyCookiePolicy(to: [dataStore])
         config.applicationNameForUserAgent = userAgentApplicationName
         config.allowsAirPlayForMediaPlayback = true
@@ -159,6 +160,9 @@ enum WebEngine {
         PictureInPicture.install(into: config.userContentController)
         LiveFavicon.install(into: config.userContentController)
         PopupBlocker.install(into: config.userContentController)
+        Passkeys.install(into: config.userContentController)
+        PasswordAutofill.install(into: config.userContentController)
+        PageTranslator.install(into: config.userContentController)
         WebNotifications.install(into: config.userContentController)
         EmbeddedSignIn.install(into: config.userContentController)
         Tab.installUnsavedInputTracking(into: config.userContentController)
@@ -167,6 +171,7 @@ enum WebEngine {
         ContentBlocker.shared.attach(config.userContentController)
         InternalPageHandler.shared.install(into: config)
         config.userContentController.add(CertificateErrorHandler.shared, contentWorld: .page, name: CertificateErrorHandler.name)
+        config.userContentController.add(HTTPSWarningHandler.shared, contentWorld: .page, name: HTTPSWarningHandler.name)
         #if DEBUG
         DebugHooks.installPageTracer(into: config.userContentController)
         #endif

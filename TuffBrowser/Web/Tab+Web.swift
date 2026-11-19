@@ -85,6 +85,14 @@ extension Tab: WKNavigationDelegate {
         // A main-frame navigation is now in flight; extensions read it as `pendingUrl` until it commits.
         if navigationAction.targetFrame?.isMainFrame ?? false {
             pendingURL = url
+            // HTTPS for every site. Tuff's own error pages load at the address that failed, as is.
+            let policy = url == errorPageURL ? .keepAsRequested : HTTPSUpgrade.policy(for: url, incognito: browser?.isPrivate ?? false)
+            preferences.preferredHTTPSNavigationPolicy = policy
+            if url.scheme?.lowercased() == "http" {
+                httpsUpgradeURL = policy == .errorOnFailure ? url : nil
+            } else if url.host(percentEncoded: false) != httpsUpgradeURL?.host(percentEncoded: false) {
+                httpsUpgradeURL = nil
+            }
             pdfNavigationWillStart(to: url, type: navigationAction.navigationType)
             ContentBlocker.shared.prepare(webView.configuration.userContentController, for: url)
         }
@@ -189,11 +197,15 @@ extension Tab: WKNavigationDelegate {
         mediaFrame = nil
         // The certificate error page commits at the address that failed; anything else ends it.
         if let failure = certificateFailure, webView.url != failure.url { certificateFailure = nil }
+        if let warning = httpsWarningURL, webView.url != warning { httpsWarningURL = nil }
+        httpsUpgradeURL = nil
         // A new page gets to show dialogs again, and starts with no blocked pop-ups.
         if !blockedPopups.isEmpty { blockedPopups.removeAll() }
         pageDialogCount = 0
         pageDialogsBlocked = false
         if hoveredLink != nil { hoveredLink = nil }
+        if passwordSuggestions != nil { passwordSuggestions = nil }
+        translationPageDidCommit()
         // A new page: reader mode was for the one before.
         closeReader()
         if isInPictureInPicture {
@@ -248,6 +260,9 @@ extension Tab: WKNavigationDelegate {
             return
         }
         refreshHeaderColor()
+        // A sign-in sent from the page before this one.
+        if pendingLogin != nil { DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in self?.offerPendingLogin() } }
+        translationPageDidFinish()
         if readerModeRequested {
             readerModeRequested = false
             openReader()
@@ -331,6 +346,19 @@ extension Tab: WKNavigationDelegate {
             NSLog("Tuff: extension page failed to load: \(failingURL) — \(ns.localizedDescription)")
             return
         }
+        // "Always use secure connections" and the site has no working https: a warning page
+        // that can let it through on http, unless the site can't be reached at all.
+        if let upgraded = httpsUpgradeURL, failingURL.scheme?.lowercased() == "https",
+           failingURL.host(percentEncoded: false)?.lowercased() == upgraded.host(percentEncoded: false)?.lowercased() {
+            httpsUpgradeURL = nil
+            if HTTPSUpgrade.isUnreachable(ns) {
+                showErrorPage(WebEngine.errorPage(for: error, url: upgraded), at: upgraded, in: webView)
+            } else {
+                httpsWarningURL = upgraded
+                showErrorPage(HTTPSUpgrade.warningPage(for: upgraded), at: upgraded, in: webView)
+            }
+            return
+        }
         // An untrusted certificate gets its own page, which can show it and let you through.
         if let failure = CertificateFailure(error: ns, url: failingURL) {
             certificateFailure = failure
@@ -394,6 +422,13 @@ extension Tab: WKNavigationDelegate {
         }
 
         let space = challenge.protectionSpace
+        // Saved passwords: the site's login filled in, and a box to save a new one.
+        let scheme = space.protocol?.lowercased() ?? "https"
+        let defaultPort = scheme == "https" ? 443 : 80
+        let origin = "\(scheme)://\(space.host.lowercased())\(space.port != 0 && space.port != defaultPort ? ":\(space.port)" : "")"
+        let profile = PasswordAutofill.enabled ? passwordProfileID : nil
+        let saved = profile.flatMap { PasswordStore.shared.logins(for: origin, profile: $0).first { $0.origin == origin } }
+        let proposed = challenge.previousFailureCount == 0 ? saved : nil
         let prompt = Prompt(
             icon: favicon,
             symbol: "lock.fill",
@@ -403,13 +438,18 @@ extension Tab: WKNavigationDelegate {
             note: space.receivesCredentialSecurely ? nil : "This connection isn’t secure, so your password could be seen by others on the network.",
             confirmTitle: "Sign In",
             fields: [
-                Prompt.Field(placeholder: "Username", text: challenge.proposedCredential?.user ?? ""),
-                Prompt.Field(placeholder: "Password", secure: true),
-            ]
+                Prompt.Field(placeholder: "Username", text: proposed?.username ?? challenge.proposedCredential?.user ?? ""),
+                Prompt.Field(placeholder: "Password", text: proposed?.password ?? "", secure: true),
+            ],
+            checkbox: profile == nil ? nil : "Save password in Tuff",
+            checked: profile != nil
         )
         Task { @MainActor in
             if let result = await askForPage(prompt), result.confirmed, result.fields.count == 2 {
                 let credential = URLCredential(user: result.fields[0], password: result.fields[1], persistence: .forSession)
+                if let profile, result.checked, !result.fields[1].isEmpty {
+                    PasswordStore.shared.save(origin: origin, username: result.fields[0].trimmed, password: result.fields[1], profile: profile)
+                }
                 completionHandler(.useCredential, credential)
             } else {
                 completionHandler(.cancelAuthenticationChallenge, nil)
@@ -627,6 +667,18 @@ extension Tab: WKUIDelegate {
         askPermission(origin: origin, kind: SitePermissionKind(type)) { decisionHandler($0 == true ? .grant : .deny) }
     }
 
+    /// `getDisplayMedia`: "Present" in Meet, Zoom and Teams. WebKit's private question for it;
+    /// unanswered, every request is refused. After Allow, macOS's own picker chooses the
+    /// screen or window. The answer is a `WKDisplayCapturePermissionDecision`: 0 deny,
+    /// 1 pick a screen, 2 pick a window.
+    @objc(_webView:requestDisplayCapturePermissionForOrigin:initiatedByFrame:withSystemAudio:decisionHandler:)
+    func webView(
+        _ webView: WKWebView, requestDisplayCapturePermissionFor origin: WKSecurityOrigin,
+        initiatedBy frame: WKFrameInfo, withSystemAudio: Bool, decisionHandler: @escaping (Int) -> Void
+    ) {
+        askPermission(origin: origin, kind: .screen) { decisionHandler($0 == true ? 1 : 0) }
+    }
+
     /// `navigator.geolocation`. Public from macOS 27; WebKit asks the private method below on
     /// older versions. Unanswered, WebKit refuses every location request.
     @available(macOS 27.0, *)
@@ -654,7 +706,7 @@ extension Tab: WKUIDelegate {
         let host = origin.host
         let key = SitePermissions.origin(of: origin)
         let incognito = browser?.isPrivate ?? false
-        if let remembered = SitePermissions.shared.decision(origin: key, kind: kind, incognito: incognito) {
+        if kind.isRemembered, let remembered = SitePermissions.shared.decision(origin: key, kind: kind, incognito: incognito) {
             decide(remembered)
             return
         }
@@ -662,7 +714,9 @@ extension Tab: WKUIDelegate {
         resolvePermission(granted: nil)
         let request = PermissionRequest(host: host, kind: kind) { granted, remember in
             guard let granted else { decide(nil); return }
-            SitePermissions.shared.record(origin: key, kind: kind, granted: granted, remember: remember, incognito: incognito)
+            if kind.isRemembered {
+                SitePermissions.shared.record(origin: key, kind: kind, granted: granted, remember: remember, incognito: incognito)
+            }
             decide(granted)
         }
         withAnimation(Motion.snappy) { permissionRequest = request }

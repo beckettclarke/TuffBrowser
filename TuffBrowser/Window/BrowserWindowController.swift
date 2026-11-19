@@ -354,6 +354,11 @@ final class BrowserWindowController: NSObject {
             return nil
         }
         let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        // The saved-password list under a sign-in field takes ↓ ↑ Return Esc from the page.
+        if window.firstResponder is WKWebView, flags.intersection([.command, .control, .option]).isEmpty,
+           let tab = state.selectedTab, tab.handlePasswordSuggestionKey(event) {
+            return nil
+        }
         // Browser shortcuts a page must not take (Chrome reserves the same ones). Left to the
         // menu, a key reaches it only after the focused page has seen it and handed it back,
         // which is slow on a busy page and never happens if the page swallows it: ⌘T opened the

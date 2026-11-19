@@ -398,10 +398,13 @@ problems from the same audit are fixed (see BUGS.md).
       `WKWebView.fullscreenState`; reuse the toast/card look (no `.shadow`, see AGENTS.md).
       Done (2026-11-17): `Window/FullScreenBanner.swift` — a click-through panel over WebKit's full-screen window (the
       browser window isn't visible then), 3.5 s. Runtime-verified via `fsbanner` (shown, then faded).
-- [ ] **[P1]** **Screen sharing (`getDisplayMedia`).** Nothing handles it, so "Present" in Meet,
+- [x] **[P1]** **Screen sharing (`getDisplayMedia`).** Nothing handles it, so "Present" in Meet,
       Zoom and Teams fails. Needs WebKit's display-capture permission delegate (private
       `_webView:requestDisplayCapturePermissionForOrigin:…` and the screen-capture preference)
       plus a `SitePermissionKind.screen` and a card.
+      Done (2026-11-19): `Tab+Web` answers WebKit's display-capture question with the permission card
+      (`SitePermissionKind.screen`, asked every time, never remembered); after Allow, macOS's own
+      screen / window picker opens. Runtime-verified up to the picker.
 - [x] **[P1]** **Camera / microphone in-use indicator** on the tab row (and horizontal tab), with a
       click to stop: observe `cameraCaptureState` / `microphoneCaptureState`, stop with
       `setCameraCaptureState(.none)` / `setMicrophoneCaptureState(.none)`.
@@ -412,9 +415,16 @@ problems from the same audit are fixed (see BUGS.md).
 - [ ] **[P1]** **Passkeys / WebAuthn.** Third-party WKWebView browsers need Apple's
       `com.apple.developer.web-browser.public-key-credential` entitlement (Developer ID + a request
       to Apple). Without it passkeys and security keys fail on most sites. Test on webauthn.io.
-- [ ] **[P1]** **Password saving and autofill.** Nothing built in (HTTP sign-in is `.forSession`
+      2026-11-19: until then `Web/Passkeys.swift` stops WebKit claiming passkey support
+      (`getClientCapabilities`), which sent sign-in pages into a redirect loop. Passkey extensions
+      (1Password) still work. Remove nothing when the entitlement arrives: the script turns itself off.
+- [x] **[P1]** **Password saving and autofill.** Nothing built in (HTTP sign-in is `.forSession`
       only); today it's extensions (1Password, Bitwarden). Either a Keychain-backed store with a
       save card and fill-on-focus, or document the extension route in onboarding.
+      Done (2026-11-19): `Passwords/`. Encrypted per-profile store (key in a file, not the keychain: ad hoc
+      signing would make the keychain ask after every update), save / update card after a sign-in, suggestion
+      list under the field (↓ ↑ ↩ Esc), strong passwords for sign-up forms, HTTP sign-in prefill, Settings →
+      Passwords (Touch ID / Mac password to show, copy, edit or export; CSV import / export). Runtime-verified.
 
 ### Privacy and site controls
 - [x] **[P1]** **"Pop-up blocked" indicator.** With Block pop-ups on, blocked `window.open`s vanish
@@ -430,8 +440,11 @@ problems from the same audit are fixed (see BUGS.md).
 - [x] **[P2]** **List "open in app" answers** ("Always allow {site} to open {App} links",
       `ExternalAppLinks`) in Settings → Websites, each removable. Today only "Forget All" clears them.
       Done (2026-11-17): "Links that open apps" group, with the app's name.
-- [ ] **[P2]** **HTTPS-first mode:** try https for every site, with a warning page before falling
+- [x] **[P2]** **HTTPS-first mode:** try https for every site, with a warning page before falling
       back to http. `upgradeKnownHostsToHTTPS` only covers sites WebKit knows support it.
+      Done (2026-11-19): `Web/HTTPSUpgrade.swift`. "Upgrade to HTTPS" tries https for every site and falls
+      back quietly; "Always use secure connections" shows a warning page with "Continue to Site" (until
+      quit). Local / intranet names and IPs are left alone. Runtime-verified (`https` debug command).
 - [ ] **[P3]** Web Push (notifications only arrive while Tuff is running).
 
 ### History, search and tabs
@@ -448,7 +461,11 @@ problems from the same audit are fixed (see BUGS.md).
       **Paste and Go** in the address pill's menu.
       Done: Paste and Go (2026-11-17) in the address bar's right-click menu and Edit menu; zero state
       (2026-11-18) shows recent tabs and this profile's top sites, with Return activating the selection.
-- [ ] **[P2]** **Translate page** (Apple's Translation framework).
+- [x] **[P2]** **Translate page** (Apple's Translation framework).
+      Done (2026-11-19): `Web/PageTranslation.swift`, page menu and View menu. On this Mac when the language is
+      installed; otherwise a card asks to download it or use Google Translate (keyless endpoint; Settings →
+      Privacy → Translation can remember the choice; Incognito always asks). Follows the tab to further pages in
+      the same language. Google path runtime-verified; the on-device path stops at macOS's download sheet here.
 - [ ] **[P3]** Per-site user agent; text-only zoom. ⌥-click a link to download it done (2026-11-18).
 - [ ] **[P3]** A quick "save for later" / bookmarks manager (favourites and pinned tabs cover most of it).
 

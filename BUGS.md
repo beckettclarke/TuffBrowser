@@ -1,6 +1,6 @@
 # Known bugs
 
-Last updated 2026-11-18. The extension / keyboard / focus sweep, the 2026-11-16 security / bug
+Last updated 2026-11-19. The extension / keyboard / focus sweep, the 2026-11-16 security / bug
 audit, the 2026-11-17 app correctness pass, and the 18-item `CDL-HANDOFF.md` correctness pass are
 fixed. Two older limitations are left over. Missing features are in TODOS.md (section K).
 
@@ -91,6 +91,8 @@ fixed. Two older limitations are left over. Missing features are in TODOS.md (se
 | A .torrent could not complete an existing magnet, and resume snapshots could include blocks still buffered in memory. | `Engine/Torrent`, `TorrentSession`, `TorrentStorage` |
 | MSE initial payload handling and web-seed multi-file cancellation were incorrect. | `Engine/MSE`, `Engine/WebSeed` |
 | Download/source cookie matching ignored path boundaries and expiry; redirects could retain old cookies. | `FaviconStore.cookies`, `TurboDownloads`, `InternalPages`, `HTTPTransfer` |
+| Every update asked for the login keychain password ("Tuff wants to use … “Tuff WebCrypto Master Key”"). WebKit kept its WebCrypto key in the keychain, and an ad hoc signed app is a new app to the keychain after each update. Tuff now hands WebKit its own key from its data folder (the old keychain key is copied over once). | `Web/WebCryptoKey.swift` |
+| Signing in with a passkey without a passkey extension looped: WebKit told pages passkeys work (`getClientCapabilities`), but without Apple's browser entitlement every passkey call fails, so sign-in pages kept redirecting into their passkey step. | `Web/Passkeys.swift` |
 | Ad-block allowlists were missed before rule activation; contenteditable edits were invisible to idle protection; history writes could finish out of order. | `ContentBlocker`, `Tab`, `HistoryWriter` |
 
 New debug-script commands (debug builds only): `press [cmd+][shift+][opt+][ctrl+]<key|tab>` sends
@@ -99,4 +101,5 @@ pointer events through the event queue (window points, origin bottom-left). Adde
 `popups` (what the pop-up blocker stopped), `historymenu` (fills and logs the History menu),
 `pasteandgo <text>`, `capture` (camera / mic / full-screen state) and `fsbanner`. Later the same day: `inspect` (opens
 Web Inspector for the selected tab, for testing `devtools_page` extensions). Added 2026-11-18: `blocker on|off|allow`
-controls the built-in blocker, and `TUFF_BLOCKER_DISABLE=main,isolated,cosmetic` isolates its advanced components.
+controls the built-in blocker, and `TUFF_BLOCKER_DISABLE=main,isolated,cosmetic` isolates its advanced components. Added 2026-11-19:
+`https only|upgrade|off|status|proceed` switches HTTPS-first and presses the warning page's "Continue to Site".

@@ -61,6 +61,15 @@ struct PageMenu: View {
                 ) {
                     closeThen { tab?.toggleReader() }
                 }
+                let translated = tab?.translation != nil
+                PageMenuTile(
+                    symbol: "translate",
+                    help: translated ? "Show Original" : "Translate to \(PageTranslation.name(of: PageTranslation.preferredTarget))",
+                    disabled: !(tab?.isAwake ?? false) || tab?.pdf != nil || tab?.url == nil,
+                    active: translated
+                ) {
+                    closeThen { tab?.toggleTranslation() }
+                }
                 PageMenuTile(symbol: "slider.horizontal.3", help: "Site Settings", disabled: SiteSettings.key(for: tab?.url) == nil) {
                     withAnimation(Motion.snappy) { page = .site }
                 }

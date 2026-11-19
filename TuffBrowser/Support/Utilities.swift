@@ -230,7 +230,9 @@ enum DataStores {
     }
 
     static func extensionControllerConfiguration() -> WKWebExtensionController.Configuration {
-        testIdentifier.map { WKWebExtensionController.Configuration(identifier: $0) } ?? .default()
+        let configuration = testIdentifier.map { WKWebExtensionController.Configuration(identifier: $0) } ?? .default()
+        WebCryptoKey.attach(to: configuration.defaultWebsiteDataStore)
+        return configuration
     }
 }
 

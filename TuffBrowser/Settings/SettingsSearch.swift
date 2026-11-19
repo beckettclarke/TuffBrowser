@@ -226,8 +226,17 @@ enum SettingsSearch {
              "clear remove delete sign out logins storage"),
         .row("Cache", .privacy, in: "Website data", named: "Empty cache", "clear cache storage"),
         .row("Block ads and trackers", .privacy, in: "Content blocking", "ad blocker adblock ublock tracking easylist filter lists"),
-        .row("Upgrade to HTTPS", .privacy, in: "Security", "secure ssl tls https-only"),
+        .row("Upgrade to HTTPS", .privacy, in: "Security", "secure ssl tls https-first"),
+        .row("Always use secure connections", .privacy, in: "Security", "https-only https-first secure ssl tls insecure http warning"),
         .row("Warn about fraudulent websites", .privacy, in: "Security", "phishing malware safe browsing fraud"),
+
+        .row("When a language isn’t on this Mac", .privacy, in: "Translation", named: "Translation", "translate google translation language download"),
+
+        // Passwords
+        .row("Save and fill passwords", .passwords, in: nil, "passwords logins autofill sign in save offer"),
+        .group("Saved passwords", .passwords, named: "Saved passwords", "passwords logins show copy edit delete add"),
+        .row("Import passwords", .passwords, in: "Import and export", "csv import passwords chrome safari 1password bitwarden"),
+        .row("Export passwords", .passwords, in: "Import and export", "csv export passwords backup"),
 
         // Websites
         .group("Site permissions", .websites, named: "Site permissions", "camera microphone location notifications allowed blocked forget"),

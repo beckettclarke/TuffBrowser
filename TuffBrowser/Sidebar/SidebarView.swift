@@ -511,17 +511,30 @@ struct LoadingSpinner: View {
 
 struct SpacePager: View {
     @Environment(BrowserState.self) private var state
+    /// The spaces a switch slides across, kept built until it has landed.
+    @State private var travelled: ClosedRange<Int>?
+    @State private var settle: DispatchWorkItem?
 
     var body: some View {
         GeometryReader { geo in
             let width = geo.size.width
+            let current = state.currentSpaceIndex
+            // Only the pages on screen or next to it are built: the rest are empty placeholders
+            // of the same width, so a switch doesn't lay out every space's tabs every frame.
+            let built = (travelled ?? current...current).widened(by: 1)
             HStack(alignment: .top, spacing: 0) {
-                ForEach(state.spaces) { space in
-                    SpacePage(space: space)
-                        .frame(width: width)
-                        // Neighbouring pages sit off to the side, over the web page. Clipping
-                        // only hides them — they must also be barred from taking mouse events.
-                        .allowsHitTesting(space === state.currentSpace)
+                ForEach(Array(state.spaces.enumerated()), id: \.element.id) { index, space in
+                    Group {
+                        if built.contains(index) {
+                            SpacePage(space: space)
+                        } else {
+                            Color.clear
+                        }
+                    }
+                    .frame(width: width)
+                    // Neighbouring pages sit off to the side, over the web page. Clipping
+                    // only hides them — they must also be barred from taking mouse events.
+                    .allowsHitTesting(space === state.currentSpace)
                 }
             }
             .offset(x: -CGFloat(state.pagerPosition) * width)
@@ -530,7 +543,20 @@ struct SpacePager: View {
         .clipped()
         .contentShape(Rectangle())
         .padding(.top, 6)
+        .onChange(of: state.currentSpaceIndex) { old, new in
+            let span = min(old, new)...max(old, new)
+            travelled = travelled.map { min($0.lowerBound, span.lowerBound)...max($0.upperBound, span.upperBound) } ?? span
+            settle?.cancel()
+            let work = DispatchWorkItem { travelled = nil }
+            settle = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.8, execute: work)
+        }
     }
+}
+
+private extension ClosedRange where Bound == Int {
+    /// Widened by `margin` on both sides; callers only test membership.
+    func widened(by margin: Int) -> ClosedRange<Int> { (lowerBound - margin)...(upperBound + margin) }
 }
 
 struct SpacePage: View {

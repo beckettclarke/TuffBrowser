@@ -40,6 +40,10 @@ final class Tab: NSObject, Identifiable {
     var isAwake = false
     /// A camera, microphone, location or notification request waiting for an answer (shown as a card over the page).
     var permissionRequest: PermissionRequest?
+    /// Saved logins offered under the sign-in field that has the keyboard (`PasswordAutofill`).
+    var passwordSuggestions: PasswordSuggestions?
+    /// The page is being shown in another language (`PageTranslation`).
+    var translation: PageTranslation?
     /// The link under the mouse, shown at the bottom of the page (see `LinkPreview`).
     var hoveredLink: URL?
     /// The colour across the top of the page (its `theme-color`, or what its header is painted
@@ -134,7 +138,22 @@ final class Tab: NSObject, Identifiable {
     @ObservationIgnored var findReporter: FindReporter?
     /// The certificate problem the tab's error page is about (see `CertificateErrorHandler`).
     @ObservationIgnored var certificateFailure: CertificateFailure?
+    /// The http address being tried over https with no automatic fallback ("Always use secure
+    /// connections"); if that fails, `HTTPSUpgrade.warningPage` goes up for it.
+    @ObservationIgnored var httpsUpgradeURL: URL?
+    /// The http address the "doesn't support a secure connection" page is up for (see
+    /// `HTTPSWarningHandler`).
+    @ObservationIgnored var httpsWarningURL: URL?
     @ObservationIgnored var beforeUnloadShowing = false
+    /// A sign-in the page sent, to offer for saving once the page moves on (`captured`).
+    @ObservationIgnored var pendingLogin: CapturedLogin?
+    @ObservationIgnored var pendingLoginShowing = false
+    /// Pages this tab goes to in `source` are translated too, until Show Original.
+    @ObservationIgnored var keepTranslating: (source: Locale.Language, target: Locale.Language, engine: PageTranslation.Engine)?
+    /// A Google translation in progress (one on this Mac runs in `TranslationHost`).
+    @ObservationIgnored var translationRun: Task<Void, Never>?
+    /// Told when the translated page adds text (`PageTranslator`).
+    @ObservationIgnored var translationMore: AsyncStream<Void>.Continuation?
     /// The address an error page of Tuff's is being put up for (`showErrorPage`), until it commits.
     @ObservationIgnored var errorPageURL: URL?
     /// The page on show is one of Tuff's error pages (can't connect, bad certificate, crashed):

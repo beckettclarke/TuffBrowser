@@ -224,7 +224,14 @@ struct PrivacySettings: Codable, Equatable {
     /// WebKit's cross-site tracking prevention: third-party cookies are blocked unless a site
     /// asks for them and you allow it (`SiteSettings`, Storage Access).
     var blockCrossSiteCookies = true
+    /// Try https for every site, falling back to http quietly (`HTTPSUpgrade`).
     var upgradeToHTTPS = true
+    /// Try https for every site, and show a warning page instead of falling back to http.
+    var httpsOnly = false
+    /// Offer to save passwords, and suggest saved ones in sign-in forms (`PasswordAutofill`).
+    var passwords = true
+    /// When a page's language isn't on this Mac: ask, download it, or use Google Translate.
+    var translationFallback: TranslationFallback = .ask
     var fraudWarnings = true
     var autoplay: AutoplayPolicy = .allow
     var rememberMediaPermissions = true
@@ -245,6 +252,9 @@ extension PrivacySettings {
         blockPopups = try c.decodeIfPresent(Bool.self, forKey: .blockPopups) ?? d.blockPopups
         blockCrossSiteCookies = try c.decodeIfPresent(Bool.self, forKey: .blockCrossSiteCookies) ?? d.blockCrossSiteCookies
         upgradeToHTTPS = try c.decodeIfPresent(Bool.self, forKey: .upgradeToHTTPS) ?? d.upgradeToHTTPS
+        httpsOnly = try c.decodeIfPresent(Bool.self, forKey: .httpsOnly) ?? d.httpsOnly
+        passwords = try c.decodeIfPresent(Bool.self, forKey: .passwords) ?? d.passwords
+        translationFallback = try c.decodeIfPresent(TranslationFallback.self, forKey: .translationFallback) ?? d.translationFallback
         fraudWarnings = try c.decodeIfPresent(Bool.self, forKey: .fraudWarnings) ?? d.fraudWarnings
         autoplay = try c.decodeIfPresent(AutoplayPolicy.self, forKey: .autoplay) ?? d.autoplay
         rememberMediaPermissions = try c.decodeIfPresent(Bool.self, forKey: .rememberMediaPermissions) ?? d.rememberMediaPermissions

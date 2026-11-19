@@ -4,7 +4,7 @@ import UniformTypeIdentifiers
 import WebKit
 
 enum SettingsTab: String, CaseIterable, Identifiable {
-    case general, importData, appearance, layout, tabs, spaces, search, downloads, privacy, websites, extensions, mods, shortcuts, advanced, about
+    case general, importData, appearance, layout, tabs, spaces, search, downloads, privacy, passwords, websites, extensions, mods, shortcuts, advanced, about
     var id: String { rawValue }
 
     var label: String {
@@ -17,6 +17,7 @@ enum SettingsTab: String, CaseIterable, Identifiable {
         case .spaces: "Spaces & Profiles"
         case .search: "Search"
         case .privacy: "Privacy & Security"
+        case .passwords: "Passwords"
         case .websites: "Websites"
         case .downloads: "Downloads"
         case .extensions: "Extensions"
@@ -37,6 +38,7 @@ enum SettingsTab: String, CaseIterable, Identifiable {
         case .spaces: "square.stack.3d.up.fill"
         case .search: "magnifyingglass"
         case .privacy: "hand.raised.fill"
+        case .passwords: "key.fill"
         case .websites: "globe"
         case .downloads: "arrow.down.circle.fill"
         case .extensions: "puzzlepiece.extension.fill"
@@ -59,6 +61,7 @@ enum SettingsTab: String, CaseIterable, Identifiable {
         case .spaces: "workspaces"
         case .search: "search engine"
         case .privacy: "security"
+        case .passwords: "logins sign in autofill keychain"
         case .websites: "sites permissions content"
         case .downloads: "files"
         case .extensions: "add-ons plugins"
@@ -74,7 +77,7 @@ enum SettingsTab: String, CaseIterable, Identifiable {
         (nil, [.general, .importData]),
         ("Appearance", [.appearance, .layout]),
         ("Browsing", [.tabs, .spaces, .search, .downloads]),
-        ("Privacy", [.privacy, .websites]),
+        ("Privacy", [.privacy, .passwords, .websites]),
         ("Add-ons", [.extensions, .mods]),
         (nil, [.shortcuts, .advanced, .about]),
     ]
@@ -237,6 +240,7 @@ struct SettingsView: View {
         case .spaces: SpacesPage()
         case .search: SearchPage()
         case .privacy: PrivacyPage()
+        case .passwords: PasswordsPage()
         case .websites:
             if let site = router.site { SiteDetailPage(origin: site) } else { WebsitesPage() }
         case .downloads: DownloadsPage()
@@ -1116,9 +1120,16 @@ struct PrivacyPage: View {
                 }
             }
 
-            SettingsGroup(title: "Security", footer: "HTTPS upgrades apply to tabs opened from now on.") {
-                SwitchRow(title: "Upgrade to HTTPS", detail: "Use secure connections for sites known to support them.", isOn: $settings.privacy.upgradeToHTTPS)
+            SettingsGroup(title: "Security") {
+                SwitchRow(title: "Upgrade to HTTPS", detail: "Try a secure connection for every site, and use an insecure one only when the site has nothing else.", isOn: $settings.privacy.upgradeToHTTPS)
+                SwitchRow(title: "Always use secure connections", detail: "Warn before opening a site that doesn’t support HTTPS.", isOn: $settings.privacy.httpsOnly)
                 SwitchRow(title: "Warn about fraudulent websites", isOn: $settings.privacy.fraudWarnings)
+            }
+
+            SettingsGroup(title: "Translation", footer: "Translating on this Mac is private, and works offline once a language is downloaded. Google Translate sends the page’s text to Google. Incognito windows always ask before using it.") {
+                SettingsRow(title: "When a language isn’t on this Mac", detail: "Download it, or translate with Google Translate.") {
+                    TuffMenu(selection: $settings.privacy.translationFallback, options: TranslationFallback.allCases, label: \.label)
+                }
             }
 
             SettingsGroup(title: "Websites") {

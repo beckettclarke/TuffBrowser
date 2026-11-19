@@ -80,6 +80,17 @@ Examples:
   layout (`settings.tabs.showBookmarksBar`, ⇧⌘B, off by default). The vertical layout shows no
   bookmarks UI: the Bookmarks menu (`App/BookmarksMenu.swift`) and command bar results find them.
 
+## Passwords and translation
+
+- Passwords (`Passwords/`): `PasswordStore` keeps each profile's logins AES-GCM encrypted in
+  `passwords.sealed`, key in `passwords.key`. Deliberately not the keychain: Tuff is signed ad hoc, so
+  the keychain treats every update as a new app and asks for the login password. The same reason
+  `Web/WebCryptoKey.swift` hands WebKit its WebCrypto key from a file. `PasswordAutofill` runs in its
+  own content world; trust the frame's `securityOrigin`, never what the page posts.
+- Translate (`Web/PageTranslation.swift`): Apple's Translation framework through `.translationTask`
+  (`TranslationHost` in `WebCard`), or Google's keyless endpoint when the user picks it. Never send a
+  page to Google without the user's choice (Settings or the card); Incognito always asks.
+
 ## Downloads and torrents
 
 - `tuff://downloads` (⌥⌘L) is an HTML page like History: `Downloads/DownloadsPageTemplate.swift`

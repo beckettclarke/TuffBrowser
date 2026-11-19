@@ -95,6 +95,8 @@ final class BrowserState {
     private static let closedTabLimit = 30
     @ObservationIgnored private let saver = Debouncer(delay: 1)
     @ObservationIgnored private var sleepTimer: Timer?
+    /// A sleeping tab waiting to be woken after the sidebar has slid to its space (`spaceDidChange`).
+    @ObservationIgnored private var pendingSpaceActivation: (work: DispatchWorkItem, from: Tab?)?
     /// The tab that was on screen before a selection change still being handed over (see
     /// `selectionDidChange(from:)`); `pipHandoffPending` says whether one is.
     @ObservationIgnored private weak var pipHandoffFrom: Tab?
@@ -1011,11 +1013,35 @@ final class BrowserState {
             currentSpaceIndex = index
             pagerPosition = Double(index)
         }
-        spaceDidChange(previous: previous)
+        spaceDidChange(previous: previous, settling: true)
     }
 
-    private func spaceDidChange(previous: Tab?) {
+    /// `settling` says the sidebar is sliding to the new space. Building a web view takes tens of
+    /// milliseconds on the main thread (more for another profile's cookie store), which would
+    /// stall that slide, so a sleeping tab is woken once it has landed. Scrolling through
+    /// several spaces wakes only the one the scroll stops on.
+    private func spaceDidChange(previous: Tab?, settling: Bool = false) {
         ext?.spaceDidChange()
+        let from = pendingSpaceActivation?.from ?? previous
+        pendingSpaceActivation?.work.cancel()
+        pendingSpaceActivation = nil
+        if settling, selectedTab?.isAwake == false || splitPartner?.isAwake == false {
+            let work = DispatchWorkItem { [weak self] in
+                self?.pendingSpaceActivation = nil
+                self?.activateSelection(previous: from)
+            }
+            pendingSpaceActivation = (work, from)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3, execute: work)
+        } else {
+            activateSelection(previous: from)
+        }
+        selectionDidChange(from: previous)
+        findVisible = false
+        updateWindowTitle()
+        scheduleSave()
+    }
+
+    private func activateSelection(previous: Tab?) {
         if let tab = selectedTab {
             tab.wake()
             tab.lastActive = Date()
@@ -1026,11 +1052,7 @@ final class BrowserState {
             partner.wake()
             partner.didBecomeVisible()
         }
-        selectionDidChange(from: previous)
-        findVisible = false
-        updateWindowTitle()
         if commandBar == nil { focusWebView() }
-        scheduleSave()
     }
 
     func switchSpace(by offset: Int) {
@@ -1270,7 +1292,10 @@ final class BrowserState {
             for tab in space.allPinned + space.tabs { tab.moveToDataStore(fallback.dataStore) }
         }
         animate { profiles.removeAll { $0 === profile } }
-        if !isPrivate { BookmarkStore.shared.moveAll(from: profile.id, to: fallback.id) }
+        if !isPrivate {
+            BookmarkStore.shared.moveAll(from: profile.id, to: fallback.id)
+            PasswordStore.shared.moveAll(from: profile.id, to: fallback.id)
+        }
         if !profile.usesSharedStore, !profile.isPrivate { DataStores.removeStore(forProfile: profile.id) }
         ext?.profileDeleted(profile.id)
         if let containerInfo { ExtensionContainers.shared.profileRemoved(containerInfo) }
@@ -1307,7 +1332,7 @@ final class BrowserState {
         }
         if changed {
             previous?.lastActive = Date()
-            spaceDidChange(previous: previous)
+            spaceDidChange(previous: previous, settling: true)
         }
     }
 
