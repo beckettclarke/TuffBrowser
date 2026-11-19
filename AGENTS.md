@@ -51,6 +51,16 @@
 - Debug builds can be scripted with `TUFF_DEBUG_SCRIPT` (see `TuffBrowser/Support/DebugHooks.swift`),
   e.g. `snap` / `snapall` for screenshots and `prompt yes|no` to answer an on-screen card.
 
+## Updates
+
+- Flint (`Vendor/Flint`, copied from `~/Developer/ai-slop/flint`) installs GitHub Releases of
+  `beckettclarke/TuffBrowser` (`Updater.app` in `App/AppDelegate.swift`). Channels: stable and nightly.
+  It checks only in Release builds; Debug has its own bundle ID. Settings → About has the controls.
+- Ship with `PUBLISH=1 scripts/release.sh`. The tag is `v` + `MARKETING_VERSION` and the asset is
+  `Tuff-<version>.zip`. Nightlies use `MARKETING_VERSION=0.2.0-nightly.<yyyymmdd>`, counted against the
+  next version.
+- Flint reads releases without authentication, so the repo must be public for updates to be found.
+
 ## Downloads and torrents
 
 - `tuff://downloads` (⌥⌘L) is an HTML page like History: `Downloads/DownloadsPageTemplate.swift`

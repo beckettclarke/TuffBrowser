@@ -420,6 +420,18 @@ enum DebugHooks {
         case "installask":
             // Like "install", but with the confirmation card.
             if let source = ExtensionManager.source(from: argument) { ExtensionManager.shared.install(source) }
+        case "onboarding":
+            // onboarding [next|back|done|<step>] — shows the welcome screen, or moves it on.
+            let onboarding = Onboarding.shared
+            switch argument {
+            case "": onboarding.show()
+            case "next": onboarding.next()
+            case "back": onboarding.back()
+            case "done": onboarding.finish()
+            default:
+                let step = Onboarding.Step.allCases.first { "\($0)".lowercased() == argument.lowercased() }
+                if let step { onboarding.go(to: step) } else { log("onboarding: no step \(argument)") }
+            }
         case "prompt":
             // prompt yes|no — answers the extension card on screen.
             log("prompt \(state.prompt?.title ?? "-") items=\(state.prompt?.items.map(\.text) ?? []) note=\(state.prompt?.note != nil)")
@@ -490,6 +502,16 @@ enum DebugHooks {
                 let context = ExtensionManager.shared.contexts[record.id]
                 log("ext \(record.id) \(record.name) v\(record.version) enabled=\(record.enabled) loaded=\(context != nil) links=\(ExtensionManager.shared.linkSummary(record) ?? "all") error=\(record.lastError ?? "-") base=\(context?.baseURL.absoluteString ?? "-") errors=\(context?.errors.map(\.localizedDescription) ?? [])")
             }
+        case "blocker":
+            // blocker on|off|allow — switches the built-in blocker, or allows the selected site.
+            var privacy = AppSettings.shared.privacy
+            if argument == "on" || argument == "off" {
+                privacy.blockAds = argument == "on"
+                AppSettings.shared.privacy = privacy
+            } else if argument == "allow", let host = state.selectedTab?.url?.host {
+                ContentBlocker.shared.toggleAllowed(host: host, reloading: state.selectedTab)
+            }
+            log("blocker enabled=\(AppSettings.shared.privacy.blockAds) allowed=\(AppSettings.shared.privacy.adBlockAllowlist)")
         case "popups":
             // popups — what the pop-up blocker stopped on the selected tab.
             let tab = state.selectedTab

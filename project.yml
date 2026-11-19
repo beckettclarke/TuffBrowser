@@ -8,7 +8,7 @@ options:
 
 settings:
   base:
-    MARKETING_VERSION: 0.1.0
+    MARKETING_VERSION: 0.4.1
     CURRENT_PROJECT_VERSION: 1
     SWIFT_VERSION: "5.0"
     SWIFT_STRICT_CONCURRENCY: minimal
@@ -16,12 +16,19 @@ settings:
     # Apple Silicon only: a universal build doubles the executable for Intel Macs.
     ARCHS: arm64
 
+packages:
+  # The auto-updater (GitHub Releases of this repo). Vendored from ~/Developer/ai-slop/flint.
+  Flint:
+    path: Vendor/Flint
+
 targets:
   TuffBrowser:
     type: application
     platform: macOS
     sources:
       - path: TuffBrowser
+    dependencies:
+      - package: Flint
     scheme:
       testTargets:
         - TuffBrowserTests

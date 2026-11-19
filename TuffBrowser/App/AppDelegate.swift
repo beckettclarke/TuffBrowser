@@ -1,6 +1,13 @@
 import AppKit
+import Flint
 import SwiftUI
 import WebKit
+
+extension Updater {
+    /// Tuff's updater: it installs releases of this repo, stable or nightly
+    /// (tagged like `v0.2.0-nightly.20261118`).
+    static let app = Updater(source: GitHubSource("beckettclarke/TuffBrowser", assetPattern: "Tuff-*.zip"), channels: [.nightly])
+}
 
 final class AppDelegate: NSObject {
     private(set) static weak var shared: AppDelegate?
@@ -90,6 +97,11 @@ final class AppDelegate: NSObject {
     @objc func showSettingsWindow(_ sender: Any?) { showSettings() }
     @objc func showExtensions(_ sender: Any?) { showSettings(tab: .extensions) }
     @objc func showBrowserWindow(_ sender: Any?) { showMainWindow() }
+
+    @objc func showWelcome(_ sender: Any?) {
+        showMainWindow()
+        Onboarding.shared.show()
+    }
 
     @objc func newTab(_ sender: Any?) {
         ensureBrowserWindow()
@@ -315,8 +327,13 @@ extension AppDelegate: NSApplicationDelegate {
         // Puts back saved torrents; the client stays off the network if there are none.
         TorrentBridge.setUp()
         showMainWindow()
+        Onboarding.shared.showIfNeeded()
         #if DEBUG
         DebugHooks.runIfRequested()
+        #else
+        // Checks shortly after launch, then daily. Debug builds have their own bundle ID, which a
+        // release would never match.
+        Updater.app.start()
         #endif
     }
 
@@ -344,7 +361,8 @@ extension AppDelegate: NSApplicationDelegate {
         let testing = Paths.testDataDirectory != nil && !Self.confirmQuitInTests
         let downloading = runningCopy == nil ? DownloadManager.shared.activeCount : 0
         // Downloads in progress are worth a card even with "confirm before quitting" off.
-        guard runningCopy == nil, !testing, AppSettings.shared.behavior.confirmQuit || downloading > 0, !Self.isSystemQuit
+        guard runningCopy == nil, !testing, AppSettings.shared.behavior.confirmQuit || downloading > 0, !Self.isSystemQuit,
+              !Self.updateInstalled
         else { return pauseDownloadsThenQuit() }
 
         // ⌘Q again while the card is up confirms it.
@@ -405,6 +423,14 @@ extension AppDelegate: NSApplicationDelegate {
         guard let event = NSAppleEventManager.shared().currentAppleEvent,
               event.eventClass == kCoreEventClass, event.eventID == kAEQuitApplication else { return false }
         return event.attributeDescriptor(forKeyword: kAEQuitReason) != nil
+    }
+
+    /// An update has replaced the app on disk (Flint's Restart Now), so this quit reopens Tuff:
+    /// no card, which would leave the restart waiting on it.
+    private static var updateInstalled: Bool {
+        let plist = Bundle.main.bundleURL.appendingPathComponent("Contents/Info.plist")
+        let onDisk = NSDictionary(contentsOf: plist)?["CFBundleShortVersionString"] as? String
+        return onDisk != nil && onDisk != Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String
     }
 
     func applicationWillTerminate(_ notification: Notification) {

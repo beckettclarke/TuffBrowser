@@ -257,7 +257,9 @@ enum SettingsSearch {
         .row("Reset all settings", .advanced, in: "Backup & reset", "defaults factory restore"),
 
         // About
-        .page(.about, named: "Check for updates", "version update about"),
+        .row("Software update", .about, in: nil, named: "Check for updates", "version update about upgrade new release"),
+        .row("Channel", .about, in: nil, named: "Update channel", "nightly stable releases builds"),
+        .row("Check automatically", .about, in: nil, named: "Check for updates automatically", "update daily background"),
     ]
 
     /// Lower-cased, with one spelling of words written two ways, so "color" finds "colour".

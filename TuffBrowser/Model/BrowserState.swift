@@ -98,6 +98,8 @@ final class BrowserState {
     @ObservationIgnored private weak var pipHandoffFrom: Tab?
     @ObservationIgnored private var pipHandoffPending = false
     @ObservationIgnored private var restored = false
+    /// `restore` found no saved session: a new profile, so the welcome screen is due.
+    @ObservationIgnored private(set) var startedFresh = false
     /// Tabs asked for before the session was restored (a link opened at launch, an extension
     /// that started early). They are real tabs, owned by this window, and go into the current
     /// space as soon as `restore` finishes.
@@ -1369,6 +1371,7 @@ final class BrowserState {
         DispatchQueue.main.async { [weak self] in
             guard let self, self.commandBar == nil, let window = self.window else { return }
             if let prompt = self.prompt, prompt.host == .browser { return }
+            if !self.isPrivate, Onboarding.shared.isShowing { return }
             if self.findVisible, let editor = window.firstResponder as? NSTextView, editor.isFieldEditor,
                (editor.delegate as? NSTextField)?.identifier?.rawValue == Self.findFieldIdentifier { return }
             // Reader mode's article, or a PDF in Tuff's viewer, takes the keys (arrows, ⌘C,
@@ -1719,6 +1722,7 @@ final class BrowserState {
             currentSpaceIndex = max(0, min(snapshot.currentSpace, spaces.count - 1))
             sidebarVisible = snapshot.sidebarVisible
         } else {
+            startedFresh = true
             let profile = Profile(name: "Personal", icon: "person.fill", usesSharedStore: true)
             profiles = [profile]
             spaces = [

@@ -66,6 +66,12 @@ enum SearchEngine: String, Codable, CaseIterable, Identifiable {
         }
     }
 
+    /// The engine's logo (Resources/Assets.xcassets); nil for a custom engine.
+    var logo: NSImage? { self == .custom ? nil : NSImage(named: "SearchEngine-\(rawValue)") }
+
+    /// The logo is a bare mark rather than an icon with its own background.
+    var logoIsBareMark: Bool { self == .google || self == .bing || self == .brave }
+
     /// A search URL template from the user, with `%s` where the query goes.
     static func isValidTemplate(_ template: String) -> Bool {
         let t = template.trimmed

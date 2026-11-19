@@ -44,7 +44,7 @@ size:
 
 ## Regenerate the app icon
 icon:
-	swift scripts/make-icon.swift TuffBrowser/Resources/Assets.xcassets/AppIcon.appiconset
+	swift scripts/make-icon.swift TuffBrowser/Resources/AppIcon.icon
 
 clean:
 	rm -rf $(BUILD_DIR) dist

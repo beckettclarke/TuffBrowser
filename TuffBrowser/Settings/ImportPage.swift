@@ -22,6 +22,9 @@ struct ImportPage: View {
 
     private let columns = [GridItem(.adaptive(minimum: 104, maximum: 140), spacing: 10)]
 
+    /// The browser to have picked when the page next opens (the welcome screen's import tiles).
+    static var preselectedSourceID: String?
+
     var body: some View {
         SettingsPage(title: "Import", subtitle: "Bring your history, bookmarks and spaces over from another browser.") {
             SettingsGroup(title: "Browser") {
@@ -150,7 +153,10 @@ struct ImportPage: View {
     private func refresh() {
         let found = BrowserImporter.detect()
         sources = found
-        if let selected, let same = found.first(where: { $0 == selected }) {
+        if let id = Self.preselectedSourceID, let wanted = found.first(where: { $0.id == id }) {
+            Self.preselectedSourceID = nil
+            pick(wanted)
+        } else if let selected, let same = found.first(where: { $0 == selected }) {
             pick(same, resetPhase: false)
         } else if let first = found.first {
             pick(first)

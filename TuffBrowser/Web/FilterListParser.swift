@@ -7,11 +7,11 @@ import Foundation
 /// types, `domain=`, `match-case`, `important`, `@@` exceptions, `$document` exceptions) and
 /// element hiding (`##selector`, `#@#` exceptions, `$generichide`). What doesn't, because content
 /// rule lists can't express it: anything that rewrites (`redirect=`, `removeparam`, `csp=`, header
-/// and HTML filtering), procedural cosmetic filters (`:has-text`, `:upward`, …) and scriptlets
-/// (`##+js(…)`). Those filters are skipped whole rather than applied approximately.
+/// and HTML filtering) are skipped whole rather than applied approximately. Procedural cosmetic
+/// filters and scriptlets are handled separately by `AdvancedContentBlocker`.
 struct FilterListParser {
     /// Bump when the output changes, so cached compiled lists are rebuilt.
-    static let version = 3
+    static let version = 6
 
     struct Result {
         /// Content rule lists as JSON, each under WebKit's 150,000-rule limit.
@@ -32,10 +32,11 @@ struct FilterListParser {
     /// Hosts excluded from generic element hiding (`@@||host^$generichide` / `$elemhide`).
     private var genericHideOff = Set<String>()
     private var genericSelectors: [String] = []
-    private var genericSelectorExceptions: [String: Set<String>] = [:]
+    private var genericExclusions: [String: Set<String>] = [:]
+    private var genericSelectorExceptions: [String: [DomainException]] = [:]
     /// Domain set (joined) → selectors.
-    private var specificSelectors: [String: (domains: [String], selectors: [String])] = [:]
-    private var specificExceptions = Set<String>()
+    private var specificSelectors: [String: (domains: [String], excluded: [String], selectors: [String])] = [:]
+    private var specificExceptions: [String: [DomainException]] = [:]
     private var badFilters = Set<String>()
     private var stats = Result(lists: [])
 
@@ -133,33 +134,27 @@ struct FilterListParser {
             stats.skipped += 1
             return
         }
-        let (included, excluded) = Self.domains(line[..<marker.lowerBound], separator: ",")
-        if line[..<marker.lowerBound].split(separator: ",").contains(where: { $0.hasSuffix(".*") }), included.isEmpty {
-            stats.skipped += 1   // only entity domains (`google.*`), which WebKit can't match
+        let parsedDomains = Self.domains(line[..<marker.lowerBound], separator: ",")
+        let (included, excluded) = (parsedDomains.included, parsedDomains.excluded)
+        if parsedDomains.unsupportedIncluded, included.isEmpty {
+            stats.skipped += 1
             return
         }
         stats.cosmeticFilters += 1
         if kind == "#@#" {
-            if included.isEmpty {
-                genericSelectorExceptions[selector, default: []].formUnion(["*"])
-            } else {
-                for domain in included {
-                    genericSelectorExceptions[selector, default: []].insert(domain)
-                    specificExceptions.insert(domain + "##" + selector)
-                }
-            }
+            let exception = DomainException(included: included.isEmpty ? ["*"] : included, excluded: excluded)
+            genericSelectorExceptions[selector, default: []].append(exception)
+            if !included.isEmpty { specificExceptions[selector, default: []].append(exception) }
             return
         }
         if included.isEmpty {
-            if excluded.isEmpty {
-                genericSelectors.append(selector)
-            } else {
-                genericSelectorExceptions[selector, default: []].formUnion(excluded)
-                genericSelectors.append(selector)
-            }
+            if !excluded.isEmpty { genericExclusions[selector, default: []].formUnion(excluded) }
+            genericSelectors.append(selector)
         } else {
-            let key = included.sorted().joined(separator: ",")
-            specificSelectors[key, default: (included.sorted(), [])].selectors.append(selector)
+            let domains = included.sorted()
+            let excluded = excluded.sorted()
+            let key = (domains + excluded.map { "~" + $0 }).joined(separator: ",")
+            specificSelectors[key, default: (domains, excluded, [])].selectors.append(selector)
         }
     }
 
@@ -217,8 +212,12 @@ struct FilterListParser {
             default:
                 if option.hasPrefix("domain=") || option.hasPrefix("from=") {
                     let value = option[option.index(after: option.firstIndex(of: "=")!)...]
-                    (included, excluded) = Self.domains(value, separator: "|")
-                    if included.isEmpty && excluded.isEmpty { stats.skipped += 1; return }
+                    let parsed = Self.domains(value, separator: "|")
+                    (included, excluded) = (parsed.included, parsed.excluded)
+                    if parsed.unsupportedIncluded && included.isEmpty || included.isEmpty && excluded.isEmpty {
+                        stats.skipped += 1
+                        return
+                    }
                 } else {
                     // redirect=, removeparam, csp=, header=, denyallow=, to=, method=, …
                     stats.skipped += 1
@@ -273,7 +272,19 @@ struct FilterListParser {
                 let rule: Rule = ["trigger": trigger, "action": action]
                 if isException { exceptions.append(rule) }
                 else if isImportant { important.append(rule) }
-                else { blocks.append(rule) }
+                else {
+                    blocks.append(rule)
+                    // WebKit forbids if-domain and unless-domain together. A later exception
+                    // keeps a normal block from reaching the excluded domains.
+                    if !included.isEmpty {
+                        for domain in excluded {
+                            var exceptionTrigger = trigger
+                            exceptionTrigger.removeValue(forKey: "unless-domain")
+                            exceptionTrigger["if-domain"] = ["*" + domain]
+                            exceptions.append(["trigger": exceptionTrigger, "action": ["type": "ignore-previous-rules"]])
+                        }
+                    }
+                }
             }
         }
     }
@@ -344,18 +355,27 @@ struct FilterListParser {
         return host.lowercased()
     }
 
-    /// `a.com,~b.com` / `a.com|~b.com` → included and excluded hosts (entity `google.*` entries dropped).
-    private static func domains(_ text: Substring, separator: Character) -> (included: [String], excluded: [String]) {
+    /// `a.com,~b.com` / `a.com|~b.com` → included and excluded hosts. An unsupported positive
+    /// entry is important: dropping `kat.*` while keeping `~other.example` would widen a rule to
+    /// every site instead of merely losing the entity's coverage.
+    private static func domains(
+        _ text: Substring, separator: Character
+    ) -> (included: [String], excluded: [String], unsupportedIncluded: Bool) {
         var included: [String] = []
         var excluded: [String] = []
+        var unsupportedIncluded = false
         for part in text.split(separator: separator) {
             var domain = part.trimmingCharacters(in: .whitespaces).lowercased()
             let negated = domain.hasPrefix("~")
             if negated { domain.removeFirst() }
-            guard !domain.isEmpty, !domain.hasSuffix(".*"), !domain.contains("/"), isASCII(domain[...]) else { continue }
+            guard !domain.isEmpty else { continue }
+            if domain.hasSuffix(".*") || domain.contains("/") || !isASCII(domain[...]) {
+                if !negated { unsupportedIncluded = true }
+                continue
+            }
             if negated { excluded.append(domain) } else { included.append(domain) }
         }
-        return (included, excluded)
+        return (included, excluded, unsupportedIncluded)
     }
 
     private static func normalizedBadFilter(_ line: Substring) -> String? {
@@ -369,6 +389,71 @@ struct FilterListParser {
         text.utf8.allSatisfy { $0 >= 0x20 && $0 < 0x7f }
     }
 
+    // MARK: Cosmetic domains
+
+    private struct DomainException {
+        var included: [String]
+        var excluded: [String]
+    }
+
+    private struct DomainVariant {
+        var included: String
+        var excluded: Set<String>
+    }
+
+    private static func domain(_ parent: String, contains child: String) -> Bool {
+        parent == "*" || parent == child || child.hasSuffix("." + parent)
+    }
+
+    private static func intersection(_ a: String, _ b: String) -> String? {
+        if domain(a, contains: b) { return b }
+        if domain(b, contains: a) { return a }
+        return nil
+    }
+
+    /// Subtracts each exception from a rule's domains. A variant whose exception has exclusions
+    /// needs a second rule for those exclusions: `unless-domain` alone would wrongly keep the
+    /// exception in force there too.
+    private static func domainVariants(
+        included: [String], excluded: Set<String>, exceptions: [DomainException]
+    ) -> [DomainVariant] {
+        var variants = included.map { DomainVariant(included: $0, excluded: excluded) }
+        for exception in exceptions {
+            var next: [DomainVariant] = []
+            for variant in variants {
+                let overlapping = exception.included.filter { intersection(variant.included, $0) != nil }
+                guard !overlapping.isEmpty else { next.append(variant); continue }
+                if !overlapping.contains(where: { domain($0, contains: variant.included) }) {
+                    var reduced = variant
+                    reduced.excluded.formUnion(overlapping)
+                    next.append(reduced)
+                }
+                for exceptionDomain in overlapping {
+                    guard let overlap = intersection(variant.included, exceptionDomain) else { continue }
+                    for restored in exception.excluded {
+                        guard let intersection = intersection(overlap, restored) else { continue }
+                        if variant.excluded.contains(where: { domain($0, contains: intersection) }) { continue }
+                        next.append(DomainVariant(included: intersection, excluded: variant.excluded))
+                    }
+                }
+            }
+            variants = next
+        }
+        return variants
+    }
+
+    private static func domainTrigger(_ variant: DomainVariant, generic: Bool) -> [String: Any] {
+        var trigger: [String: Any] = ["url-filter": ".*"]
+        if !variant.excluded.isEmpty, variant.included != "*" {
+            // A host-bound url-filter leaves the one domain-condition slot available for exclusions.
+            trigger["url-filter"] = urlRegexes("||\(variant.included)^")?.first ?? ".*"
+        } else if !generic || variant.included != "*" {
+            trigger["if-domain"] = ["*" + variant.included]
+        }
+        if !variant.excluded.isEmpty { trigger["unless-domain"] = variant.excluded.sorted().map { "*" + $0 } }
+        return trigger
+    }
+
     // MARK: Output
 
     private static let rulesPerList = 80_000
@@ -380,33 +465,54 @@ struct FilterListParser {
         for entry in specificSelectors.values { allSelectors.formUnion(entry.selectors) }
         let valid = validSelectors(Array(allSelectors))
         var cosmetic: [Rule] = []
-        let hideOff = genericHideOff.sorted().map { "*" + $0 }
+        let hideOff = Set(genericHideOff)
         var plainGeneric: [String] = []
+        var complexGeneric: [String: (variant: DomainVariant, selectors: [String])] = [:]
         var seen = Set<String>()
         for selector in genericSelectors where valid.contains(selector) && seen.insert(selector).inserted {
-            if let off = genericSelectorExceptions[selector] {
-                if off.contains("*") { continue }
-                var unless = Set(off.map { "*" + $0 })
-                unless.formUnion(hideOff)
-                cosmetic.append(["trigger": ["url-filter": ".*", "unless-domain": unless.sorted()],
-                                 "action": ["type": "css-display-none", "selector": selector]])
-            } else {
+            let exceptions = genericSelectorExceptions[selector] ?? []
+            let exclusions = genericExclusions[selector] ?? []
+            if exceptions.isEmpty && exclusions.isEmpty {
                 plainGeneric.append(selector)
+                continue
+            }
+            let variants = Self.domainVariants(included: ["*"], excluded: exclusions.union(hideOff), exceptions: exceptions)
+            for variant in variants {
+                let key = variant.included + "|" + variant.excluded.sorted().joined(separator: "|")
+                complexGeneric[key, default: (variant, [])].selectors.append(selector)
             }
         }
         for batch in stride(from: 0, to: plainGeneric.count, by: Self.selectorsPerRule) {
             let selectors = plainGeneric[batch..<min(batch + Self.selectorsPerRule, plainGeneric.count)]
             var trigger: [String: Any] = ["url-filter": ".*"]
-            if !hideOff.isEmpty { trigger["unless-domain"] = hideOff }
+            if !hideOff.isEmpty { trigger["unless-domain"] = hideOff.sorted().map { "*" + $0 } }
             cosmetic.append(["trigger": trigger, "action": ["type": "css-display-none", "selector": selectors.joined(separator: ", ")]])
         }
+        for entry in complexGeneric.values {
+            for batch in stride(from: 0, to: entry.selectors.count, by: Self.selectorsPerRule) {
+                let chunk = entry.selectors[batch..<min(batch + Self.selectorsPerRule, entry.selectors.count)]
+                cosmetic.append(["trigger": Self.domainTrigger(entry.variant, generic: true),
+                                 "action": ["type": "css-display-none", "selector": chunk.joined(separator: ", ")]])
+            }
+        }
+        var resolvedSpecific: [String: (variant: DomainVariant, selectors: [String])] = [:]
         for (_, entry) in specificSelectors.sorted(by: { $0.key < $1.key }) {
-            let selectors = Array(Set(entry.selectors.filter { selector in
-                valid.contains(selector) && !entry.domains.contains { specificExceptions.contains($0 + "##" + selector) }
-            })).sorted()
+            for selector in Set(entry.selectors) where valid.contains(selector) {
+                let variants = Self.domainVariants(
+                    included: entry.domains, excluded: Set(entry.excluded),
+                    exceptions: specificExceptions[selector] ?? []
+                )
+                for variant in variants {
+                    let key = variant.included + "|" + variant.excluded.sorted().joined(separator: "|")
+                    resolvedSpecific[key, default: (variant, [])].selectors.append(selector)
+                }
+            }
+        }
+        for entry in resolvedSpecific.values {
+            let selectors = entry.selectors.sorted()
             for batch in stride(from: 0, to: selectors.count, by: Self.selectorsPerRule) {
                 let chunk = selectors[batch..<min(batch + Self.selectorsPerRule, selectors.count)]
-                cosmetic.append(["trigger": ["url-filter": ".*", "if-domain": entry.domains.map { "*" + $0 }],
+                cosmetic.append(["trigger": Self.domainTrigger(entry.variant, generic: false),
                                  "action": ["type": "css-display-none", "selector": chunk.joined(separator: ", ")]])
             }
         }

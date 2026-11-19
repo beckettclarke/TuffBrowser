@@ -558,3 +558,125 @@ final class BrowserRegressionTests: XCTestCase {
         view.navigationDelegate = nil
     }
 }
+
+
+final class ContentBlockerFilterTests: XCTestCase {
+    private func rules(_ filters: String) throws -> [[String: Any]] {
+        let result = FilterListParser.parse([filters], validSelectors: { Set($0) })
+        let source = try XCTUnwrap(result.lists.first)
+        return try XCTUnwrap(JSONSerialization.jsonObject(with: Data(source.utf8)) as? [[String: Any]])
+    }
+
+    private func trigger(_ rule: [String: Any]) -> [String: Any]? {
+        rule["trigger"] as? [String: Any]
+    }
+
+    func testNetworkDomainExclusionDoesNotProduceAnInvalidTrigger() throws {
+        let rules = try rules("||ads.example.test^$script,domain=news.example|~allowed.news.example")
+        for rule in rules {
+            let trigger = try XCTUnwrap(trigger(rule))
+            XCTAssertFalse(trigger["if-domain"] != nil && trigger["unless-domain"] != nil)
+        }
+        let block = try XCTUnwrap(rules.first { ($0["action"] as? [String: Any])?["type"] as? String == "block" })
+        XCTAssertEqual(trigger(block)?["if-domain"] as? [String], ["*news.example"])
+        let exception = try XCTUnwrap(rules.first { ($0["action"] as? [String: Any])?["type"] as? String == "ignore-previous-rules" })
+        XCTAssertEqual(trigger(exception)?["if-domain"] as? [String], ["*allowed.news.example"])
+    }
+
+    func testSpecificCosmeticExceptionOnlyCancelsTheNamedDomain() throws {
+        let rules = try rules("""
+        a.example,b.example##.advert
+        a.example#@#.advert
+        """)
+        XCTAssertEqual(rules.count, 1)
+        XCTAssertEqual(trigger(rules[0])?["if-domain"] as? [String], ["*b.example"])
+    }
+
+    func testCosmeticExclusionUsesOnlyOneWebKitDomainCondition() throws {
+        let rules = try rules("a.example,~allowed.a.example##.advert")
+        XCTAssertEqual(rules.count, 1)
+        let trigger = try XCTUnwrap(trigger(rules[0]))
+        XCTAssertNil(trigger["if-domain"])
+        XCTAssertEqual(trigger["unless-domain"] as? [String], ["*allowed.a.example"])
+        XCTAssertTrue((trigger["url-filter"] as? String)?.contains("a\\.example") == true)
+    }
+
+    func testGenericCosmeticExceptionRestoresItsExcludedSubdomain() throws {
+        let rules = try rules("""
+        ##.advert
+        a.example,~allowed.a.example#@#.advert
+        """)
+        XCTAssertEqual(rules.count, 2)
+        let generic = try XCTUnwrap(rules.first { trigger($0)?["unless-domain"] != nil })
+        XCTAssertEqual(trigger(generic)?["unless-domain"] as? [String], ["*a.example"])
+        let restored = try XCTUnwrap(rules.first { trigger($0)?["if-domain"] != nil })
+        XCTAssertEqual(trigger(restored)?["if-domain"] as? [String], ["*allowed.a.example"])
+    }
+
+    func testUnsupportedEntityDomainCannotWidenRuleToEverySite() throws {
+        let networkRules = try rules("*$script,1p,domain=~kat.ai|kat.*|kickass.*")
+        XCTAssertTrue(networkRules.isEmpty)
+        let cosmetic = try rules("kat.*,~allowed.example##.advert")
+        XCTAssertTrue(cosmetic.isEmpty)
+    }
+
+    func testMixedDomainFiltersCompileInWebKit() throws {
+        let result = FilterListParser.parse(["""
+        ||ads.example.test^$script,domain=news.example|~allowed.news.example
+        a.example,~allowed.a.example##.advert
+        ##.advert
+        a.example,~allowed.a.example#@#.advert
+        """], validSelectors: { Set($0) })
+        let source = try XCTUnwrap(result.lists.first)
+        let store = try XCTUnwrap(WKContentRuleListStore.default())
+        let id = "test.\(UUID().uuidString)"
+        let compiled = expectation(description: "content rules compiled")
+        store.compileContentRuleList(forIdentifier: id, encodedContentRuleList: source) { list, error in
+            XCTAssertNil(error)
+            XCTAssertNotNil(list)
+            store.removeContentRuleList(forIdentifier: id) { _ in compiled.fulfill() }
+        }
+        wait(for: [compiled], timeout: 10)
+    }
+
+    func testProceduralRulesKeepTheirExceptionsWhenReindexed() throws {
+        let input: [String: Any] = [
+            "selectors": [".plain", "{\"selector\":\".one\"}", "{\"selector\":\".two\"}"],
+            "selectorLists": ["0,1,-2", "2", "0"],
+            "selectorListRefs": ["0", "1"],
+            "hostnames": ["a.example", "b.example"],
+            "regexes": [],
+            "hasEntities": false,
+        ]
+        let output = try XCTUnwrap(AdvancedContentBlocker.proceduralOnly(JSONSerialization.data(withJSONObject: input)))
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(output.utf8)) as? [String: Any])
+        XCTAssertEqual(object["selectors"] as? [String], ["{\"selector\":\".one\"}", "{\"selector\":\".two\"}"])
+        XCTAssertEqual(object["selectorLists"] as? [String], ["0,-1", "1", ""])
+    }
+
+    @MainActor
+    func testAdvancedScriptsFollowAllowlistAndGlobalSwitch() {
+        let blocker = AdvancedContentBlocker()
+        let controller = WKUserContentController()
+        let original = AppSettings.shared.privacy
+        defer {
+            AppSettings.shared.privacy = original
+            blocker.settingsChanged()
+        }
+        var privacy = original
+        privacy.blockAds = true
+        privacy.adBlockAllowlist = ["allowed.example"]
+        AppSettings.shared.privacy = privacy
+        blocker.activate(.init(main: "void 0;", isolated: "void 0;", cosmetic: "void 0;"))
+        blocker.attach(controller)
+        XCTAssertEqual(controller.userScripts.count, 3)
+        blocker.prepare(controller, for: URL(string: "https://sub.allowed.example")!)
+        XCTAssertEqual(controller.userScripts.count, 0)
+        blocker.prepare(controller, for: URL(string: "https://outside.example")!)
+        XCTAssertEqual(controller.userScripts.count, 3)
+        privacy.blockAds = false
+        AppSettings.shared.privacy = privacy
+        blocker.settingsChanged()
+        XCTAssertEqual(controller.userScripts.count, 0)
+    }
+}

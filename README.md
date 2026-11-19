@@ -118,10 +118,12 @@ blockers built on `webRequestBlocking` (full uBlock Origin, most Firefox blocker
 anything; Tuff says so in the install prompt. Tuff blocks ads itself instead
 (`Web/ContentBlocker.swift`, Settings › Privacy): it downloads EasyList, EasyPrivacy, the uBlock
 filter lists and Peter Lowe's list, translates them into WebKit content rule lists
-(`Web/FilterListParser.swift`), compiles them (cached; refreshed every few days) and adds them to
-every tab, Incognito included. The page menu turns it off for one site. Filters that rewrite
-rather than block (`redirect=`, `removeparam`, `csp=`) and procedural cosmetic filters are
-skipped. YouTube's ads need uBO's scriptlets, which still work through the extension (see above).
+(`Web/FilterListParser.swift`), compiles them (cached; refreshed twice a day) and adds them to
+every tab, Incognito included. The page menu turns it off for one site. Tuff also runs the
+maintained uBlock Origin Lite scriptlet and procedural-cosmetic rulesets itself
+(`Web/AdvancedContentBlocker.swift`), so YouTube and other sites that need more than request
+blocking work without installing uBO. Network filters that rewrite responses or URLs rather than
+block (`redirect=`, `removeparam`, `csp=`) are still skipped.
 
 **Extension pages and websites.** WebKit only lets an extension's own pages load in a web view
 made for that extension. When such a page sends the tab to a website (the "Sign in" button on
@@ -177,5 +179,5 @@ TuffBrowser/
 - One browser window.
 - The adjustable blur uses the window server's per-window blur radius (the same call
   terminals use); if it is ever unavailable, pick the Vibrancy style.
-- No bookmarks manager or built-in content blocker yet (uBlock Origin Lite
-  works as an extension; the full uBlock Origin cannot block on WebKit).
+- No bookmarks manager. The built-in blocker covers standard filters and uBO Lite's advanced
+  scriptlets; full uBlock Origin still cannot block network requests through WebKit.

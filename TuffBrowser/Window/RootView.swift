@@ -87,6 +87,12 @@ struct RootView: View {
                     .zIndex(11.5)
             }
 
+            if !state.isPrivate, Onboarding.shared.isShowing {
+                OnboardingOverlay()
+                    .transition(.opacity)
+                    .zIndex(11.8)
+            }
+
             if let prompt = state.prompt, prompt.host == .browser {
                 PromptOverlay(prompt: prompt)
                     .id(prompt.id)

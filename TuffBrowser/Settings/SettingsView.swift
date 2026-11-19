@@ -1,3 +1,4 @@
+import Flint
 import SwiftUI
 import UniformTypeIdentifiers
 import WebKit
@@ -445,10 +446,15 @@ struct GeneralPage: View {
     }
 
     private func makeDefault() {
+        Self.makeDefaultBrowser { isDefault = Self.checkDefault() }
+    }
+
+    /// Asks macOS to open web links in Tuff; `done` runs on the main queue once it has answered.
+    static func makeDefaultBrowser(_ done: @escaping () -> Void) {
         let app = Bundle.main.bundleURL
         NSWorkspace.shared.setDefaultApplication(at: app, toOpenURLsWithScheme: "http") { _ in
             NSWorkspace.shared.setDefaultApplication(at: app, toOpenURLsWithScheme: "https") { _ in
-                DispatchQueue.main.async { isDefault = Self.checkDefault() }
+                DispatchQueue.main.async(execute: done)
             }
         }
     }
@@ -538,7 +544,7 @@ struct AppearancePage: View {
 /// One background style, drawn as a small window so the four look as different as they are:
 /// Glass shows a colourful desktop blurred through the tint, Vibrancy the system's milky frosted
 /// material, Solid a flat opaque tint, and Seamless chrome painted the colour of the page's header.
-private struct StyleTile: View {
+struct StyleTile: View {
     @Environment(AppSettings.self) private var settings
     @Environment(BrowserState.self) private var state
     let style: BackgroundStyle
@@ -1729,9 +1735,55 @@ struct AboutPage: View {
                 .font(.system(size: 13.5))
                 .foregroundStyle(.primary.opacity(0.65))
                 .padding(.top, 14)
+            UpdatesGroup()
+                .frame(maxWidth: 440)
+                .padding(.top, 30)
             Spacer()
         }
+        .padding(.horizontal, 26)
         .frame(maxWidth: .infinity)
         .onAppear { withAnimation(.spring(response: 0.5, dampingFraction: 0.7)) { appeared = true } }
+    }
+}
+
+/// Checking for updates, and which releases to take. Flint does the work and shows its own window
+/// when there is something to install.
+private struct UpdatesGroup: View {
+    @ObservedObject private var updater = Updater.app
+
+    var body: some View {
+        SettingsGroup {
+            SettingsRow(title: "Software update", detail: status) {
+                Button("Check Now") { updater.checkForUpdates() }
+                    .buttonStyle(TuffButtonStyle())
+                    .disabled(busy)
+            }
+            SettingsRow(title: "Channel", detail: "Nightly builds have the newest changes, and the newest bugs.") {
+                TuffSegmented(selection: $updater.channel, options: updater.channels) { $0.title }
+            }
+            SwitchRow(title: "Check automatically", detail: "Once a day.", isOn: $updater.automaticallyChecksForUpdates)
+        }
+    }
+
+    private var busy: Bool {
+        switch updater.phase {
+        case .checking, .downloading, .installing: true
+        default: false
+        }
+    }
+
+    private var status: String {
+        switch updater.phase {
+        case .checking: return "Checking…"
+        case .upToDate: return "Tuff is up to date."
+        case .available(let release): return "Version \(release.version) is available."
+        case .downloading(let release, _, _): return "Downloading version \(release.version)…"
+        case .ready(let release): return "Version \(release.version) will install when Tuff restarts."
+        case .installing(let release): return "Installing version \(release.version)…"
+        case .failed(let title, _): return title
+        case .idle:
+            guard let date = updater.lastCheckDate else { return "Not checked yet." }
+            return "Last checked " + date.formatted(.relative(presentation: .named)) + "."
+        }
     }
 }

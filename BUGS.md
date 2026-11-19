@@ -22,6 +22,7 @@ fixed. Two older limitations are left over. Missing features are in TODOS.md (se
 |---|---|
 | Ad blocking extensions blocked nothing: WebKit ignores `webRequest` block answers (full uBO: 10 of 130 on adblock.turtlecute.org while its counter said thousands). Tuff now blocks natively from the standard filter lists (91 of 130, more than uBO's own engine). | `Web/ContentBlocker.swift`, `Web/FilterListParser.swift` |
 | uBO let YouTube ads through: its scriptlets come through `browser.contentScripts.register`, which was an inert stub. Now implemented natively for any extension (plus `userScripts`). | `Extensions/ExtensionContentScripts.swift` |
+| The built-in blocker skipped YouTube's scriptlets and procedural cosmetic rules; mixed-domain exceptions could over-block; and an unsupported entity such as `kat.*` could be dropped while its exclusions stayed, widening one KAT rule into a global first-party script block. Failed or outdated compilations also stayed active too long. Tuff now runs cached uBO Lite advanced rulesets itself (no extension needed), preserves domain exclusions, rejects those widened rules, and rebuilds incompatible or partial caches before using them. | `Web/AdvancedContentBlocker.swift`, `Web/ContentBlocker.swift`, `Web/FilterListParser.swift` |
 | A blocked ad iframe sent the whole tab to uBO's block page. WebKit reports iframe loads as `main_frame`. | `Extensions/ExtensionCompat.swift` (shim) |
 | Iframes directly inside the page reported WebKit's raw id as their `parentFrameId` instead of 0. | shim |
 | `webRequest` details had no `initiator` and empty `documentUrl` / `originUrl`. | shim |
@@ -97,4 +98,5 @@ a real key event, and `responder` logs what has keyboard focus. `move x y` and `
 pointer events through the event queue (window points, origin bottom-left). Added 2026-11-17:
 `popups` (what the pop-up blocker stopped), `historymenu` (fills and logs the History menu),
 `pasteandgo <text>`, `capture` (camera / mic / full-screen state) and `fsbanner`. Later the same day: `inspect` (opens
-Web Inspector for the selected tab, for testing `devtools_page` extensions).
+Web Inspector for the selected tab, for testing `devtools_page` extensions). Added 2026-11-18: `blocker on|off|allow`
+controls the built-in blocker, and `TUFF_BLOCKER_DISABLE=main,isolated,cosmetic` isolates its advanced components.

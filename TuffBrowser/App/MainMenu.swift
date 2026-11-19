@@ -1,9 +1,10 @@
 import AppKit
+import Flint
 
 enum MainMenu {
     private static func key(_ code: Int) -> String { String(UnicodeScalar(UInt32(code)).map(Character.init) ?? " ") }
 
-    static func build(target: AppDelegate) -> NSMenu {
+    @MainActor static func build(target: AppDelegate) -> NSMenu {
         let main = NSMenu()
 
         func item(
@@ -55,6 +56,7 @@ enum MainMenu {
         NSApp.servicesMenu = services
         _ = submenu("Tuff", [
             item("About Tuff", #selector(AppDelegate.showAbout(_:))),
+            Updater.app.makeMenuItem(),
             sep(),
             item("Settings…", #selector(AppDelegate.showSettingsWindow(_:)), ","),
             item("Extensions…", #selector(AppDelegate.showExtensions(_:)), "e", [.command, .shift]),
@@ -211,6 +213,7 @@ enum MainMenu {
         // Help (macOS adds its menu search at the top)
         let help = submenu("Help", [
             item("Keyboard Shortcuts", #selector(AppDelegate.showKeyboardShortcuts(_:)), "/", [.command, .shift]),
+            item("Welcome to Tuff", #selector(AppDelegate.showWelcome(_:))),
         ])
         NSApp.helpMenu = help
 

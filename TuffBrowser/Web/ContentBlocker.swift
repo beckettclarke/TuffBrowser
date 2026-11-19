@@ -8,8 +8,9 @@ import WebKit
 /// `webRequest` listeners hear about requests after they've been sent, so blockers built on them
 /// (full uBlock Origin, most Firefox blockers) can't stop anything. This downloads the standard
 /// filter lists, translates them (`FilterListParser`), compiles them with `WKContentRuleListStore`
-/// and adds them to every tab. Compiled lists are cached, so a launch only looks them up; the
-/// filter lists are refreshed every few days and recompiled when they change.
+/// and adds them to every tab. `AdvancedContentBlocker` supplies the maintained uBO Lite scriptlet
+/// and procedural-cosmetic rulesets that WebKit's rule lists cannot express. Everything is cached;
+/// the lists and advanced rules are refreshed twice a day and recompiled when they change.
 final class ContentBlocker {
     static let shared = ContentBlocker()
 
@@ -32,15 +33,17 @@ final class ContentBlocker {
                    url: URL(string: "https://pgl.yoyo.org/adservers/serverlist.php?hostformat=adblockplus&showintro=1&mimetype=plaintext")!),
     ]
 
-    private static let refreshInterval: TimeInterval = 4 * 24 * 3600
+    private static let refreshInterval: TimeInterval = 12 * 3600
 
     private struct Saved: Codable {
         var fingerprint: String
         var identifiers: [String]
         var updated: Date
+        var parserVersion: Int?
     }
 
     private var active: [WKContentRuleList] = []
+    private let advanced = AdvancedContentBlocker()
     private let controllers = NSHashTable<WKUserContentController>.weakObjects()
     /// Controllers whose tab is showing a site the user allowed ads on (lists taken out).
     private let skipped = NSHashTable<WKUserContentController>.weakObjects()
@@ -60,6 +63,7 @@ final class ContentBlocker {
         try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
         return url
     }
+    private var advancedFolder: URL { folder.appendingPathComponent("Advanced", isDirectory: true) }
     private var savedURL: URL { folder.appendingPathComponent("compiled.json") }
     private lazy var store: WKContentRuleListStore? = WKContentRuleListStore(url: folder.appendingPathComponent("Compiled", isDirectory: true))
 
@@ -73,12 +77,14 @@ final class ContentBlocker {
     func attach(_ controller: WKUserContentController) {
         start()
         controllers.add(controller)
+        advanced.attach(controller)
         if enabled { active.forEach(controller.add) }
     }
 
     /// Before a tab's main frame navigates: lists off on sites the user allowed ads on.
     func prepare(_ controller: WKUserContentController, for url: URL) {
         guard enabled else { return }
+        advanced.prepare(controller, for: url)
         let allowed = isAllowed(host: url.host)
         if allowed, !skipped.contains(controller) {
             active.forEach(controller.remove)
@@ -122,6 +128,7 @@ final class ContentBlocker {
     // MARK: On / off
 
     func settingsChanged() {
+        advanced.settingsChanged()
         if enabled {
             for controller in controllers.allObjects where !skipped.contains(controller) {
                 active.forEach(controller.remove)
@@ -149,7 +156,8 @@ final class ContentBlocker {
     func start() {
         guard !started else { return }
         started = true
-        if let saved, let store {
+        advanced.start(in: advancedFolder)
+        if let saved, saved.parserVersion == FilterListParser.version, let store {
             lookUp(saved.identifiers, in: store) { [weak self] lists in
                 guard let self else { return }
                 if let lists { self.activate(lists) }
@@ -165,12 +173,19 @@ final class ContentBlocker {
     /// when the compiled lists don't match them.
     func refreshIfNeeded(force: Bool = false) {
         guard enabled, !building else { return }
-        let stale = force || active.isEmpty || saved.map { Date().timeIntervalSince($0.updated) > Self.refreshInterval } ?? true
+        let stale = force || active.isEmpty || saved.map {
+            $0.fingerprint.isEmpty || $0.parserVersion != FilterListParser.version
+                || Date().timeIntervalSince($0.updated) > Self.refreshInterval
+        } ?? true
         guard stale else { return }
         building = true
         Task.detached(priority: .utility) { [weak self] in
             guard let self else { return }
+            async let advancedSources = AdvancedContentBlocker.download()
             let texts = await self.download()
+            if let sources = await advancedSources {
+                await MainActor.run { self.advanced.activate(sources) }
+            }
             await MainActor.run { self.build(from: texts) }
         }
     }
@@ -216,7 +231,7 @@ final class ContentBlocker {
         let fingerprint = Self.fingerprint(texts)
         if let saved, saved.fingerprint == fingerprint, !active.isEmpty {
             // Unchanged: just note that it was checked.
-            save(Saved(fingerprint: fingerprint, identifiers: saved.identifiers, updated: Date()))
+            save(Saved(fingerprint: fingerprint, identifiers: saved.identifiers, updated: Date(), parserVersion: FilterListParser.version))
             building = false
             return
         }
@@ -260,7 +275,7 @@ final class ContentBlocker {
                 self.activate(lists)
                 let identifiers = compiled.enumerated().compactMap { $0.element == nil ? nil : prefix + String($0.offset) }
                 // With a failure the fingerprint isn't kept, so the next check tries again.
-                self.save(Saved(fingerprint: failures.isEmpty ? fingerprint : "", identifiers: identifiers, updated: Date()))
+                self.save(Saved(fingerprint: failures.isEmpty ? fingerprint : "", identifiers: identifiers, updated: Date(), parserVersion: FilterListParser.version))
                 for identifier in old?.identifiers ?? [] where !identifiers.contains(identifier) {
                     store.removeContentRuleList(forIdentifier: identifier) { _ in }
                 }
