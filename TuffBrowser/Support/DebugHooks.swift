@@ -163,6 +163,9 @@ enum DebugHooks {
             for (i, window) in NSApp.windows.enumerated() where window.isVisible {
                 snapshot(window: window, to: "\(argument)-\(i).png")
             }
+        case "newtab":
+            // ⌘T: the New Tab page or the command bar, as the settings say.
+            state.openNewTab()
         case "cmdbar":
             // cmdbar [edit|close]
             if argument == "close" { state.closeCommandBar() } else { state.openCommandBar(argument == "edit" ? .editCurrent : .newTab) }
@@ -393,7 +396,9 @@ enum DebugHooks {
                     + "firstResponder=\(String(describing: state.window?.firstResponder.map { type(of: $0) }))")
             }
         case "settings":
-            AppDelegate.shared?.showSettings(tab: SettingsTab(rawValue: argument) ?? .general)
+            // settings <page> [origin] — with an origin, Websites opens on that site.
+            let words = argument.split(separator: " ", maxSplits: 1).map(String.init)
+            AppDelegate.shared?.showSettings(tab: SettingsTab(rawValue: words.first ?? "") ?? .general, site: words.count > 1 ? words[1] : nil)
         case "settingsquery", "settingsfind":
             // settingsquery <words> types into the Settings search field; settingsfind also
             // presses Return (opens the best result and scrolls to it).
@@ -719,8 +724,9 @@ enum DebugHooks {
             }
             return
         case "pagemenu":
-            // pagemenu [off|screenshot] — opens / closes the page menu off the address bar.
+            // pagemenu [off|screenshot|site] — opens / closes the page menu off the address bar.
             if argument == "screenshot" { PageMenu.openOn = .screenshot }
+            if argument == "site" { PageMenu.openOn = .site }
             state.pageMenuVisible = argument != "off"
         case "readersnap":
             // readersnap <path> — reader mode's article as WebKit draws it (works with the screen locked).

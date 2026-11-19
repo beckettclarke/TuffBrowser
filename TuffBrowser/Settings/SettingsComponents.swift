@@ -10,6 +10,8 @@ import SwiftUI
 struct SettingsPage<Content: View>: View {
     let title: String
     var subtitle: String?
+    /// A link back up above the title, for a page inside another (a site inside Websites).
+    var back: SettingsBack?
     @ViewBuilder var content: Content
 
     @State private var position = ScrollPosition()
@@ -22,8 +24,22 @@ struct SettingsPage<Content: View>: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 22) {
                 VStack(alignment: .leading, spacing: 4) {
+                    if let back {
+                        Button(action: back.action) {
+                            HStack(spacing: 4) {
+                                Image(systemName: "chevron.left").font(.system(size: 10, weight: .bold))
+                                Text(back.title).font(.system(size: 12.5, weight: .medium))
+                            }
+                            .foregroundStyle(.primary.opacity(0.55))
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(SquishButtonStyle(scale: 0.96))
+                        .padding(.bottom, 4)
+                    }
                     Text(title)
                         .font(.system(size: 24, weight: .semibold, design: .rounded))
+                        .lineLimit(1)
+                        .truncationMode(.head)
                     if let subtitle {
                         Text(subtitle)
                             .font(.system(size: 12.5))
@@ -55,6 +71,11 @@ struct SettingsPage<Content: View>: View {
             withAnimation(Motion.smooth) { position.scrollTo(y: y) }
         }
     }
+}
+
+struct SettingsBack {
+    let title: String
+    let action: () -> Void
 }
 
 /// A rounded plate of rows with hairlines between them, an optional heading and footnote.

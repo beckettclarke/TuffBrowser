@@ -49,6 +49,10 @@ final class Tab: NSObject, Identifiable {
     var pdf: PDFViewer?
     /// Set while the tab is in reader mode: the article, shown over the page (see `Reader`).
     var reader: Reader?
+    /// Opened by ⌘T with the New Tab page on (`TabSettings.newTabPage`): it shows Tuff's mark
+    /// until something is loaded in it.
+    var isNewTabPage = false
+    var showsNewTabPage: Bool { isNewTabPage && url == nil }
 
     /// The page a pinned / favourite tab was pinned on: where it returns to when it is
     /// "closed", or when its icon is clicked after browsing away (see `isAwayFromHome`).

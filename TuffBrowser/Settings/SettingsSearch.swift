@@ -35,6 +35,9 @@ final class SettingsRouter {
     /// The page on show. Remembered, so ⌘, reopens where you were.
     private(set) var tab: SettingsTab
     private(set) var target: SettingsTarget?
+    /// The site whose settings Websites shows (an origin, `https://example.com`), or nil for
+    /// the list of sites.
+    var site: String?
     /// What's typed in the sidebar's search field.
     var query = ""
 
@@ -43,7 +46,8 @@ final class SettingsRouter {
     }
 
     /// Shows a page, optionally scrolling to one setting on it and lighting it up.
-    func go(_ tab: SettingsTab, anchor: String? = nil) {
+    func go(_ tab: SettingsTab, anchor: String? = nil, site: String? = nil) {
+        self.site = site
         // Set the target first: the page being left ignores it (it's for another page), and the
         // page coming in finds it when it appears.
         target = anchor.map { SettingsTarget(tab: tab, anchor: $0) }
@@ -186,6 +190,7 @@ enum SettingsSearch {
         // Tabs
         .row("New tabs go at the", .tabs, in: "Opening", named: "New tab position", "new tabs top bottom order place"),
         .row("Switch to tabs opened with ⌘-click", .tabs, in: "Opening", "background foreground links command click focus"),
+        .row("Open a New Tab page", .tabs, in: "Opening", "new tab page empty blank start command t logo"),
         .row("After closing a tab, show", .tabs, in: "Closing", "close select next previous"),
         .row("Close tabs I haven’t viewed in", .tabs, in: "Closing", named: "Close idle tabs automatically",
              "archive old idle auto close cleanup tidy"),
@@ -226,6 +231,8 @@ enum SettingsSearch {
 
         // Websites
         .group("Site permissions", .websites, named: "Site permissions", "camera microphone location notifications allowed blocked forget"),
+        .group("Sites", .websites, named: "Settings for each site",
+               "site permissions camera microphone location notifications ask allow deny block reset per site"),
         .row("Remember my choice by default", .websites, in: "Site permissions", "permissions remember camera microphone"),
         .row("Block pop-ups", .websites, in: "Content", "popup popups windows new tabs"),
         .row("Allow JavaScript", .websites, in: "Content", "js scripts disable"),

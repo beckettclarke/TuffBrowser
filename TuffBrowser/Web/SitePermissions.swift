@@ -47,6 +47,31 @@ enum SitePermissionKind: String, Codable, CaseIterable {
     }
 
     var symbols: [String] { chips.map(\.symbol) }
+
+    /// The permissions a site's settings list, each set on its own. Camera and microphone
+    /// requested together are answered for both (`SitePermissions.record`).
+    static let perSite: [SitePermissionKind] = [.camera, .microphone, .location, .notifications]
+
+    /// The two answers a camera-and-microphone request is kept as.
+    var parts: [SitePermissionKind] { self == .cameraAndMicrophone ? [.camera, .microphone] : [self] }
+}
+
+/// What a site may do for one permission: ask each time, or always allow or deny.
+enum PermissionSetting: String, CaseIterable, Identifiable {
+    case ask, allow, deny
+    var id: String { rawValue }
+
+    init(_ granted: Bool?) {
+        self = granted.map { $0 ? .allow : .deny } ?? .ask
+    }
+
+    var label: String {
+        switch self {
+        case .ask: "Ask"
+        case .allow: "Allow"
+        case .deny: "Deny"
+        }
+    }
 }
 
 /// A site's pending request, shown as a card over its tab.
@@ -76,9 +101,7 @@ final class SitePermissions {
         var id: String { "\(origin)|\(kind.rawValue)" }
 
         /// The host alone for an https origin on the default port, else the whole origin.
-        var displayName: String {
-            origin.hasPrefix("https://") && !origin.dropFirst(8).contains(":") ? String(origin.dropFirst(8)) : origin
-        }
+        var displayName: String { SitePermissions.displayName(origin) }
 
         enum CodingKeys: String, CodingKey { case origin = "host", kind, granted }
     }
@@ -86,18 +109,44 @@ final class SitePermissions {
     static let shared = SitePermissions()
 
     private(set) var saved: [Entry] = []
-    @ObservationIgnored private var session: [String: Bool] = [:]
-    @ObservationIgnored private var incognitoSession: [String: Bool] = [:]
+    /// Answers given without "Remember", until Tuff quits. Observed, so a site's settings show them.
+    private var session: [String: Bool] = [:]
+    private var incognitoSession: [String: Bool] = [:]
     @ObservationIgnored private let file = Paths.appSupport.appendingPathComponent("site-permissions.json")
 
     private init() {
-        if let data = try? Data(contentsOf: file), let list = try? JSONDecoder().decode([Entry].self, from: data) {
-            saved = list.map { entry in
-                var entry = entry
-                if !entry.origin.contains("://") { entry.origin = "https://" + entry.origin.lowercased() }
-                return entry
+        guard let data = try? Data(contentsOf: file), let list = try? JSONDecoder().decode([Entry].self, from: data) else { return }
+        var migrated = false
+        for var entry in list {
+            if !entry.origin.contains("://") { entry.origin = "https://" + entry.origin.lowercased() }
+            // Camera + microphone used to be one answer; each is now set on its own.
+            if entry.kind == .cameraAndMicrophone {
+                migrated = true
+                for part in entry.kind.parts where !list.contains(where: { $0.origin == entry.origin && $0.kind == part }) {
+                    saved.append(Entry(origin: entry.origin, kind: part, granted: entry.granted))
+                }
+                continue
             }
+            saved.append(entry)
         }
+        if migrated {
+            sort()
+            save()
+        }
+    }
+
+    /// The host alone for an https origin on the default port, else the whole origin.
+    static func displayName(_ origin: String) -> String {
+        origin.hasPrefix("https://") && !origin.dropFirst(8).contains(":") ? String(origin.dropFirst(8)) : origin
+    }
+
+    /// The key permissions are kept under for a page's address, or nil for a page that isn't
+    /// on the web.
+    static func origin(of url: URL?) -> String? {
+        guard let url, let scheme = url.scheme?.lowercased(), scheme == "http" || scheme == "https",
+              let host = url.host(percentEncoded: false)?.lowercased(), !host.isEmpty else { return nil }
+        let port = url.port.flatMap { $0 != (scheme == "https" ? 443 : 80) ? ":\($0)" : nil } ?? ""
+        return "\(scheme)://\(host)\(port)"
     }
 
     /// The key permissions are kept under for a page's or frame's origin.
@@ -140,17 +189,20 @@ final class SitePermissions {
         // A normal window's "Allow" doesn't carry into Incognito; its "Don't Allow" does.
         if incognito, answer == true { answer = nil }
         if let answer { return answer }
-        // Camera + microphone is covered when each was answered the same way on its own.
-        if kind == .cameraAndMicrophone,
-           let camera = decision(origin: origin, kind: .camera, incognito: incognito),
-           let mic = decision(origin: origin, kind: .microphone, incognito: incognito),
-           camera == mic {
-            return camera
+        // Camera + microphone: denied if either is, allowed if both are, else the site asks.
+        if kind == .cameraAndMicrophone {
+            let answers = kind.parts.map { decision(origin: origin, kind: $0, incognito: incognito) }
+            if answers.contains(false) { return false }
+            if answers.allSatisfy({ $0 == true }) { return true }
         }
         return nil
     }
 
     func record(origin: String, kind: SitePermissionKind, granted: Bool, remember: Bool, incognito: Bool) {
+        guard kind != .cameraAndMicrophone else {
+            for part in kind.parts { record(origin: origin, kind: part, granted: granted, remember: remember, incognito: incognito) }
+            return
+        }
         let entry = Entry(origin: origin, kind: kind, granted: granted)
         if incognito {
             // Nothing from Incognito reaches the disk; "remember" lasts while Incognito is open.
@@ -158,12 +210,68 @@ final class SitePermissions {
             return
         }
         if remember {
+            // A remembered answer replaces one given for this session only.
+            session[entry.id] = nil
             saved.removeAll { $0.id == entry.id }
             saved.append(entry)
-            saved.sort { ($0.origin, $0.kind.rawValue) < ($1.origin, $1.kind.rawValue) }
+            sort()
             save()
         } else {
             session[entry.id] = granted
+        }
+    }
+
+    // MARK: Per-site settings
+
+    /// What a site's settings show for one permission: the answer kept for exactly this origin
+    /// (remembered, or given until Tuff quits), else Ask. Incognito shows its own answers and
+    /// the "Deny"s it inherits from normal windows.
+    func setting(origin: String, kind: SitePermissionKind, incognito: Bool) -> PermissionSetting {
+        let key = "\(origin)|\(kind.rawValue)"
+        let normal = session[key] ?? saved.first(where: { $0.id == key })?.granted
+        guard incognito else { return PermissionSetting(normal) }
+        if let answer = incognitoSession[key] { return PermissionSetting(answer) }
+        return normal == false ? .deny : .ask
+    }
+
+    /// Sets one permission for a site, from its settings. Ask forgets the answer, so the site
+    /// asks again next time. Denying the camera or microphone stops a page of that site
+    /// already using it.
+    func set(_ setting: PermissionSetting, origin: String, kind: SitePermissionKind, incognito: Bool) {
+        for part in kind.parts {
+            switch setting {
+            case .ask:
+                for granted in [true, false] { remove(Entry(origin: origin, kind: part, granted: granted), incognito: incognito) }
+            case .allow, .deny:
+                record(origin: origin, kind: part, granted: setting == .allow, remember: true, incognito: incognito)
+            }
+        }
+        if setting == .deny, kind != .location, kind != .notifications {
+            Self.stopCapture(kind, origin: origin, incognito: incognito)
+        }
+    }
+
+    /// Every origin with a remembered answer, sorted.
+    var origins: [String] {
+        var seen = Set<String>()
+        return saved.map(\.origin).filter { seen.insert($0).inserted }
+    }
+
+    /// Forgets every answer for one site.
+    func removeAll(origin: String) {
+        saved.removeAll { $0.origin == origin }
+        session = session.filter { !$0.key.hasPrefix(origin + "|") }
+        save()
+    }
+
+    /// Turns off the camera or microphone in open tabs showing `origin`.
+    private static func stopCapture(_ kind: SitePermissionKind, origin: String, incognito: Bool) {
+        for state in BrowserState.all where state.isPrivate == incognito {
+            for tab in state.allTabs where Self.origin(of: tab.url) == origin {
+                guard let webView = tab.webView else { continue }
+                if kind != .microphone { webView.setCameraCaptureState(.none) }
+                if kind != .camera { webView.setMicrophoneCaptureState(.none) }
+            }
         }
     }
 
@@ -173,7 +281,10 @@ final class SitePermissions {
     }
 
     func remove(_ entry: Entry, incognito: Bool = false) {
-        if incognito { incognitoSession[entry.id] = nil }
+        if incognito {
+            incognitoSession[entry.id] = nil
+            return
+        }
         saved.removeAll { $0.id == entry.id }
         session[entry.id] = nil
         save()
@@ -183,6 +294,10 @@ final class SitePermissions {
         saved.removeAll()
         session.removeAll()
         save()
+    }
+
+    private func sort() {
+        saved.sort { ($0.origin, $0.kind.rawValue) < ($1.origin, $1.kind.rawValue) }
     }
 
     private func save() {

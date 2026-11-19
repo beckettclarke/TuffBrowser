@@ -496,7 +496,7 @@ private struct NewStripTabButton: View {
 
     var body: some View {
         Button {
-            state.openCommandBar(.newTab)
+            state.openNewTab()
         } label: {
             Image(systemName: "plus")
                 .font(.system(size: 12.5, weight: .semibold))
@@ -561,7 +561,7 @@ struct HorizontalToolbar: View {
             }
 
             Menu {
-                Button("New Tab") { state.openCommandBar(.newTab) }
+                Button("New Tab") { state.openNewTab() }
                 Button("New Incognito Window") { AppDelegate.shared?.openIncognitoWindow() }
                 if !state.isPrivate {
                     Button("New Space") { state.addSpace() }

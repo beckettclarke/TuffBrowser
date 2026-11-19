@@ -98,7 +98,7 @@ struct URLPill: View {
                     .lineLimit(1)
                     .truncationMode(.head)
             } else {
-                Text(tab == nil ? "Search or enter address" : (url?.absoluteString ?? "New Tab"))
+                Text(tab?.showsNewTabPage ?? true ? "Search or enter address" : (url?.absoluteString ?? "New Tab"))
                     .font(.system(size: 13.5, weight: .medium))
                     .foregroundStyle(.primary.opacity(0.45))
                     .lineLimit(1)
@@ -1180,7 +1180,7 @@ struct NewTabRow: View {
 
     var body: some View {
         Button {
-            state.openCommandBar(.newTab)
+            state.openNewTab()
         } label: {
             HStack(spacing: 10) {
                 Image(systemName: "plus")
@@ -1714,7 +1714,7 @@ struct BottomBar: View {
             Menu {
                 if !state.isPrivate { Button("New Space") { state.addSpace() } }
                 Button("New Folder") { state.addFolder() }
-                Button("New Tab") { state.openCommandBar(.newTab) }
+                Button("New Tab") { state.openNewTab() }
                 Button("New Incognito Window") { AppDelegate.shared?.openIncognitoWindow() }
                 Divider()
                 if !state.isPrivate { Button("Extensions…") { AppDelegate.shared?.showSettings(tab: .extensions) } }

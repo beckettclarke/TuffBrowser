@@ -7,6 +7,9 @@ RELEASE_APP := $(BUILD_DIR)/Build/Products/Release/$(APP_NAME).app
 # used automatically (see scripts/signing-args.sh; SIGN_KIND picks another kind of certificate).
 SIGNING := $(shell scripts/signing-args.sh)
 XCODEBUILD := xcodebuild -project TuffBrowser.xcodeproj -scheme $(SCHEME) -derivedDataPath $(BUILD_DIR) $(SIGNING)
+# Xcode rewrites the bundle's contents but never the .app folder's own date, and macOS caches
+# app icons by path and that date, so without a touch every rebuild shows the first build's icon.
+LSREGISTER := /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
 
 .PHONY: gen build test run release install size icon clean
 
@@ -17,6 +20,7 @@ gen:
 ## Debug build
 build: gen
 	$(XCODEBUILD) -configuration Debug build | grep -E "error:|warning: |BUILD" || true
+	@touch $(DEBUG_APP)
 
 ## Unit tests (TuffBrowserTests). Hosted in a Tuff that opens no windows and loads no profile.
 test: gen
@@ -29,12 +33,15 @@ run: build
 ## Optimised build
 release: gen
 	$(XCODEBUILD) -configuration Release build | grep -E "error:|BUILD" || true
+	@touch $(RELEASE_APP)
 	@$(MAKE) size
 
 ## Optimised build, copied to /Applications (where helper apps such as 1Password look for browsers)
 install: release
 	rm -rf "/Applications/$(APP_NAME).app"
 	ditto $(RELEASE_APP) "/Applications/$(APP_NAME).app"
+	@touch "/Applications/$(APP_NAME).app"
+	@$(LSREGISTER) -f "/Applications/$(APP_NAME).app"
 	@codesign -dv "/Applications/$(APP_NAME).app" 2>&1 | grep -E "^(Authority|TeamIdentifier|Signature)" | head -3
 
 ## Show how big the release app is

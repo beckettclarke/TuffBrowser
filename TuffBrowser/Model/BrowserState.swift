@@ -874,8 +874,19 @@ final class BrowserState {
 
     // MARK: Navigation
 
+    /// ⌘T. With the New Tab page on for this layout, an empty tab opens and the address is typed
+    /// into it; otherwise just the command bar, whose result gets a new tab.
+    func openNewTab() {
+        if settings.tabs.newTabPage(for: tabLayout), selectedTab?.showsNewTabPage != true {
+            newTab(url: nil).isNewTabPage = true
+        }
+        openCommandBar(.newTab)
+    }
+
     func openCommandBar(_ mode: CommandBarMode) {
-        let resolved: CommandBarMode = (mode != .newTab && selectedTab == nil) ? .newTab : mode
+        // ⌘L on an empty New Tab page fills it in, as ⌘T would.
+        let blank = selectedTab?.showsNewTabPage ?? true
+        let resolved: CommandBarMode = (mode == .editCurrent && blank) || (mode == .splitTab && selectedTab == nil) ? .newTab : mode
         let wasOpen = commandBar != nil
         animate(Motion.snappy) { commandBar = resolved }
         // Take the keyboard from the page right away, so nothing typed before the bar's field
@@ -913,7 +924,10 @@ final class BrowserState {
     }
 
     func open(url: URL, mode: CommandBarMode) {
-        if mode == .editCurrent, let tab = selectedTab {
+        if mode == .newTab, let tab = selectedTab, tab.showsNewTabPage {
+            tab.load(url)
+            focusWebView()
+        } else if mode == .editCurrent, let tab = selectedTab {
             tab.load(url)
             focusWebView()
         } else if mode == .splitTab, let current = selectedTab {

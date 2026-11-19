@@ -142,8 +142,9 @@ final class SettingsWindowController: NSObject {
     #endif
 
     /// Shows `tab`, or with nil, the page that was showing last (⌘, works like Safari's).
-    func show(_ tab: SettingsTab?) {
-        if let tab { router.go(tab) }
+    /// With `site`, Websites opens on that site's settings.
+    func show(_ tab: SettingsTab?, site: String? = nil) {
+        if let tab { router.go(tab, site: site) }
         let wasVisible = window.isVisible
         window.makeKeyAndOrderFront(nil)
         applyTheme()
@@ -196,7 +197,7 @@ struct SettingsView: View {
 
             ZStack {
                 page(router.tab)
-                    .id(router.tab)
+                    .id("\(router.tab.rawValue)|\(router.site ?? "")")
                     .transition(.opacity.combined(with: .offset(y: 6)))
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -211,6 +212,7 @@ struct SettingsView: View {
             .shadow(color: .black.opacity(0.18), radius: 7, y: 2)
             .padding([.top, .bottom, .trailing], inset)
             .animation(settings.animationsEnabled ? Motion.quick : nil, value: router.tab)
+            .animation(settings.animationsEnabled ? Motion.quick : nil, value: router.site)
         }
         .background(WindowBackground(tint: Color(nsColor: tint)))
         .overlay {
@@ -235,7 +237,8 @@ struct SettingsView: View {
         case .spaces: SpacesPage()
         case .search: SearchPage()
         case .privacy: PrivacyPage()
-        case .websites: WebsitesPage()
+        case .websites:
+            if let site = router.site { SiteDetailPage(origin: site) } else { WebsitesPage() }
         case .downloads: DownloadsPage()
         case .extensions: ExtensionsPage()
         case .mods: ModsPage()
@@ -829,6 +832,11 @@ struct TabsPage: View {
                     detail: "Hold ⇧ while clicking to do the opposite.",
                     isOn: $settings.tabs.foregroundLinks
                 )
+                SwitchRow(
+                    title: "Open a New Tab page",
+                    detail: "⌘T opens an empty tab, then you type where to go. Set separately for each layout; this is the \(settings.tabs.layout.label.lowercased()) one.",
+                    isOn: settings.tabs.layout == .horizontal ? $settings.tabs.newTabPageHorizontal : $settings.tabs.newTabPageVertical
+                )
             }
 
             SettingsGroup(title: "Closing", footer: "Pinned tabs and favourites are never closed automatically. ⇧⌘T brings a closed tab back.") {
@@ -1160,24 +1168,14 @@ struct PrivacyPage: View {
 // MARK: - Websites
 
 /// Everything that's about what sites may do and how their pages are shown: permissions they've
-/// asked for, pop-ups, JavaScript, autoplay, and zoom (overall and remembered per site).
+/// asked for, pop-ups, JavaScript, autoplay, and zoom. Each site with settings of its own is
+/// listed, and opens on its own page (`SiteDetailPage`).
 struct WebsitesPage: View {
     @Environment(AppSettings.self) private var settings
-    private var permissions = SitePermissions.shared
     private var siteSettings = SiteSettings.shared
     private var siteZoom = SiteZoom.shared
 
     private static let zoomOptions: [Double] = [0.5, 0.67, 0.75, 0.8, 0.9, 1, 1.1, 1.25, 1.5, 1.75, 2]
-
-    /// "JavaScript off · Pop-ups allowed" for a site's own settings.
-    private static func siteSummary(_ entry: SiteSettings.Entry?) -> String {
-        guard let entry else { return "" }
-        var parts: [String] = []
-        if let js = entry.javaScript { parts.append("JavaScript \(js ? "on" : "off")") }
-        if let popups = entry.popups { parts.append("Pop-ups \(popups ? "allowed" : "blocked")") }
-        if let autoplay = entry.autoplay { parts.append("Autoplay: \(autoplay.label)") }
-        return parts.joined(separator: " · ")
-    }
     private static let fontOptions: [Double] = [0, 9, 10, 11, 12, 14, 16, 18, 20, 24]
 
     var body: some View {
@@ -1189,31 +1187,9 @@ struct WebsitesPage: View {
                     detail: "Starts the “Remember for this site” switch on when a site asks.",
                     isOn: $settings.privacy.rememberMediaPermissions
                 )
-                if permissions.saved.isEmpty {
-                    SettingsRow(title: "No saved choices", detail: "Sites you allow or block will appear here.")
-                } else {
-                    ForEach(permissions.saved) { entry in
-                        SettingsRow(title: entry.displayName, detail: entry.kind.label, symbol: entry.kind.symbols.first) {
-                            Text(entry.granted ? "Allowed" : "Blocked")
-                                .font(.system(size: 11.5, weight: .semibold))
-                                .foregroundStyle(entry.granted ? Color.green : Color.red)
-                                .padding(.horizontal, 8)
-                                .frame(height: 20)
-                                .background(Capsule().fill((entry.granted ? Color.green : Color.red).opacity(0.14)))
-                            IconButton(symbol: "xmark", size: 10, side: 24, help: "Forget") {
-                                withAnimation(Motion.snappy) { permissions.remove(entry) }
-                            }
-                        }
-                    }
-                    SettingsRow(title: "Forget all saved choices") {
-                        ConfirmButton(title: "Forget All") {
-                            withAnimation(Motion.snappy) { permissions.removeAll() }
-                            // "Always allow … to open … links" answers go too.
-                            ExternalAppLinks.removeAll()
-                        }
-                    }
-                }
             }
+
+            SiteListGroup()
 
             OpenInAppAnswersGroup()
 
@@ -1226,25 +1202,16 @@ struct WebsitesPage: View {
                 }
             }
 
-            SettingsGroup(title: "Site settings", footer: "Change a site’s settings from the page menu (the button at the end of the address bar).") {
-                let sites = siteSettings.sites.keys.sorted()
-                let access = siteSettings.storageAccess.keys.sorted()
-                if sites.isEmpty && access.isEmpty {
-                    SettingsRow(title: "No sites with their own settings")
-                }
-                ForEach(sites, id: \.self) { site in
-                    SettingsRow(title: site, detail: Self.siteSummary(siteSettings.sites[site]), symbol: "globe") {
-                        IconButton(symbol: "xmark", size: 10, side: 24, help: "Back to defaults") {
-                            withAnimation(Motion.snappy) { siteSettings.remove(site: site) }
-                        }
-                    }
-                }
-                ForEach(access, id: \.self) { key in
-                    let parts = key.split(separator: "|").map(String.init)
-                    let allowed = siteSettings.storageAccess[key] == true
-                    SettingsRow(title: parts.first ?? key, detail: "Cookies on \(parts.last ?? "") · \(allowed ? "Allowed" : "Blocked")", symbol: "lock.open") {
-                        IconButton(symbol: "xmark", size: 10, side: 24, help: "Forget") {
-                            withAnimation(Motion.snappy) { siteSettings.removeStorageAccess(key) }
+            let access = siteSettings.storageAccess.keys.sorted()
+            if !access.isEmpty {
+                SettingsGroup(title: "Cross-site cookies", footer: "Embedded sites you let use, or stopped using, their cookies on another site.") {
+                    ForEach(access, id: \.self) { key in
+                        let parts = key.split(separator: "|").map(String.init)
+                        let allowed = siteSettings.storageAccess[key] == true
+                        SettingsRow(title: parts.first ?? key, detail: "Cookies on \(parts.last ?? "") · \(allowed ? "Allowed" : "Blocked")", symbol: "lock.open") {
+                            IconButton(symbol: "xmark", size: 10, side: 24, help: "Forget") {
+                                withAnimation(Motion.snappy) { siteSettings.removeStorageAccess(key) }
+                            }
                         }
                     }
                 }

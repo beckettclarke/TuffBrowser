@@ -74,7 +74,7 @@ final class Onboarding {
         animate(.easeOut(duration: 0.25)) { isShowing = false }
         let state = BrowserState.shared
         // Straight on to the first page.
-        if state.selectedTab == nil { state.openCommandBar(.newTab) } else { state.focusWebView() }
+        if state.selectedTab == nil { state.openNewTab() } else { state.focusWebView() }
     }
 
     private func animate(_ animation: Animation, _ body: () -> Void) {

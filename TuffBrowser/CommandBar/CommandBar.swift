@@ -367,7 +367,10 @@ struct CommandBarView: View {
             state.open(url: url, mode: mode)
         case .tab(let id):
             guard let tab = state.allTabs.first(where: { $0.id == id }) else { return }
+            // Switching away from an empty New Tab page leaves no empty tab behind.
+            let blank = mode == .newTab ? state.selectedTab.flatMap { $0.showsNewTabPage ? $0 : nil } : nil
             if mode == .splitTab { state.split(with: tab) } else { state.select(tab) }
+            if let blank, blank !== tab { state.close(blank, force: true) }
         case .keyword:
             break
         }

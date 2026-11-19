@@ -437,6 +437,56 @@ final class SitePermissionDecisionTests: XCTestCase {
         permissions.record(origin: allowed, kind: .camera, granted: true, remember: true, incognito: true)
         XCTAssertEqual(permissions.decision(origin: allowed, kind: .camera, incognito: true), true)
     }
+
+    func testPerSiteSettings() {
+        let permissions = SitePermissions.shared
+        let origin = "https://\(UUID().uuidString).example"
+        defer { permissions.removeAll(origin: origin) }
+        XCTAssertEqual(permissions.setting(origin: origin, kind: .camera, incognito: false), .ask)
+
+        // Each device is set on its own; a request for both needs both allowed.
+        permissions.set(.allow, origin: origin, kind: .camera, incognito: false)
+        XCTAssertEqual(permissions.setting(origin: origin, kind: .camera, incognito: false), .allow)
+        XCTAssertNil(permissions.decision(origin: origin, kind: .cameraAndMicrophone, incognito: false))
+        permissions.set(.allow, origin: origin, kind: .microphone, incognito: false)
+        XCTAssertEqual(permissions.decision(origin: origin, kind: .cameraAndMicrophone, incognito: false), true)
+        permissions.set(.deny, origin: origin, kind: .camera, incognito: false)
+        XCTAssertEqual(permissions.decision(origin: origin, kind: .cameraAndMicrophone, incognito: false), false)
+
+        // Ask forgets the answer, including one given only for this session.
+        permissions.record(origin: origin, kind: .location, granted: true, remember: false, incognito: false)
+        XCTAssertEqual(permissions.setting(origin: origin, kind: .location, incognito: false), .allow)
+        permissions.set(.ask, origin: origin, kind: .location, incognito: false)
+        XCTAssertNil(permissions.decision(origin: origin, kind: .location, incognito: false))
+
+        // A setting replaces a session answer that disagrees with it.
+        permissions.record(origin: origin, kind: .notifications, granted: false, remember: false, incognito: false)
+        permissions.set(.allow, origin: origin, kind: .notifications, incognito: false)
+        XCTAssertEqual(permissions.decision(origin: origin, kind: .notifications, incognito: false), true)
+
+        // A camera-and-microphone answer is kept for each device.
+        let both = "https://\(UUID().uuidString).example"
+        defer { permissions.removeAll(origin: both) }
+        permissions.record(origin: both, kind: .cameraAndMicrophone, granted: true, remember: true, incognito: false)
+        XCTAssertEqual(permissions.setting(origin: both, kind: .camera, incognito: false), .allow)
+        XCTAssertEqual(permissions.setting(origin: both, kind: .microphone, incognito: false), .allow)
+        XCTAssertTrue(permissions.origins.contains(both))
+
+        // Incognito's settings stay there; it inherits Deny but not Allow.
+        permissions.set(.allow, origin: both, kind: .location, incognito: true)
+        XCTAssertEqual(permissions.setting(origin: both, kind: .location, incognito: true), .allow)
+        XCTAssertEqual(permissions.setting(origin: both, kind: .location, incognito: false), .ask)
+        XCTAssertEqual(permissions.setting(origin: both, kind: .camera, incognito: true), .ask)
+        XCTAssertEqual(permissions.setting(origin: origin, kind: .camera, incognito: true), .deny)
+        permissions.forgetIncognito()
+    }
+
+    func testOriginOfAddress() {
+        XCTAssertEqual(SitePermissions.origin(of: URL(string: "https://Example.com/a?b")), "https://example.com")
+        XCTAssertEqual(SitePermissions.origin(of: URL(string: "http://example.com:8080/")), "http://example.com:8080")
+        XCTAssertEqual(SitePermissions.origin(of: URL(string: "https://example.com:443/")), "https://example.com")
+        XCTAssertNil(SitePermissions.origin(of: URL(string: "about:blank")))
+    }
 }
 
 private final class PageWaiter: NSObject, WKNavigationDelegate {

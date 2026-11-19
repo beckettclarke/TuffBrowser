@@ -143,6 +143,12 @@ final class SiteSettings {
         save()
     }
 
+    /// Every site's own JavaScript, pop-up and autoplay settings (cross-site cookie answers stay).
+    func removeSites() {
+        sites.removeAll()
+        save()
+    }
+
     // MARK: Cross-site cookies (Storage Access API)
 
     func storageAccess(domain: String, under top: String, incognito: Bool) -> Bool? {
@@ -221,12 +227,14 @@ final class SiteSettings {
 
 // MARK: - Page menu: Site Settings
 
-/// The page menu's "Site Settings" page: this site's JavaScript, pop-ups and autoplay, each
-/// "Default" (as Settings says), "Allow" or "Block". Changing one reloads the page.
+/// The page menu's "Site Settings" page: this site's permissions (Ask, Allow or Deny), and its
+/// JavaScript, pop-ups and autoplay, each "Default" (as Settings says), "Allow" or "Block".
+/// Changing one of the last three reloads the page.
 struct SiteSettingsPanel: View {
     @Environment(BrowserState.self) private var state
     let back: () -> Void
     private var store: SiteSettings { .shared }
+    private var permissions: SitePermissions { .shared }
 
     var body: some View {
         let tab = state.selectedTab
@@ -245,14 +253,38 @@ struct SiteSettingsPanel: View {
             }
             .padding(.leading, -4)
 
-            row("JavaScript", symbol: "curlybraces", value: entry.javaScript, fallback: privacy.javaScript) { value in
-                change(url, tab) { $0.javaScript = value }
+            if let origin = SitePermissions.origin(of: url) {
+                VStack(spacing: 4) {
+                    // Incognito windows never get notifications.
+                    ForEach(SitePermissionKind.perSite.filter { !incognito || $0 != .notifications }, id: \.self) { kind in
+                        permissionRow(kind, origin: origin, incognito: incognito)
+                    }
+                }
             }
-            row("Pop-ups", symbol: "macwindow.on.rectangle", value: entry.popups, fallback: !privacy.blockPopups) { value in
-                change(url, tab) { $0.popups = value }
+
+            VStack(spacing: 4) {
+                row("JavaScript", symbol: "curlybraces", value: entry.javaScript, fallback: privacy.javaScript) { value in
+                    change(url, tab) { $0.javaScript = value }
+                }
+                row("Pop-ups", symbol: "macwindow.on.rectangle", value: entry.popups, fallback: !privacy.blockPopups) { value in
+                    change(url, tab) { $0.popups = value }
+                }
+                autoplayRow(entry.autoplay, fallback: privacy.autoplay) { value in
+                    change(url, tab) { $0.autoplay = value }
+                }
             }
-            autoplayRow(entry.autoplay, fallback: privacy.autoplay) { value in
-                change(url, tab) { $0.autoplay = value }
+
+            if !incognito, let origin = SitePermissions.origin(of: url) {
+                Button {
+                    state.pageMenuVisible = false
+                    AppDelegate.shared?.showSettings(tab: .websites, site: origin)
+                } label: {
+                    Label("All Site Settings…", systemImage: "gearshape")
+                        .font(.system(size: 12, weight: .medium))
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.primary.opacity(0.75))
+                .padding(.leading, 2)
             }
 
             if !incognito, SiteSettings.key(for: url) != nil {
@@ -267,7 +299,7 @@ struct SiteSettingsPanel: View {
                 .padding(.leading, 2)
             }
 
-            Text(incognito ? "Kept until you close Incognito." : "Default follows Settings → Privacy.")
+            Text(incognito ? "Kept until you close Incognito." : "Default follows Settings → Websites.")
                 .font(.system(size: 11))
                 .foregroundStyle(.primary.opacity(0.45))
                 .padding(.leading, 2)
@@ -303,6 +335,19 @@ struct SiteSettingsPanel: View {
     private func change(_ url: URL?, _ tab: Tab?, _ edit: (inout SiteSettings.Entry) -> Void) {
         store.update(url, incognito: state.isPrivate, edit)
         tab?.reload()
+    }
+
+    private func permissionRow(_ kind: SitePermissionKind, origin: String, incognito: Bool) -> some View {
+        let current = permissions.setting(origin: origin, kind: kind, incognito: incognito)
+        return SiteSettingRow(title: kind.label, symbol: kind.symbols.first ?? "questionmark") {
+            Menu {
+                ForEach(PermissionSetting.allCases) { setting in
+                    Button(setting.label) { permissions.set(setting, origin: origin, kind: kind, incognito: incognito) }
+                }
+            } label: {
+                Text(current.label)
+            }
+        }
     }
 
     private func row(_ title: String, symbol: String, value: Bool?, fallback: Bool, set: @escaping (Bool?) -> Void) -> some View {

@@ -30,6 +30,9 @@ fi
 xcodebuild "${ARGS[@]}" build | grep -E "error|warning: |BUILD" || true
 
 APP="build/Build/Products/Release/Tuff.app"
+# Xcode never updates the .app folder's own date, and macOS caches icons by it: a stale date
+# makes an updated app keep showing an older build's icon.
+touch "$APP"
 VERSION=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$APP/Contents/Info.plist")
 mkdir -p dist
 ZIP="dist/Tuff-$VERSION.zip"

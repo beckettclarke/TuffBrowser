@@ -191,6 +191,15 @@ struct TabSettings: Codable, Equatable {
     var autoPictureInPicture = true
     /// The bookmarks bar under the address bar (horizontal layout only; ⇧⌘B).
     var showBookmarksBar = false
+    /// ⌘T opens an empty tab (Tuff's mark on it) whose address is typed in the address bar,
+    /// rather than the command bar alone. Kept per layout: on where the address bar sits over
+    /// the page (horizontal), off where ⌘T's floating bar is the address bar (vertical).
+    var newTabPageHorizontal = true
+    var newTabPageVertical = false
+
+    func newTabPage(for layout: TabLayout) -> Bool {
+        layout == .horizontal ? newTabPageHorizontal : newTabPageVertical
+    }
 }
 
 struct SearchSettings: Codable, Equatable {

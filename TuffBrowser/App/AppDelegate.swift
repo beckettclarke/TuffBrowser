@@ -69,7 +69,7 @@ final class AppDelegate: NSObject {
         if let url {
             incognito.newTab(url: url)
         } else {
-            incognito.openCommandBar(.newTab)
+            incognito.openNewTab()
         }
         return incognito
     }
@@ -84,10 +84,11 @@ final class AppDelegate: NSObject {
         settingsWindow.map(\.window).flatMap { $0.isVisible ? $0 : nil }
     }
 
-    /// Opens Settings at `tab`, or with nil, at the page you last had open.
-    func showSettings(tab: SettingsTab? = nil) {
+    /// Opens Settings at `tab`, or with nil, at the page you last had open. `site` opens
+    /// Websites on one site's settings.
+    func showSettings(tab: SettingsTab? = nil, site: String? = nil) {
         if settingsWindow == nil { settingsWindow = SettingsWindowController(state: mainState) }
-        settingsWindow?.show(tab)
+        settingsWindow?.show(tab, site: site)
         NSApp.activate(ignoringOtherApps: true)
     }
 
@@ -105,7 +106,7 @@ final class AppDelegate: NSObject {
 
     @objc func newTab(_ sender: Any?) {
         ensureBrowserWindow()
-        state.openCommandBar(.newTab)
+        state.openNewTab()
     }
 
     @objc func newIncognitoWindow(_ sender: Any?) { openIncognitoWindow() }

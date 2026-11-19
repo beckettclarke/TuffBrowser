@@ -468,14 +468,22 @@ struct WebCard: View {
         let radius = seamless ? 0 : CGFloat(settings.theme.cardRadius)
         let shape = RoundedRectangle(cornerRadius: radius, style: .continuous)
 
+        let newTabPage = tab?.showsNewTabPage ?? false
+        let pageShowing = (tab?.isAwake ?? false) && !newTabPage
+
         ZStack(alignment: .top) {
-            if tab == nil {
+            if tab == nil || newTabPage {
                 shape.fill(.primary.opacity(0.05))
+            }
+            if tab == nil {
                 EmptyStateView()
                     .transition(.opacity.combined(with: .scale(scale: 0.98)))
+            } else if newTabPage {
+                NewTabPageView()
+                    .transition(.opacity)
             }
             WebStack(
-                webView: (tab?.isAwake ?? false) ? tab?.webView : nil,
+                webView: pageShowing ? tab?.webView : nil,
                 radius: radius,
                 animated: settings.animationsEnabled,
                 focus: { [weak state] in state?.focusWebView() }
@@ -542,7 +550,7 @@ struct WebCard: View {
         .overlay(shape.strokeBorder(accent.opacity(split && focused ? 0.85 : 0), lineWidth: 2).allowsHitTesting(false))
         .animation(Motion.quick, value: split && focused)
         // Solid once a page is showing: the empty state is see-through.
-        .modifier(CardShadow(cornerRadius: radius, opacity: 0.22, radius: 7, y: 2, solid: tab?.isAwake ?? false, enabled: !seamless))
+        .modifier(CardShadow(cornerRadius: radius, opacity: 0.22, radius: 7, y: 2, solid: pageShowing, enabled: !seamless))
         .animation(Motion.snappy, value: state.findVisible)
         .animation(Motion.snappy, value: tab?.permissionRequest?.id)
         .animation(Motion.quick, value: state.screenshotSelecting)
@@ -693,7 +701,7 @@ struct EmptyStateView: View {
                 .foregroundStyle(.primary.opacity(0.42))
 
             Button {
-                state.openCommandBar(.newTab)
+                state.openNewTab()
             } label: {
                 HStack(spacing: 8) {
                     Image(systemName: "magnifyingglass")
@@ -718,6 +726,22 @@ struct EmptyStateView: View {
         .onAppear {
             withAnimation(.spring(response: 0.5, dampingFraction: 0.7)) { appeared = true }
         }
+    }
+}
+
+/// An empty tab opened with ⌘T (`Tab.isNewTabPage`): Tuff's mark, faded, while the address is
+/// typed. A click anywhere puts the keyboard back in the address bar.
+struct NewTabPageView: View {
+    @Environment(BrowserState.self) private var state
+
+    var body: some View {
+        TuffLogoShape()
+            .fill(.primary.opacity(0.07))
+            .frame(width: 120, height: 120 * TuffLogoShape.aspect)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .contentShape(Rectangle())
+            .onTapGesture { state.openCommandBar(.newTab) }
+            .accessibilityLabel("New Tab")
     }
 }
 
