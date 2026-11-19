@@ -62,7 +62,6 @@ struct DockedCommandBar: View {
     let mode: CommandBarMode
     /// The address bar's frame in `RootView.space`; the field sits exactly over it.
     let frame: CGRect
-    @State private var appeared = false
 
     static let minWidth: CGFloat = 380
 
@@ -77,13 +76,11 @@ struct DockedCommandBar: View {
             CommandBarView(mode: mode, docked: true, fieldHeight: frame.height)
                 .id(mode)
                 .frame(width: width)
-                .opacity(appeared ? 1 : 0)
                 .offset(x: frame.minX, y: frame.minY)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .onAppear {
-            withAnimation(.easeOut(duration: 0.12)) { appeared = true }
-        }
+        // No fade of its own: one that waited on `onAppear` could leave the field invisible
+        // while the address bar under it was hidden. `RootView` fades it in.
     }
 }
 
@@ -242,11 +239,7 @@ struct CommandBarView: View {
             }
         )
         .clipShape(shape)
-        .overlay(
-            docked
-                ? shape.strokeBorder(accent.opacity(0.75), lineWidth: 1.5)
-                : shape.strokeBorder(.primary.opacity(0.14), lineWidth: 1)
-        )
+        .overlay(shape.strokeBorder(.primary.opacity(docked ? 0 : 0.14), lineWidth: 1))
         .modifier(CardShadow(
             cornerRadius: radius, opacity: docked ? (items.isEmpty ? 0.12 : 0.3) : 0.4,
             radius: docked ? 16 : 40, y: docked ? 8 : 18, hollow: true
@@ -405,7 +398,7 @@ struct CommandBarView: View {
 
     private func zeroStateSuggestions() -> [Suggestion] {
         let recentTabs = state.allTabs
-            .filter { $0 !== state.selectedTab }
+            .filter { $0 !== state.selectedTab && !$0.showsNewTabPage }
             .sorted { $0.lastActive > $1.lastActive }
             .prefix(4)
         var items = recentTabs.map { tab in
@@ -482,7 +475,7 @@ struct CommandBarView: View {
         // In a split, only the current space's tabs can go beside this one.
         let candidates = mode == .splitTab ? state.allTabs.filter { state.canSplit(with: $0) } : state.allTabs
         let openTabs = !settings.search.openTabSuggestions ? [] : candidates.filter { tab in
-            tab !== state.selectedTab
+            tab !== state.selectedTab && !tab.showsNewTabPage
                 && (tab.displayTitle.lowercased().contains(needle) || (tab.url?.absoluteString.lowercased().contains(needle) ?? false))
         }
         for tab in openTabs.prefix(2) {
