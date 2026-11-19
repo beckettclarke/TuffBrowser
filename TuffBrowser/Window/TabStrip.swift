@@ -1,3 +1,4 @@
+import Observation
 import SwiftUI
 
 // MARK: - Horizontal layout chrome
@@ -298,17 +299,19 @@ struct CompactStripTab: View {
 /// the folder, shows beside it so the page showing is never missing from the strip.
 struct StripFolder: View {
     @Environment(BrowserState.self) private var state
+    @Environment(StripDropdownController.self) private var dropdown
     let folder: Folder
     let space: Space
     let selectedID: UUID?
     @State private var hovering = false
-    @State private var showingMenu = false
 
     var body: some View {
         let showing = folder.tabs.first { $0.id == selectedID }
+        let menuID = StripDropdownController.ID.folder(folder.id)
+        let showingMenu = dropdown.open == menuID
         HStack(spacing: TabStrip.gap) {
             Button {
-                showingMenu.toggle()
+                dropdown.toggle(menuID)
             } label: {
                 HStack(spacing: 6) {
                     Image(systemName: "folder.fill")
@@ -327,49 +330,56 @@ struct StripFolder: View {
             }
             .buttonStyle(.plain)
             .fixedSize()
-            .popover(isPresented: $showingMenu, arrowEdge: .bottom) {
-                StripPopoverMenu(width: 260) {
-                    ForEach(folder.tabs) { tab in
-                        StripMenuRow(
-                            title: tab.displayTitle,
-                            symbol: tab.favicon == nil ? (tab.url == nil ? "plus.square.dashed" : "globe") : nil,
-                            image: tab.favicon,
-                            checked: tab.id == selectedID
-                        ) {
-                            closeThen { state.select(tab) }
-                        }
-                    }
-                    if folder.tabs.isEmpty {
-                        StripMenuRow(title: "Empty folder", symbol: "folder", disabled: true) {}
-                    }
-                    StripMenuDivider()
-                    StripMenuRow(title: "Rename…", symbol: "pencil") {
-                        closeThen {
-                            Task { @MainActor in
-                                var prompt = Prompt(symbol: "folder.fill", title: "Rename Folder", confirmTitle: "Rename", fields: [Prompt.Field(placeholder: "Folder name", text: folder.name)])
-                                prompt.browser = state
-                                let result = await PromptPresenter.ask(prompt)
-                                if result.confirmed, let name = result.fields.first { state.rename(folder, to: name) }
-                            }
-                        }
-                    }
-                    StripMenuRow(title: "Delete Folder", symbol: "trash", destructive: true) {
-                        closeThen { state.delete(folder) }
-                    }
-                }
-            }
+            .anchorPreference(key: StripDropdownAnchorKey.self, value: .bounds) { [menuID: $0] }
             .onHover { hovering = $0 }
             .help(folder.name)
             .onDrop(of: [.text], delegate: FolderDropDelegate(folder: folder, space: space, state: state))
+            .onDisappear { if dropdown.open == menuID { dropdown.open = nil } }
 
             if let showing {
                 CompactStripTab(tab: showing, section: .pinned, selected: true, space: space, folder: folder)
             }
         }
     }
+}
+
+private struct FolderStripMenu: View {
+    @Environment(BrowserState.self) private var state
+    @Environment(StripDropdownController.self) private var dropdown
+    let folder: Folder
+
+    var body: some View {
+        ForEach(folder.tabs) { tab in
+            StripMenuRow(
+                title: tab.displayTitle,
+                symbol: tab.favicon == nil ? (tab.url == nil ? "plus.square.dashed" : "globe") : nil,
+                image: tab.favicon,
+                checked: tab.id == state.currentSpace.selectedTabID
+            ) {
+                closeThen { state.select(tab) }
+            }
+        }
+        if folder.tabs.isEmpty {
+            StripMenuRow(title: "Empty folder", symbol: "folder", disabled: true) {}
+        }
+        StripMenuDivider()
+        StripMenuRow(title: "Rename…", symbol: "pencil") {
+            closeThen {
+                Task { @MainActor in
+                    var prompt = Prompt(symbol: "folder.fill", title: "Rename Folder", confirmTitle: "Rename", fields: [Prompt.Field(placeholder: "Folder name", text: folder.name)])
+                    prompt.browser = state
+                    let result = await PromptPresenter.ask(prompt)
+                    if result.confirmed, let name = result.fields.first { state.rename(folder, to: name) }
+                }
+            }
+        }
+        StripMenuRow(title: "Delete Folder", symbol: "trash", destructive: true) {
+            closeThen { state.delete(folder) }
+        }
+    }
 
     private func closeThen(_ action: @escaping () -> Void) {
-        showingMenu = false
+        dropdown.open = nil
         DispatchQueue.main.async(execute: action)
     }
 }
@@ -377,11 +387,13 @@ struct StripFolder: View {
 /// A popover list in the strip's style (folders, spaces, the bookmarks bar's folders).
 struct StripPopoverMenu<Content: View>: View {
     let width: CGFloat
+    let maxHeight: CGFloat
     let content: Content
     @State private var contentHeight: CGFloat = 0
 
-    init(width: CGFloat, @ViewBuilder content: () -> Content) {
+    init(width: CGFloat, maxHeight: CGFloat = 360, @ViewBuilder content: () -> Content) {
         self.width = width
+        self.maxHeight = maxHeight
         self.content = content()
     }
 
@@ -393,7 +405,7 @@ struct StripPopoverMenu<Content: View>: View {
         }
         .scrollIndicators(.never)
         .frame(width: width)
-        .frame(height: min(max(contentHeight, 1), 360))
+        .frame(height: min(max(contentHeight, 1), maxHeight))
     }
 }
 
@@ -455,7 +467,7 @@ struct StripMenuRow: View {
             .padding(.horizontal, 9)
             .frame(height: 30)
             .background(
-                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                RoundedRectangle(cornerRadius: 7, style: .continuous)
                     .fill(checked ? accent.opacity(hovering ? 0.24 : 0.16) : .primary.opacity(hovering && !disabled ? 0.09 : 0))
             )
             .contentShape(Rectangle())
@@ -580,13 +592,15 @@ struct HorizontalToolbar: View {
 /// The space on screen, as a button that switches to another.
 private struct SpaceMenuButton: View {
     @Environment(BrowserState.self) private var state
+    @Environment(StripDropdownController.self) private var dropdown
     @State private var hovering = false
-    @State private var showingMenu = false
 
     var body: some View {
         let current = state.currentSpace
+        let menuID = StripDropdownController.ID.spaces
+        let showingMenu = dropdown.open == menuID
         Button {
-            showingMenu.toggle()
+            dropdown.toggle(menuID)
         } label: {
             HStack(spacing: 5) {
                 Image(systemName: current.icon)
@@ -606,32 +620,176 @@ private struct SpaceMenuButton: View {
         .background(SpaceScrollCatcher { [weak state] offset in
             state?.switchSpace(by: offset)
         })
-        .popover(isPresented: $showingMenu, arrowEdge: .bottom) {
-            StripPopoverMenu(width: 232) {
-                ForEach(Array(state.spaces.enumerated()), id: \.element.id) { index, space in
-                    StripMenuRow(
-                        title: space.name,
-                        symbol: space.icon,
-                        shortcut: index < 9 ? "⌃\(index + 1)" : nil,
-                        checked: index == state.currentSpaceIndex
-                    ) {
-                        closeThen { state.switchSpace(to: index) }
-                    }
-                }
-                StripMenuDivider()
-                StripMenuRow(title: "New Space", symbol: "plus") {
-                    closeThen { state.addSpace() }
-                }
-            }
-        }
+        .anchorPreference(key: StripDropdownAnchorKey.self, value: .bounds) { [menuID: $0] }
         .onHover { hovering = $0 }
         .help("Switch Space  ⌃1–9 · Scroll left/right")
         .accessibilityHint("Scroll left or right to switch spaces")
+        .onDisappear { if dropdown.open == menuID { dropdown.open = nil } }
+    }
+}
+
+private struct SpaceStripMenu: View {
+    @Environment(BrowserState.self) private var state
+    @Environment(StripDropdownController.self) private var dropdown
+
+    var body: some View {
+        ForEach(Array(state.spaces.enumerated()), id: \.element.id) { index, space in
+            StripMenuRow(
+                title: space.name,
+                symbol: space.icon,
+                shortcut: index < 9 ? "⌃\(index + 1)" : nil,
+                checked: index == state.currentSpaceIndex
+            ) {
+                closeThen { state.switchSpace(to: index) }
+            }
+        }
+        StripMenuDivider()
+        StripMenuRow(title: "New Space", symbol: "plus") {
+            closeThen { state.addSpace() }
+        }
     }
 
     private func closeThen(_ action: @escaping () -> Void) {
-        showingMenu = false
+        dropdown.open = nil
         DispatchQueue.main.async(execute: action)
+    }
+}
+
+@Observable
+final class StripDropdownController {
+    enum ID: Hashable {
+        case spaces
+        case folder(UUID)
+    }
+
+    var open: ID?
+
+    func toggle(_ id: ID) {
+        open = open == id ? nil : id
+    }
+}
+
+struct StripDropdownAnchorKey: PreferenceKey {
+    static var defaultValue: [StripDropdownController.ID: Anchor<CGRect>] = [:]
+
+    static func reduce(value: inout [StripDropdownController.ID: Anchor<CGRect>], nextValue: () -> [StripDropdownController.ID: Anchor<CGRect>]) {
+        value.merge(nextValue()) { $1 }
+    }
+}
+
+struct StripDropdownLayer: View {
+    @Environment(BrowserState.self) private var state
+    @Environment(AppSettings.self) private var settings
+    let controller: StripDropdownController
+    let anchors: [StripDropdownController.ID: Anchor<CGRect>]
+    @State private var cardFrame: CGRect = .zero
+
+    var body: some View {
+        GeometryReader { geo in
+            if let open = controller.open, let anchor = anchors[open] {
+                let button = geo[anchor]
+                let width: CGFloat = open == .spaces ? 232 : 260
+                let x = max(8, min(button.midX - width / 2, geo.size.width - width - 8))
+                let top = button.maxY + 6
+                let maxHeight = max(120, min(360, geo.size.height - top - 10))
+                ZStack(alignment: .topLeading) {
+                    Color.black.opacity(0.001)
+                        .contentShape(Rectangle())
+                        .onTapGesture { controller.open = nil }
+                    menu(open, width: width, maxHeight: maxHeight)
+                        .offset(x: x, y: top)
+                        .onGeometryChange(for: CGSize.self) { $0.size } action: { cardFrame = CGRect(origin: CGPoint(x: x, y: top), size: $0) }
+                        .transition(.scale(scale: 0.96, anchor: .top).combined(with: .opacity))
+                        .id(open)
+                }
+                .background(StripDropdownDismissal(cardFrame: cardFrame, buttonFrame: button) {
+                    controller.open = nil
+                })
+                .onExitCommand { controller.open = nil }
+            }
+        }
+        .animation(settings.animationsEnabled ? Motion.snappy : nil, value: controller.open)
+        .onDisappear { controller.open = nil }
+    }
+
+    @ViewBuilder
+    private func menu(_ id: StripDropdownController.ID, width: CGFloat, maxHeight: CGFloat) -> some View {
+        switch id {
+        case .spaces:
+            card(width: width, maxHeight: maxHeight) { SpaceStripMenu() }
+        case .folder(let id):
+            if let folder = state.spaces.flatMap({ $0.folders }).first(where: { $0.id == id }) {
+                card(width: width, maxHeight: maxHeight) { FolderStripMenu(folder: folder) }
+            }
+        }
+    }
+
+    private func card<Content: View>(width: CGFloat, maxHeight: CGFloat, @ViewBuilder content: () -> Content) -> some View {
+        let shape = RoundedRectangle(cornerRadius: 12, style: .continuous)
+        return StripPopoverMenu(width: width, maxHeight: maxHeight, content: content)
+            .background(shape.fill(.regularMaterial))
+            .overlay(shape.strokeBorder(.primary.opacity(0.14), lineWidth: 0.5))
+            .clipShape(shape)
+            .modifier(CardShadow(cornerRadius: 12, opacity: 0.32, radius: 16, y: 6, hollow: true))
+    }
+}
+
+private struct StripDropdownDismissal: NSViewRepresentable {
+    let cardFrame: CGRect
+    let buttonFrame: CGRect
+    let close: () -> Void
+
+    func makeNSView(context: Context) -> StripDropdownDismissalView {
+        let view = StripDropdownDismissalView()
+        view.update(cardFrame: cardFrame, buttonFrame: buttonFrame, close: close)
+        return view
+    }
+
+    func updateNSView(_ view: StripDropdownDismissalView, context: Context) {
+        view.update(cardFrame: cardFrame, buttonFrame: buttonFrame, close: close)
+    }
+}
+
+private final class StripDropdownDismissalView: NSView {
+    private var cardFrame: CGRect = .zero
+    private var buttonFrame: CGRect = .zero
+    private var close: (() -> Void)?
+    private var monitor: Any?
+
+    func update(cardFrame: CGRect, buttonFrame: CGRect, close: @escaping () -> Void) {
+        self.cardFrame = cardFrame
+        self.buttonFrame = buttonFrame
+        self.close = close
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if window == nil {
+            if let monitor {
+                NSEvent.removeMonitor(monitor)
+                self.monitor = nil
+            }
+        } else if monitor == nil {
+            monitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .keyDown]) { [weak self] event in
+                guard let self, event.window === self.window else { return event }
+                if event.type == .keyDown {
+                    guard event.keyCode == 53 else { return event }
+                    close?()
+                    return nil
+                }
+                let location = convert(event.locationInWindow, from: nil)
+                let point = CGPoint(x: location.x, y: bounds.height - location.y)
+                guard !cardFrame.contains(point), !buttonFrame.contains(point) else { return event }
+                close?()
+                return nil
+            }
+        }
+    }
+
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    deinit {
+        if let monitor { NSEvent.removeMonitor(monitor) }
     }
 }
 

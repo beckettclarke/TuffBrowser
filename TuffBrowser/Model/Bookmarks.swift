@@ -245,16 +245,21 @@ extension BrowserState {
 
     var canBookmarkCurrentPage: Bool { Bookmark.canSave(selectedTab?.url) && bookmarksProfileID != nil }
 
-    /// ⇧⌘D and the star in the address bar: bookmarks the page, or edits its bookmark.
+    /// ⇧⌘D and the star in the address bar: bookmarks the page and asks for its name (as
+    /// Chrome's bubble does), or edits the bookmark it already has.
     func bookmarkCurrentPage() {
         guard let tab = selectedTab, let url = tab.url, Bookmark.canSave(url), let profile = bookmarksProfileID else { return }
         if let existing = BookmarkStore.shared.bookmark(for: url, profile: profile) {
             Task { @MainActor in await self.edit(existing) }
             return
         }
-        BookmarkStore.shared.add(url: url, title: tab.displayTitle, profile: profile)
-        let hint = tabLayout == .horizontal && !bookmarksBarShowing ? " · ⇧⌘B shows the bar" : ""
-        show(Toast(symbol: "star.fill", text: "Bookmarked" + hint))
+        let added = BookmarkStore.shared.add(url: url, title: tab.displayTitle, profile: profile)
+        Task { @MainActor in
+            guard await self.edit(added, justAdded: true) else { return }
+            if self.tabLayout == .horizontal, !self.bookmarksBarShowing {
+                self.show(Toast(symbol: "star.fill", text: "Bookmarked · ⇧⌘B shows the bar"))
+            }
+        }
     }
 
     func bookmark(_ tab: Tab, into folder: UUID? = nil, at index: Int? = nil) {
@@ -285,14 +290,19 @@ extension BrowserState {
     }
 
     /// Edits a bookmark's name and address (a folder's name) on a card, which can also remove it.
+    /// `justAdded`: the page was bookmarked a moment ago; the card names it, and leaving it with
+    /// Esc keeps the bookmark as it is. Returns false when the bookmark was removed.
     @MainActor
-    func edit(_ bookmark: Bookmark) async {
-        guard let profile = bookmarksProfileID else { return }
+    @discardableResult
+    func edit(_ bookmark: Bookmark, justAdded: Bool = false) async -> Bool {
+        guard let profile = bookmarksProfileID else { return true }
         var prompt = Prompt(
             symbol: bookmark.isFolder ? "folder.fill" : "star.fill",
-            title: bookmark.isFolder ? "Rename Folder" : "Edit Bookmark",
-            confirmTitle: "Save"
+            title: bookmark.isFolder ? "Rename Folder" : (justAdded ? "Bookmark Added" : "Edit Bookmark"),
+            confirmTitle: justAdded ? "Done" : "Save"
         )
+        // Nothing to cancel: the page is already bookmarked, and Remove undoes it.
+        if justAdded { prompt.cancelTitle = nil }
         prompt.browser = self
         if bookmark.isFolder {
             prompt.fields = [Prompt.Field(placeholder: "Folder name", text: bookmark.title)]
@@ -310,13 +320,14 @@ extension BrowserState {
         if result.alternate {
             BookmarkStore.shared.remove(bookmark.id, profile: profile)
             show(Toast(symbol: "star.slash", text: "Bookmark removed"))
-            return
+            return false
         }
-        guard result.confirmed else { return }
+        guard result.confirmed else { return true }
         let title = result.fields.first ?? bookmark.title
         let address = result.fields.count > 1 ? result.fields[1].trimmed : ""
         let url = address.isEmpty ? bookmark.url : Self.resolve(address, engine: AppSettings.shared.general.searchEngine)
         BookmarkStore.shared.update(bookmark.id, title: title, url: url, profile: profile)
+        return true
     }
 
     /// Asks for a name, then adds an empty folder at the end of the bar (or at `index`).

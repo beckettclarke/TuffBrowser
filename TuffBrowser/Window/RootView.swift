@@ -7,6 +7,7 @@ struct RootView: View {
     @Environment(AppSettings.self) private var settings
     /// Where the horizontal toolbar's address bar is (see `URLPillFrameKey`).
     @State private var pillFrame: CGRect = .zero
+    @State private var stripDropdown = StripDropdownController()
 
     /// The coordinate space the address bar's frame is measured in.
     static let space = "tuff.root"
@@ -102,7 +103,14 @@ struct RootView: View {
             }
         }
         .coordinateSpace(name: Self.space)
+        .overlayPreferenceValue(StripDropdownAnchorKey.self) { anchors in
+            if horizontal {
+                StripDropdownLayer(controller: stripDropdown, anchors: anchors)
+                    .zIndex(9)
+            }
+        }
         .onPreferenceChange(URLPillFrameKey.self) { pillFrame = $0 }
+        .environment(stripDropdown)
         .environment(\.accent, Color(nsColor: state.currentTint.derivedAccent))
         .animation(settings.animationsEnabled ? Motion.snappy : nil, value: horizontal)
         .animation(settings.animationsEnabled ? Motion.snappy : nil, value: state.bookmarksBarShowing)
