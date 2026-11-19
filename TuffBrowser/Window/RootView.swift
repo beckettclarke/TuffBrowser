@@ -20,6 +20,7 @@ struct RootView: View {
         let docked = state.sidebarVisible && !horizontal
         let shown = docked || (state.sidebarPeeking && !horizontal)
         let chromeHeight = BrowserWindowController.tabStripHeight + BrowserWindowController.toolbarHeight
+            + (state.bookmarksBarShowing ? BrowserWindowController.bookmarksBarHeight : 0)
 
         ZStack(alignment: .topLeading) {
             WindowBackground(tint: Color(nsColor: state.currentTint), theme: theme)
@@ -104,6 +105,7 @@ struct RootView: View {
         .onPreferenceChange(URLPillFrameKey.self) { pillFrame = $0 }
         .environment(\.accent, Color(nsColor: state.currentTint.derivedAccent))
         .animation(settings.animationsEnabled ? Motion.snappy : nil, value: horizontal)
+        .animation(settings.animationsEnabled ? Motion.snappy : nil, value: state.bookmarksBarShowing)
         .ignoresSafeArea()
     }
 }

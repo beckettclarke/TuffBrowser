@@ -171,6 +171,14 @@ enum MainMenu {
         ])
         historyMenu.delegate = HistoryMenuFiller.shared
 
+        // Bookmarks (the bookmarks themselves are filled in as it opens)
+        let bookmarksMenu = submenu("Bookmarks", [
+            item("Bookmark This Page", #selector(AppDelegate.bookmarkPage(_:)), "d", [.command, .shift]),
+            item("Show Bookmarks Bar", #selector(AppDelegate.toggleBookmarksBar(_:)), "b", [.command, .shift]),
+            item("New Bookmark Folder…", #selector(AppDelegate.newBookmarkFolder(_:))),
+        ])
+        bookmarksMenu.delegate = BookmarksMenuFiller.shared
+
         // Tabs
         var tabItems: [NSMenuItem] = [
             item("Next Tab", #selector(AppDelegate.nextTab(_:)), "\t", [.control]),

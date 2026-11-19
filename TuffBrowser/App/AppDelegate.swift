@@ -441,6 +441,7 @@ extension AppDelegate: NSApplicationDelegate {
         } else {
             HistoryStore.shared.saveNow(synchronously: true)
         }
+        BookmarkStore.shared.saveNow(synchronously: true)
         DownloadManager.shared.saveNow(quitting: true)
         TorrentSession.shared.shutdown()
     }

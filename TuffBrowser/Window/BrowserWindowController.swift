@@ -39,6 +39,8 @@ final class BrowserWindowController: NSObject {
     static let tabStripHeight: CGFloat = 40
     /// Height of the toolbar (back / forward, address) under the tab strip.
     static let toolbarHeight: CGFloat = 40
+    /// Height of the bookmarks bar under the toolbar, when it is showing.
+    static let bookmarksBarHeight: CGFloat = 30
     /// Gap between the window edge and the sidebar when it floats over the page (peeking).
     static let floatingSidebarMargin: CGFloat = 6
     /// Leading inset of the close button when the sidebar is docked.

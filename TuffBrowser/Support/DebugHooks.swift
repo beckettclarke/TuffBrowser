@@ -94,6 +94,22 @@ enum DebugHooks {
             if let url = URL(string: argument) { state.newTab(url: url) }
         case "history":
             state.showHistory()
+        case "bookmark":
+            // bookmark — bookmarks the page on screen; bookmark folder <name>; bookmark bar on|off;
+            // bookmark list
+            let words = argument.split(separator: " ", maxSplits: 1).map(String.init)
+            let profile = state.bookmarksProfileID
+            switch words.first {
+            case "folder":
+                if let profile { BookmarkStore.shared.addFolder(named: words.count > 1 ? words[1] : "Folder", profile: profile) }
+            case "bar":
+                AppSettings.shared.tabs.showBookmarksBar = words.count > 1 && words[1] == "on"
+            case "list":
+                let items = profile.map { BookmarkStore.shared.items(for: $0) } ?? []
+                log("bookmarks \(items.map { $0.isFolder ? "[\($0.displayTitle): \($0.children.count)]" : $0.displayTitle })")
+            default:
+                state.bookmarkCurrentPage()
+            }
         case "import":
             // import <browser id> [history,bookmarks,spaces] — e.g. "import zen spaces"
             let words = argument.split(separator: " ").map(String.init)

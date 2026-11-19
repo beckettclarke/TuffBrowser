@@ -68,6 +68,8 @@ final class BrowserState {
     var splitDropTargetID: UUID?
     /// A folder being dragged within its space's pinned section.
     var draggingFolder: Folder?
+    /// A bookmark being dragged along the bookmarks bar.
+    var draggingBookmarkID: UUID?
     var editingSpaceID: UUID?
     /// The folder whose name is being edited in the sidebar.
     var renamingFolderID: UUID?
@@ -1254,6 +1256,7 @@ final class BrowserState {
             for tab in space.allPinned + space.tabs { tab.moveToDataStore(fallback.dataStore) }
         }
         animate { profiles.removeAll { $0 === profile } }
+        if !isPrivate { BookmarkStore.shared.moveAll(from: profile.id, to: fallback.id) }
         if !profile.usesSharedStore, !profile.isPrivate { DataStores.removeStore(forProfile: profile.id) }
         ext?.profileDeleted(profile.id)
         if let containerInfo { ExtensionContainers.shared.profileRemoved(containerInfo) }

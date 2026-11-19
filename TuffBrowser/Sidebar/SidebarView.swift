@@ -66,6 +66,7 @@ struct TopControls: View {
 struct URLPill: View {
     @Environment(BrowserState.self) private var state
     @Environment(ExtensionManager.self) private var extensions
+    @Environment(\.accent) private var accent
     var height: CGFloat = 36
     @State private var hovering = false
 
@@ -137,6 +138,19 @@ struct URLPill: View {
                     }
                     .transition(.opacity.combined(with: .scale(scale: 0.8)))
                 }
+                // Bookmarks are part of the horizontal layout only (as in Chrome); the vertical
+                // one keeps them out of sight.
+                if state.tabLayout == .horizontal, state.canBookmarkCurrentPage {
+                    let bookmarked = state.currentBookmark != nil
+                    PillButton(
+                        symbol: bookmarked ? "star.fill" : "star", size: 11.5, side: height > 32 ? 24 : 22,
+                        help: bookmarked ? "Edit Bookmark  ⇧⌘D" : "Bookmark This Page  ⇧⌘D",
+                        tint: bookmarked ? accent : nil
+                    ) {
+                        state.bookmarkCurrentPage()
+                    }
+                    .contentTransition(.symbolEffect(.replace))
+                }
             }
         }
         .padding(.leading, 12)
@@ -182,6 +196,8 @@ struct PillButton: View {
     var side: CGFloat = 22
     var help = ""
     var active = false
+    /// Colours the symbol (a bookmarked page's star) instead of the usual grey.
+    var tint: Color?
     let action: () -> Void
     @State private var hovering = false
 
@@ -189,7 +205,7 @@ struct PillButton: View {
         Button(action: action) {
             Image(systemName: symbol)
                 .font(.system(size: size, weight: .semibold))
-                .foregroundStyle(.primary.opacity(hovering || active ? 0.9 : 0.6))
+                .foregroundStyle(tint.map(AnyShapeStyle.init) ?? AnyShapeStyle(.primary.opacity(hovering || active ? 0.9 : 0.6)))
                 .frame(width: side, height: side)
                 .background(
                     RoundedRectangle(cornerRadius: 7, style: .continuous)
@@ -953,6 +969,7 @@ func endSidebarDrag(_ state: BrowserState) -> Bool {
     withAnimation(Motion.quick) {
         state.draggingTab = nil
         state.draggingFolder = nil
+        state.draggingBookmarkID = nil
         state.splitDropTargetID = nil
     }
     return true

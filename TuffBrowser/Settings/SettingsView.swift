@@ -751,6 +751,18 @@ struct LayoutPage: View {
                 }
             }
 
+            SettingsGroup(
+                title: "Bookmarks",
+                footer: "Bookmark a page with ⇧⌘D. The vertical layout keeps bookmarks out of sight: find them in the Bookmarks menu, or type part of a name in the command bar."
+            ) {
+                SwitchRow(
+                    title: "Show the bookmarks bar",
+                    detail: "Under the address bar in the horizontal layout. ⇧⌘B shows or hides it.",
+                    isOn: $settings.tabs.showBookmarksBar
+                )
+                .disabled(settings.tabs.layout == .vertical && settings.tabs.incognitoLayout == .vertical)
+            }
+
             SettingsGroup(title: "Sidebar") {
                 SliderRow(title: "Width", value: $settings.general.sidebarWidth, range: 200...420, step: 1, format: { "\(Int($0)) pt" })
                 SwitchRow(
@@ -1016,6 +1028,7 @@ struct SearchPage: View {
                     .disabled(!hasSuggestions)
                 SwitchRow(title: "Pages from your history", isOn: $settings.search.historySuggestions)
                 SwitchRow(title: "Open tabs", detail: "Jump to a tab that’s already open instead of opening it again.", isOn: $settings.search.openTabSuggestions)
+                SwitchRow(title: "Bookmarks", isOn: $settings.search.bookmarkSuggestions)
             }
 
             SettingsGroup(title: "Bangs") {

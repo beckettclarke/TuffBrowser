@@ -5,12 +5,19 @@ import SwiftUI
 /// The top of the window in the horizontal layout: a row of tabs (with the traffic lights at
 /// its start), then a toolbar with back / forward, the address and the window's buttons.
 struct HorizontalChrome: View {
+    @Environment(BrowserState.self) private var state
+
     var body: some View {
         VStack(spacing: 0) {
             TabStrip()
                 .frame(height: BrowserWindowController.tabStripHeight)
             HorizontalToolbar()
                 .frame(height: BrowserWindowController.toolbarHeight)
+            if state.bookmarksBarShowing {
+                BookmarksBar()
+                    .frame(height: BrowserWindowController.bookmarksBarHeight)
+                    .transition(.opacity)
+            }
         }
         .background(WindowDragArea())
     }
@@ -39,6 +46,9 @@ struct TabStrip: View {
                 ForEach(favorites) { tab in
                     CompactStripTab(tab: tab, section: .favorites, selected: tab.id == selectedID, space: space)
                 }
+                if !favorites.isEmpty && !space.pinnedItems.isEmpty {
+                    StripSectionDivider()
+                }
                 ForEach(space.pinnedItems) { item in
                     switch item {
                     case .tab(let tab):
@@ -48,10 +58,7 @@ struct TabStrip: View {
                     }
                 }
                 if !favorites.isEmpty || !space.pinnedItems.isEmpty {
-                    Capsule()
-                        .fill(.primary.opacity(0.14))
-                        .frame(width: 1.5, height: 16)
-                        .padding(.horizontal, 2)
+                    StripSectionDivider()
                 }
                 RegularStripTabs(space: space, selectedID: selectedID)
             }
@@ -112,6 +119,15 @@ private struct RegularStripTabs: View {
                 row
             }
         }
+    }
+}
+
+private struct StripSectionDivider: View {
+    var body: some View {
+        Capsule()
+            .fill(.primary.opacity(0.14))
+            .frame(width: 1.5, height: 16)
+            .padding(.horizontal, 2)
     }
 }
 
@@ -286,34 +302,13 @@ struct StripFolder: View {
     let space: Space
     let selectedID: UUID?
     @State private var hovering = false
+    @State private var showingMenu = false
 
     var body: some View {
         let showing = folder.tabs.first { $0.id == selectedID }
         HStack(spacing: TabStrip.gap) {
-            Menu {
-                ForEach(folder.tabs) { tab in
-                    Button {
-                        state.select(tab)
-                    } label: {
-                        if let icon = tab.favicon {
-                            Label { Text(tab.displayTitle) } icon: { Image(nsImage: icon) }
-                        } else {
-                            Label(tab.displayTitle, systemImage: "globe")
-                        }
-                    }
-                }
-                if folder.tabs.isEmpty { Text("Empty folder") }
-                Divider()
-                Button("Rename…") {
-                    // Renaming happens in the sidebar's row; here, ask with a card.
-                    Task { @MainActor in
-                        var prompt = Prompt(symbol: "folder.fill", title: "Rename Folder", confirmTitle: "Rename", fields: [Prompt.Field(placeholder: "Folder name", text: folder.name)])
-                        prompt.browser = state
-                        let result = await PromptPresenter.ask(prompt)
-                        if result.confirmed, let name = result.fields.first { state.rename(folder, to: name) }
-                    }
-                }
-                Button("Delete Folder", role: .destructive) { state.delete(folder) }
+            Button {
+                showingMenu.toggle()
             } label: {
                 HStack(spacing: 6) {
                     Image(systemName: "folder.fill")
@@ -328,12 +323,41 @@ struct StripFolder: View {
                 }
                 .foregroundStyle(.primary.opacity(0.75))
                 .padding(.horizontal, 10)
-                .modifier(StripTile(selected: false, hovering: hovering))
+                .modifier(StripTile(selected: false, hovering: hovering || showingMenu))
             }
-            .menuStyle(.button)
             .buttonStyle(.plain)
-            .menuIndicator(.hidden)
             .fixedSize()
+            .popover(isPresented: $showingMenu, arrowEdge: .bottom) {
+                StripPopoverMenu(width: 260) {
+                    ForEach(folder.tabs) { tab in
+                        StripMenuRow(
+                            title: tab.displayTitle,
+                            symbol: tab.favicon == nil ? (tab.url == nil ? "plus.square.dashed" : "globe") : nil,
+                            image: tab.favicon,
+                            checked: tab.id == selectedID
+                        ) {
+                            closeThen { state.select(tab) }
+                        }
+                    }
+                    if folder.tabs.isEmpty {
+                        StripMenuRow(title: "Empty folder", symbol: "folder", disabled: true) {}
+                    }
+                    StripMenuDivider()
+                    StripMenuRow(title: "Rename…", symbol: "pencil") {
+                        closeThen {
+                            Task { @MainActor in
+                                var prompt = Prompt(symbol: "folder.fill", title: "Rename Folder", confirmTitle: "Rename", fields: [Prompt.Field(placeholder: "Folder name", text: folder.name)])
+                                prompt.browser = state
+                                let result = await PromptPresenter.ask(prompt)
+                                if result.confirmed, let name = result.fields.first { state.rename(folder, to: name) }
+                            }
+                        }
+                    }
+                    StripMenuRow(title: "Delete Folder", symbol: "trash", destructive: true) {
+                        closeThen { state.delete(folder) }
+                    }
+                }
+            }
             .onHover { hovering = $0 }
             .help(folder.name)
             .onDrop(of: [.text], delegate: FolderDropDelegate(folder: folder, space: space, state: state))
@@ -342,6 +366,115 @@ struct StripFolder: View {
                 CompactStripTab(tab: showing, section: .pinned, selected: true, space: space, folder: folder)
             }
         }
+    }
+
+    private func closeThen(_ action: @escaping () -> Void) {
+        showingMenu = false
+        DispatchQueue.main.async(execute: action)
+    }
+}
+
+/// A popover list in the strip's style (folders, spaces, the bookmarks bar's folders).
+struct StripPopoverMenu<Content: View>: View {
+    let width: CGFloat
+    let content: Content
+    @State private var contentHeight: CGFloat = 0
+
+    init(width: CGFloat, @ViewBuilder content: () -> Content) {
+        self.width = width
+        self.content = content()
+    }
+
+    var body: some View {
+        ScrollView(.vertical) {
+            VStack(spacing: 2) { content }
+                .padding(5)
+                .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { contentHeight = $0 }
+        }
+        .scrollIndicators(.never)
+        .frame(width: width)
+        .frame(height: min(max(contentHeight, 1), 360))
+    }
+}
+
+struct StripMenuRow: View {
+    @Environment(\.accent) private var accent
+    let title: String
+    var symbol: String?
+    var image: NSImage?
+    var shortcut: String?
+    var checked = false
+    var disabled = false
+    var destructive = false
+    /// A chevron at the end, for a row that opens a list of its own.
+    var disclosure = false
+    let action: () -> Void
+    @State private var hovering = false
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 9) {
+                Group {
+                    if let image {
+                        Image(nsImage: image)
+                            .resizable()
+                            .interpolation(.high)
+                            .clipShape(RoundedRectangle(cornerRadius: 3, style: .continuous))
+                    } else if let symbol {
+                        Image(systemName: symbol)
+                            .font(.system(size: 13, weight: .medium))
+                    } else {
+                        Color.clear
+                    }
+                }
+                .foregroundStyle(destructive ? Color.red : (checked ? accent : .primary.opacity(0.75)))
+                .frame(width: 18, height: 18)
+
+                Text(title)
+                    .font(.system(size: 13, weight: checked ? .semibold : .regular))
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                Spacer(minLength: 8)
+                if let shortcut {
+                    Text(shortcut)
+                        .font(.system(size: 11.5, weight: .medium, design: .rounded))
+                        .foregroundStyle(.secondary)
+                }
+                if checked {
+                    Image(systemName: "checkmark")
+                        .font(.system(size: 11, weight: .bold))
+                        .foregroundStyle(accent)
+                }
+                if disclosure {
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 10, weight: .bold))
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .foregroundStyle(destructive ? Color.red : .primary)
+            .padding(.horizontal, 9)
+            .frame(height: 30)
+            .background(
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .fill(checked ? accent.opacity(hovering ? 0.24 : 0.16) : .primary.opacity(hovering && !disabled ? 0.09 : 0))
+            )
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(disabled)
+        .opacity(disabled ? 0.38 : 1)
+        .onHover { hovering = $0 }
+        .animation(Motion.quick, value: hovering)
+    }
+}
+
+struct StripMenuDivider: View {
+    var body: some View {
+        Rectangle()
+            .fill(.primary.opacity(0.1))
+            .frame(height: 0.5)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
     }
 }
 
@@ -448,17 +581,12 @@ struct HorizontalToolbar: View {
 private struct SpaceMenuButton: View {
     @Environment(BrowserState.self) private var state
     @State private var hovering = false
+    @State private var showingMenu = false
 
     var body: some View {
         let current = state.currentSpace
-        Menu {
-            ForEach(Array(state.spaces.enumerated()), id: \.element.id) { index, space in
-                Toggle(isOn: Binding(get: { index == state.currentSpaceIndex }, set: { _ in state.switchSpace(to: index) })) {
-                    Label(space.name, systemImage: space.icon)
-                }
-            }
-            Divider()
-            Button("New Space") { state.addSpace() }
+        Button {
+            showingMenu.toggle()
         } label: {
             HStack(spacing: 5) {
                 Image(systemName: current.icon)
@@ -467,18 +595,124 @@ private struct SpaceMenuButton: View {
                     .font(.system(size: 12, weight: .semibold))
                     .lineLimit(1)
             }
-            .foregroundStyle(.primary.opacity(hovering ? 0.9 : 0.62))
+            .foregroundStyle(.primary.opacity(hovering || showingMenu ? 0.9 : 0.62))
             .padding(.horizontal, 9)
             .frame(height: 28)
-            .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(.primary.opacity(hovering ? 0.1 : 0)))
+            .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(.primary.opacity(hovering || showingMenu ? 0.1 : 0)))
             .contentShape(Rectangle())
         }
-        .menuStyle(.button)
         .buttonStyle(.plain)
-        .menuIndicator(.hidden)
         .fixedSize()
+        .background(SpaceScrollCatcher { [weak state] offset in
+            state?.switchSpace(by: offset)
+        })
+        .popover(isPresented: $showingMenu, arrowEdge: .bottom) {
+            StripPopoverMenu(width: 232) {
+                ForEach(Array(state.spaces.enumerated()), id: \.element.id) { index, space in
+                    StripMenuRow(
+                        title: space.name,
+                        symbol: space.icon,
+                        shortcut: index < 9 ? "⌃\(index + 1)" : nil,
+                        checked: index == state.currentSpaceIndex
+                    ) {
+                        closeThen { state.switchSpace(to: index) }
+                    }
+                }
+                StripMenuDivider()
+                StripMenuRow(title: "New Space", symbol: "plus") {
+                    closeThen { state.addSpace() }
+                }
+            }
+        }
         .onHover { hovering = $0 }
-        .help("Switch Space  ⌃1–9")
+        .help("Switch Space  ⌃1–9 · Scroll left/right")
+        .accessibilityHint("Scroll left or right to switch spaces")
+    }
+
+    private func closeThen(_ action: @escaping () -> Void) {
+        showingMenu = false
+        DispatchQueue.main.async(execute: action)
+    }
+}
+
+private struct SpaceScrollCatcher: NSViewRepresentable {
+    let onSwitch: (Int) -> Void
+
+    func makeNSView(context: Context) -> SpaceScrollView {
+        let view = SpaceScrollView()
+        view.onSwitch = onSwitch
+        return view
+    }
+
+    func updateNSView(_ view: SpaceScrollView, context: Context) {
+        view.onSwitch = onSwitch
+    }
+}
+
+private final class SpaceScrollView: NSView {
+    var onSwitch: ((Int) -> Void)?
+    private var monitor: Any?
+    private var accumulated: CGFloat = 0
+    private var switched = false
+    private var lastDiscreteScroll: TimeInterval = 0
+    private var lastDiscreteSwitch: TimeInterval = -.infinity
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if window == nil {
+            if let monitor {
+                NSEvent.removeMonitor(monitor)
+                self.monitor = nil
+            }
+        } else if monitor == nil {
+            monitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { [weak self] event in
+                guard let self, event.window === self.window else { return event }
+                let point = convert(event.locationInWindow, from: nil)
+                guard bounds.contains(point) else { return event }
+                consume(event)
+                return nil
+            }
+        }
+    }
+
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    deinit {
+        if let monitor { NSEvent.removeMonitor(monitor) }
+    }
+
+    private func consume(_ event: NSEvent) {
+        guard event.momentumPhase == [] else { return }
+        if event.phase == .began || event.phase == .mayBegin {
+            accumulated = 0
+            switched = false
+        }
+        if event.phase == .ended || event.phase == .cancelled {
+            accumulated = 0
+            switched = false
+            return
+        }
+
+        let delta = event.scrollingDeltaX
+        guard abs(delta) > 0, abs(delta) >= abs(event.scrollingDeltaY) else { return }
+        if event.phase == [] {
+            let now = event.timestamp
+            if now - lastDiscreteScroll > 0.18 { accumulated = 0 }
+            lastDiscreteScroll = now
+            accumulated += delta
+            let threshold: CGFloat = event.hasPreciseScrollingDeltas ? 18 : 1
+            if abs(accumulated) >= threshold, now - lastDiscreteSwitch > 0.3 {
+                onSwitch?(accumulated < 0 ? 1 : -1)
+                accumulated = 0
+                lastDiscreteSwitch = now
+            }
+        } else if !switched {
+            accumulated += delta
+            if abs(accumulated) >= 24 {
+                switched = true
+                onSwitch?(accumulated < 0 ? 1 : -1)
+            }
+        }
     }
 }
 

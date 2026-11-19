@@ -176,6 +176,7 @@ enum SettingsSearch {
         // Layout
         .row("Main browsing", .layout, in: "Tabs", named: "Tab position", "vertical horizontal tabs sidebar top tab bar layout"),
         .row("Incognito", .layout, in: "Tabs", named: "Tab position in Incognito", "private vertical horizontal tabs layout"),
+        .row("Show the bookmarks bar", .layout, in: "Bookmarks", named: "Bookmarks bar", "bookmarks bar favourites toolbar star saved pages"),
         .row("Width", .layout, in: "Sidebar", named: "Sidebar width", "size wide narrow"),
         .row("Show when the pointer reaches the edge", .layout, in: "Sidebar", named: "Show the hidden sidebar at the edge",
              "peek hover float sidebar auto hide"),
@@ -201,6 +202,7 @@ enum SettingsSearch {
         .row("Search suggestions", .search, in: "Suggestions in the command bar", "autocomplete address bar"),
         .row("Pages from your history", .search, in: "Suggestions in the command bar", "history suggestions autocomplete"),
         .row("Open tabs", .search, in: "Suggestions in the command bar", named: "Suggest open tabs", "switch to tab"),
+        .row("Bookmarks", .search, in: "Suggestions in the command bar", named: "Suggest bookmarks", "bookmark saved pages star"),
         // Bangs are listed once, under Mods where they're switched on and set up; the Search page
         // only links there.
 

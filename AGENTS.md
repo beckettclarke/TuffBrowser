@@ -61,6 +61,25 @@
   next version.
 - Flint reads releases without authentication, so the repo must be public for updates to be found.
 
+## Changelogs
+
+Use concise sentences that users can understand. Focus on the visible improvement, not implementation details.
+
+Examples:
+- Redesigned app icon
+- New space selector dropdown in horizontal tabs mode
+- Added onboarding screen
+- Revamped adblocker
+
+## Bookmarks
+
+- `Model/Bookmarks.swift`: `BookmarkStore` keeps each profile's bookmarks (folders nest) in
+  `bookmarks.json`; Incognito windows use the main window's. The `BrowserState` extension there has
+  the actions (⇧⌘D bookmark / edit, open, edit, delete), all through `Prompt`.
+- The bar (`Window/BookmarksBar.swift`) and the address bar's star exist only in the horizontal
+  layout (`settings.tabs.showBookmarksBar`, ⇧⌘B, off by default). The vertical layout shows no
+  bookmarks UI: the Bookmarks menu (`App/BookmarksMenu.swift`) and command bar results find them.
+
 ## Downloads and torrents
 
 - `tuff://downloads` (⌥⌘L) is an HTML page like History: `Downloads/DownloadsPageTemplate.swift`

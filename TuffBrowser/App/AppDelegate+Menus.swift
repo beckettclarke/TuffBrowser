@@ -139,6 +139,7 @@ extension AppDelegate {
             ("rectangle.split.2x1", "⌘\\  Split view · ⌥⌘\\  Switch side"),
             ("rectangle.stack", "⌘1–9  Tabs · ⌃1–9  Spaces · ⌥⌘←/→  Switch space"),
             ("pin", "⌘D  Pin tab · ⇧⌘M  Mute tab"),
+            ("star", "⇧⌘D  Bookmark page · ⇧⌘B  Bookmarks bar"),
             ("text.magnifyingglass", "⌘F  Find · ⌘G / ⇧⌘G  Next / previous match"),
             ("arrow.down.circle", "⌥⌘L  Downloads · ⌘Y  History"),
             ("chevron.left.forwardslash.chevron.right", "⌥⌘U  View source · ⌥⌘I  Web Inspector"),
@@ -173,7 +174,7 @@ extension AppDelegate {
         case #selector(clearHistory(_:)):
             return HistoryStore.shared.count(profileID: state.currentProfile.id) > 0 || state.hasClosedTabs
         default:
-            return true
+            return validateBookmarkMenuItem(menuItem)
         }
     }
 }

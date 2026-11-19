@@ -5,6 +5,7 @@ struct Suggestion: Identifiable, Equatable {
         case go(URL)
         case search(String)
         case history(URL)
+        case bookmark(URL)
         case tab(UUID)
         /// Text for an extension's omnibox keyword (`chrome.omnibox`).
         case keyword(String)
@@ -359,7 +360,7 @@ struct CommandBarView: View {
         }
         state.closeCommandBar()
         switch item.kind {
-        case .go(let url), .history(let url):
+        case .go(let url), .history(let url), .bookmark(let url):
             state.open(url: url, mode: mode)
         case .search(let query):
             let url = activeBang?.bang.url(for: query) ?? settings.general.searchEngine.searchURL(for: query)
@@ -499,7 +500,18 @@ struct CommandBarView: View {
             }
         }
 
-        let openURLs = Set(openTabs.prefix(2).compactMap { $0.url?.absoluteString })
+        var openURLs = Set(openTabs.prefix(2).compactMap { $0.url?.absoluteString })
+        let bookmarks = settings.search.bookmarkSuggestions
+            ? state.bookmarksProfileID.map { BookmarkStore.shared.search(query, limit: 3, profile: $0) } ?? [] : []
+        for bookmark in bookmarks {
+            guard let url = bookmark.url, !openURLs.contains(url.absoluteString) else { continue }
+            openURLs.insert(url.absoluteString)
+            items.append(Suggestion(
+                id: "bookmark:" + url.absoluteString, kind: .bookmark(url), title: bookmark.displayTitle,
+                subtitle: "Bookmark · " + url.displayHost + (url.path.count > 1 ? url.path : ""),
+                symbol: "star", icon: FaviconStore.shared.cachedIcon(for: url)
+            ))
+        }
         let history = settings.search.historySuggestions ? HistoryStore.shared.search(query, limit: 3, profileID: state.currentProfile.id) : []
         for entry in history where !openURLs.contains(entry.url.absoluteString) {
             items.append(Suggestion(

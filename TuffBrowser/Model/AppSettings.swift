@@ -189,12 +189,15 @@ struct TabSettings: Codable, Equatable {
     var compactRows = false
     /// Pop a video that is playing with sound into picture in picture when its tab is left.
     var autoPictureInPicture = true
+    /// The bookmarks bar under the address bar (horizontal layout only; ⇧⌘B).
+    var showBookmarksBar = false
 }
 
 struct SearchSettings: Codable, Equatable {
     var customTemplate = ""
     var historySuggestions = true
     var openTabSuggestions = true
+    var bookmarkSuggestions = true
 }
 
 /// Optional extras ("mods") that change how Tuff behaves. Settings → Mods.
