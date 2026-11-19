@@ -43,17 +43,18 @@ struct PageMenu: View {
     private var main: some View {
         let tab = state.selectedTab
         let canCapture = tab?.isAwake == true && tab?.webView != nil && tab?.pdf == nil
-        let hasURL = tab?.url != nil
+        // Sized from the menu's width rather than left to the layout, which let the tiles shrink
+        // to their icons after coming back from a sub-page.
+        let count = AppSettings.shared.privacy.blockAds ? 5 : 4
+        let side = ((Self.width - 24) - 6 * CGFloat(count - 1)) / CGFloat(count)
         return VStack(alignment: .leading, spacing: 14) {
             HStack(spacing: 6) {
-                PageMenuTile(symbol: "camera", help: "Screenshot", disabled: !canCapture) {
+                PageMenuTile(side: side, symbol: "camera", help: "Screenshot", disabled: !canCapture) {
                     withAnimation(Motion.snappy) { page = .screenshot }
-                }
-                PageMenuTile(symbol: "square.and.arrow.up", help: "Share", disabled: !hasURL) {
-                    closeThen { PageMenu.share(state) }
                 }
                 let reading = tab?.reader != nil
                 PageMenuTile(
+                    side: side,
                     symbol: reading ? "doc.plaintext.fill" : "doc.plaintext",
                     help: reading ? "Exit Reader Mode  ⌥⌘R" : "Reader Mode  ⌥⌘R",
                     disabled: !reading && tab?.canUseReader != true,
@@ -63,6 +64,7 @@ struct PageMenu: View {
                 }
                 let translated = tab?.translation != nil
                 PageMenuTile(
+                    side: side,
                     symbol: "translate",
                     help: translated ? "Show Original" : "Translate to \(PageTranslation.name(of: PageTranslation.preferredTarget))",
                     disabled: !(tab?.isAwake ?? false) || tab?.pdf != nil || tab?.url == nil,
@@ -70,13 +72,11 @@ struct PageMenu: View {
                 ) {
                     closeThen { tab?.toggleTranslation() }
                 }
-                PageMenuTile(symbol: "slider.horizontal.3", help: "Site Settings", disabled: SiteSettings.key(for: tab?.url) == nil) {
-                    withAnimation(Motion.snappy) { page = .site }
-                }
                 if AppSettings.shared.privacy.blockAds {
                     let host = tab?.url?.host
                     let allowed = ContentBlocker.shared.isAllowed(host: host)
                     PageMenuTile(
+                        side: side,
                         symbol: allowed ? "shield.slash" : "shield.lefthalf.filled",
                         help: allowed ? "Block Ads on This Site" : "Allow Ads on This Site",
                         disabled: host == nil || tab?.pdf != nil
@@ -90,6 +90,7 @@ struct PageMenu: View {
                     }
                 }
                 PageMenuTile(
+                    side: side,
                     symbol: tab?.isInPictureInPicture == true ? "pip.exit" : "pip.enter",
                     help: tab?.isInPictureInPicture == true ? "Exit Picture in Picture" : "Picture in Picture",
                     disabled: !(tab?.isAwake ?? false)
@@ -106,7 +107,7 @@ struct PageMenu: View {
                 PageMenuExtensions(close: closeThen)
             }
 
-            PageMenuFooter(tab: tab)
+            PageMenuFooter(tab: tab, openSite: { withAnimation(Motion.snappy) { page = .site } })
         }
     }
 
@@ -126,21 +127,13 @@ struct PageMenu: View {
     /// The anchor popups opened from the menu hang off: the address bar it came from.
     static weak var anchor: NSView?
 
-    static func share(_ state: BrowserState) {
-        guard let url = state.selectedTab?.url else { return }
-        let picker = NSSharingServicePicker(items: [url])
-        if let anchor, anchor.window != nil, anchor.window === state.window {
-            picker.show(relativeTo: anchor.bounds, of: anchor, preferredEdge: .minY)
-        } else if let content = state.window?.contentView {
-            picker.show(relativeTo: NSRect(x: 24, y: content.bounds.maxY - 60, width: 1, height: 1), of: content, preferredEdge: .maxX)
-        }
-    }
 }
 
 /// A square button in the menu's top row. The row shares its width between however many tiles
 /// it has, and each tile stays square at that width.
 private struct PageMenuTile: View {
     @Environment(\.accent) private var accent
+    let side: CGFloat
     let symbol: String
     let help: String
     var disabled = false
@@ -155,8 +148,7 @@ private struct PageMenuTile: View {
             Image(systemName: symbol)
                 .font(.system(size: 13.5, weight: .medium))
                 .foregroundStyle(.primary.opacity(disabled ? 0.28 : 0.88))
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .aspectRatio(1, contentMode: .fit)
+                .frame(width: side, height: side)
                 .background(
                     shape.fill(active
                         ? AnyShapeStyle(accent.opacity(hovering ? 0.34 : 0.26))
@@ -239,7 +231,7 @@ private struct PageMenuExtensionTile: View {
                     }
                 }
                 .opacity(action.enabled ? 1 : 0.4)
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .frame(maxWidth: .infinity)
                 .aspectRatio(1, contentMode: .fit)
 
                 if !action.badge.isEmpty {
@@ -308,7 +300,7 @@ private struct PageMenuAddTile: View {
             Image(systemName: "plus")
                 .font(.system(size: 12.5, weight: .medium))
                 .foregroundStyle(.primary.opacity(hovering ? 0.85 : 0.6))
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .frame(maxWidth: .infinity)
                 .aspectRatio(1, contentMode: .fit)
                 .background(shape.fill(.primary.opacity(hovering ? 0.15 : 0.08)))
                 .overlay(shape.strokeBorder(.primary.opacity(0.06), lineWidth: 0.5))
@@ -323,28 +315,45 @@ private struct PageMenuAddTile: View {
 
 // MARK: - Footer
 
-/// The connection and the page's zoom.
+/// The connection (which opens the site's settings and permissions) and the page's zoom.
 private struct PageMenuFooter: View {
     let tab: Tab?
+    let openSite: () -> Void
     /// `Tab.pageZoom` isn't observed, so the label keeps its own copy.
     @State private var zoom: CGFloat = 1
+    @State private var hoveringSite = false
 
     var body: some View {
         let insecure = tab?.isNotSecure == true
         let web = tab?.url.map { $0.scheme == "http" || $0.scheme == "https" } ?? false
+        let hasSite = SiteSettings.key(for: tab?.url) != nil
         HStack(spacing: 8) {
-            HStack(spacing: 6) {
-                Image(systemName: insecure ? "lock.open.fill" : (web ? "lock.fill" : "info.circle"))
-                    .font(.system(size: 11, weight: .semibold))
-                    .foregroundStyle(insecure ? Color(red: 0.93, green: 0.36, blue: 0.30) : .primary.opacity(0.7))
-                Text(insecure ? "Not Secure" : (web ? "Secure" : "Tuff Page"))
-                    .font(.system(size: 12.5, weight: .semibold))
-                    .foregroundStyle(.primary.opacity(0.85))
+            Button(action: openSite) {
+                HStack(spacing: 6) {
+                    Image(systemName: insecure ? "lock.open.fill" : (web ? "lock.fill" : "info.circle"))
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(insecure ? Color(red: 0.93, green: 0.36, blue: 0.30) : .primary.opacity(0.7))
+                    Text(insecure ? "Not Secure" : (web ? "Secure" : "Tuff Page"))
+                        .font(.system(size: 12.5, weight: .semibold))
+                        .foregroundStyle(.primary.opacity(0.85))
+                    if hasSite {
+                        Image(systemName: "chevron.right")
+                            .font(.system(size: 8.5, weight: .bold))
+                            .foregroundStyle(.primary.opacity(0.4))
+                    }
+                }
+                .padding(.horizontal, 12)
+                .frame(height: 34)
+                .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(.primary.opacity(hoveringSite && hasSite ? 0.14 : 0.08)))
+                .contentShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
             }
-            .padding(.horizontal, 12)
-            .frame(height: 34)
-            .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(.primary.opacity(0.08)))
-            .help(insecure ? "Your connection to this site isn’t encrypted" : (web ? "Your connection to this site is encrypted" : ""))
+            .buttonStyle(SquishButtonStyle(scale: 0.97))
+            .disabled(!hasSite)
+            .onHover { hoveringSite = $0 }
+            .animation(Motion.quick, value: hoveringSite)
+            .help(hasSite
+                  ? (insecure ? "Your connection to this site isn’t encrypted. Site settings and permissions" : "Your connection to this site is encrypted. Site settings and permissions")
+                  : "")
 
             Spacer(minLength: 0)
 
