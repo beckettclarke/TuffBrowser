@@ -712,8 +712,8 @@ private struct AnnotationCanvas: View {
                     .frame(width: display.width, height: display.height)
             }
 
-            if let id = session.editingTextID, let index = session.annotations.firstIndex(where: { $0.id == id }) {
-                AnnotationTextField(session: session, index: index, scale: scale)
+            if let id = session.editingTextID, session.annotations.contains(where: { $0.id == id }) {
+                AnnotationTextField(session: session, id: id, scale: scale)
             }
         }
         .frame(width: display.width, height: display.height)
@@ -838,18 +838,27 @@ private struct AnnotationCanvas: View {
 /// Typing into a text annotation, in place.
 private struct AnnotationTextField: View {
     @Bindable var session: ScreenshotSession
-    let index: Int
+    // By id, not index: the box can be removed (left empty, undone) and this body run once more
+    // before the parent drops it, and a stale index then points past the end.
+    let id: UUID
     let scale: CGFloat
     @FocusState private var focused: Bool
 
     var body: some View {
-        let a = session.annotations[index]
+        if let a = session.annotations.first(where: { $0.id == id }) {
+            field(a)
+        }
+    }
+
+    private func field(_ a: Annotation) -> some View {
         let size = AnnotationRenderer.fontSize(a) * scale
         let text = Binding(
-            get: { session.annotations.indices.contains(index) ? session.annotations[index].text : "" },
-            set: { if session.annotations.indices.contains(index) { session.annotations[index].text = $0 } }
+            get: { session.annotations.first { $0.id == id }?.text ?? "" },
+            set: { new in
+                if let i = session.annotations.firstIndex(where: { $0.id == id }) { session.annotations[i].text = new }
+            }
         )
-        TextField("Type…", text: text)
+        return TextField("Type…", text: text)
             .textFieldStyle(.plain)
             .font(.system(size: size, weight: .bold))
             .foregroundStyle(Color(nsColor: a.color))

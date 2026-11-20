@@ -239,6 +239,8 @@ struct PrivacySettings: Codable, Equatable {
     var blockAds = true
     /// Sites (and their subdomains) the blocker leaves alone.
     var adBlockAllowlist: [String] = []
+    /// Send anonymous usage counts (`Analytics`).
+    var shareUsageStats = true
 }
 
 extension PrivacySettings {
@@ -260,6 +262,7 @@ extension PrivacySettings {
         rememberMediaPermissions = try c.decodeIfPresent(Bool.self, forKey: .rememberMediaPermissions) ?? d.rememberMediaPermissions
         blockAds = try c.decodeIfPresent(Bool.self, forKey: .blockAds) ?? d.blockAds
         adBlockAllowlist = try c.decodeIfPresent([String].self, forKey: .adBlockAllowlist) ?? d.adBlockAllowlist
+        shareUsageStats = try c.decodeIfPresent(Bool.self, forKey: .shareUsageStats) ?? d.shareUsageStats
     }
 }
 
@@ -400,7 +403,14 @@ final class AppSettings {
     var behavior: BehaviorSettings { didSet { if behavior != oldValue { persist(Self.behaviorKey) } } }
     var tabs: TabSettings { didSet { if tabs != oldValue { persist(Self.tabsKey) } } }
     var search: SearchSettings { didSet { if search != oldValue { persist(Self.searchKey) } } }
-    var privacy: PrivacySettings { didSet { if privacy != oldValue { persist(Self.privacyKey); webSettingsChanged() } } }
+    var privacy: PrivacySettings {
+        didSet {
+            guard privacy != oldValue else { return }
+            persist(Self.privacyKey)
+            webSettingsChanged()
+            if !privacy.shareUsageStats { Analytics.forgetID() }
+        }
+    }
     var downloads: DownloadSettings { didSet { if downloads != oldValue { persist(Self.downloadsKey) } } }
     var advanced: AdvancedSettings { didSet { if advanced != oldValue { persist(Self.advancedKey); webSettingsChanged() } } }
     var mods: ModSettings { didSet { if mods != oldValue { persist(Self.modsKey) } } }

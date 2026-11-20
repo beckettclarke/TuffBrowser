@@ -1132,6 +1132,10 @@ struct PrivacyPage: View {
                 }
             }
 
+            SettingsGroup(title: "Analytics", footer: "A count of how many people use Tuff each day: the app and macOS version, updates, and how settings like tab layout and search engine are set. Never the pages you visit, what you search for, or anything that identifies you.") {
+                SwitchRow(title: "Share anonymous usage statistics", isOn: $settings.privacy.shareUsageStats)
+            }
+
             SettingsGroup(title: "Websites") {
                 SettingsRow(title: "Permissions, pop-ups, JavaScript and zoom", detail: "What each site may do, and how its pages are shown.", symbol: "globe") {
                     SettingsLink(title: "Websites", tab: .websites)

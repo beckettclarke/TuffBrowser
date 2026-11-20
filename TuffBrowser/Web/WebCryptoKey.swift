@@ -9,8 +9,8 @@ import WebKit
 /// the keychain lets only the exact app that made it read it without asking. Tuff is signed ad
 /// hoc, so every update is a different app to the keychain, and macOS asked for the login
 /// password after each one. The key now lives in a file in Tuff's data folder (readable by this
-/// user only). The first time it's needed, the keychain's key is copied over if there is one, so
-/// keys sites saved before keep working; that can ask for the password one last time.
+/// user only). The keychain's old key is deliberately never read: reading it is what asks for the
+/// password. Keys sites saved under it are lost, so those sites may have to sign in again.
 ///
 /// WebKit asks the website data store's (private) delegate first, for pages and workers alike;
 /// `attach(to:)` sets it on every store Tuff uses.
@@ -28,8 +28,8 @@ final class WebCryptoKey: NSObject {
         store.perform(selector, with: shared)
     }
 
-    /// `_WKWebsiteDataStoreDelegate`'s question. The answer may take a keychain prompt the first
-    /// time, so it is worked out off the main thread.
+    /// `_WKWebsiteDataStoreDelegate`'s question. The answer may need a disk read, so it is worked
+    /// out off the main thread.
     @objc(webCryptoMasterKey:)
     func webCryptoMasterKey(_ completionHandler: @escaping (Data?) -> Void) {
         queue.async {
@@ -44,13 +44,8 @@ final class WebCryptoKey: NSObject {
             key = saved
             return saved
         }
-        var made: Data
-        if let old = Self.keychainKey() {
-            made = old
-        } else {
-            made = Data(count: 16)
-            guard made.withUnsafeMutableBytes({ SecRandomCopyBytes(kSecRandomDefault, 16, $0.baseAddress!) }) == errSecSuccess else { return nil }
-        }
+        var made = Data(count: 16)
+        guard made.withUnsafeMutableBytes({ SecRandomCopyBytes(kSecRandomDefault, 16, $0.baseAddress!) }) == errSecSuccess else { return nil }
         do {
             try made.write(to: file, options: .atomic)
             try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
@@ -63,23 +58,4 @@ final class WebCryptoKey: NSObject {
 
     /// AES key sizes; WebKit makes 16-byte keys.
     private static let validSizes: Set<Int> = [16, 24, 32]
-
-    /// The key WebKit kept in the keychain before, if there is one. WebKit stores it base64
-    /// encoded. Test runs never touch the keychain.
-    private static func keychainKey() -> Data? {
-        guard Paths.testDataDirectory == nil, NSClassFromString("XCTestCase") == nil,
-              let bundleID = Bundle.main.bundleIdentifier else { return nil }
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrAccount as String: "com.apple.WebKit.WebCrypto.master+" + bundleID,
-            kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne,
-        ]
-        var result: CFTypeRef?
-        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess, let data = result as? Data else { return nil }
-        if let text = String(data: data, encoding: .utf8), let decoded = Data(base64Encoded: text), validSizes.contains(decoded.count) {
-            return decoded
-        }
-        return validSizes.contains(data.count) ? data : nil
-    }
 }

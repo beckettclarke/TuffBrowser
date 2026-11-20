@@ -592,6 +592,11 @@ struct WebStack: NSViewRepresentable {
 }
 
 final class WebStackView: NSView {
+    /// Every host there is. A card can briefly have two (a modifier above it changing shape, as
+    /// switching to or from Seamless does, swaps the host for a new one while the old fades out),
+    /// and when that flips back quickly SwiftUI can keep the one that isn't holding the web view.
+    private static let all = NSHashTable<WebStackView>.weakObjects()
+
     private weak var current: WKWebView?
     var focus: () -> Void = {}
 
@@ -600,9 +605,23 @@ final class WebStackView: NSView {
         wantsLayer = true
         layer?.masksToBounds = true
         layer?.cornerCurve = .continuous
+        Self.all.add(self)
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        guard window == nil, let webView = current, webView.superview === self else { return }
+        // Leaving with the page: hand it to a host that is still meant to show it (one that
+        // stood back for this one, see `takenBySibling`). After the removal has finished.
+        DispatchQueue.main.async { [weak webView] in
+            guard let webView, webView.window == nil,
+                  let host = Self.all.allObjects.first(where: { $0.window != nil && $0.current === webView }) else { return }
+            host.current = nil
+            host.show(webView, animated: false)
+        }
+    }
 
     func show(_ webView: WKWebView?, animated: Bool) {
         // Showing already, unless something else has taken the web view into its own hierarchy.

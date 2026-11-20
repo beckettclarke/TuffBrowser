@@ -231,6 +231,7 @@ enum SettingsSearch {
         .row("Warn about fraudulent websites", .privacy, in: "Security", "phishing malware safe browsing fraud"),
 
         .row("When a language isn’t on this Mac", .privacy, in: "Translation", named: "Translation", "translate google translation language download"),
+        .row("Share anonymous usage statistics", .privacy, in: "Analytics", "analytics telemetry tracking posthog usage data statistics"),
 
         // Passwords
         .row("Save and fill passwords", .passwords, in: nil, "passwords logins autofill sign in save offer"),

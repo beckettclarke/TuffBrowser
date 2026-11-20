@@ -343,6 +343,7 @@ extension AppDelegate: NSApplicationDelegate {
         // release would never match.
         Updater.app.start()
         #endif
+        Analytics.start()
     }
 
     func application(_ application: NSApplication, open urls: [URL]) {

@@ -103,18 +103,29 @@ enum Screenshotter {
         guard let setup = await js(webView, setupJS) as? [NSNumber], setup.count == 2 else { return nil }
         // View points per CSS pixel.
         let zoom = webView.pageZoom * webView.magnification
-        let pageHeight = CGFloat(truncating: setup[0]), viewport = CGFloat(truncating: setup[1])
+        let pageHeight = CGFloat(truncating: setup[0])
         let width = webView.bounds.width, viewHeight = webView.bounds.height
+        // CSS pixels per screen, never more than is actually on screen so no strip is skipped.
+        let viewport = min(CGFloat(truncating: setup[1]), viewHeight / zoom).rounded(.down)
         let total = min(max(pageHeight * zoom, viewHeight), maxFullPageHeight)
         var context: CGContext?
         var contextScale: CGFloat = 1
         var offset: CGFloat = 0
+        var lastScrolled: CGFloat = -1
+        // How far down the image has been painted, in bitmap pixels.
+        var covered = 0
         var first = true
 
         while true {
             // Switching tabs or closing the editor's page mid-capture: give up.
             guard state.selectedTab === tab, tab.webView === webView else { return nil }
-            let scrolled = (await js(webView, "window.scrollTo(0, \(offset)); window.scrollY") as? NSNumber).map { CGFloat(truncating: $0) } ?? offset
+            // Where the page actually scrolled to, and how far it can scroll.
+            let position = await js(webView, """
+            (() => { window.scrollTo(0, \(offset)); const e = document.scrollingElement || document.documentElement;
+              return [scrollY, Math.max(0, e.scrollHeight - innerHeight)]; })()
+            """) as? [NSNumber]
+            let scrolled = position.map { CGFloat(truncating: $0[0]) } ?? offset
+            let maxScroll = position.map { CGFloat(truncating: $0[1]) } ?? .infinity
             if !first { _ = await js(webView, hideFixedJS) }
             // A moment for lazy images and scroll-triggered layout to settle.
             try? await Task.sleep(nanoseconds: first ? 40_000_000 : 110_000_000)
@@ -132,23 +143,26 @@ enum Screenshotter {
                 context?.interpolationQuality = .high
             }
             guard let context else { return nil }
-            // Bitmap space runs bottom-up.
-            let top = scrolled * zoom
-            context.draw(shot, in: CGRect(
-                x: 0, y: (total - top - viewHeight) * contextScale,
-                width: width * contextScale, height: viewHeight * contextScale
-            ))
-            state.screenshotProgress = min(1, (top + viewHeight) / total)
+            // On whole pixels, so screens meet without a half-covered row. Bitmap space runs bottom-up.
+            let top = Int((scrolled * zoom * contextScale).rounded())
+            let shotHeight = Int((viewHeight * contextScale).rounded())
+            context.draw(shot, in: CGRect(x: 0, y: context.height - top - shotHeight, width: context.width, height: shotHeight))
+            covered = min(context.height, max(covered, top + shotHeight))
+            state.screenshotProgress = Double(covered) / Double(max(context.height, 1))
             first = false
 
-            let reachedEnd = top + viewHeight >= total - 0.5
-            // The page wouldn't scroll as far as asked: that was the bottom.
-            let clamped = scrolled + 0.5 < offset
-            if reachedEnd || clamped { break }
+            let reachedEnd = covered >= context.height
+            // At the bottom, or the page won't scroll any further. Not "scrolled less than asked":
+            // zoomed pages round the scroll position to device pixels (767 lands on 766).
+            let atBottom = scrolled >= maxScroll - 1 || scrolled <= lastScrolled
+            if reachedEnd || atBottom { break }
+            lastScrolled = scrolled
             offset = scrolled + viewport
         }
-        guard let image = context?.makeImage() else { return nil }
-        return (image, CGSize(width: width, height: total))
+        // Leave off anything never painted (the page got shorter, or stopped scrolling early)
+        // rather than hand back a transparent strip.
+        guard let context, let image = context.makeImage()?.cropping(to: CGRect(x: 0, y: 0, width: context.width, height: covered)) else { return nil }
+        return (image, CGSize(width: width, height: CGFloat(covered) / contextScale))
     }
 
     @MainActor

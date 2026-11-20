@@ -82,10 +82,17 @@ enum DebugHooks {
             let value = TabLayout(rawValue: words.first.map(String.init) ?? "") ?? .vertical
             if words.count > 1 { AppSettings.shared.tabs.incognitoLayout = value } else { AppSettings.shared.tabs.layout = value }
         case "style":
-            // style glass|vibrancy|solid|seamless
-            // style glass|vibrancy|solid|seamless, or style incognito-seamless on|off
-            if let style = BackgroundStyle(rawValue: argument) { AppSettings.shared.theme.style = style }
+            // style glass|vibrancy|solid|seamless [animated] (as the Settings tiles do it), or
+            // style incognito-seamless on|off
+            if let style = BackgroundStyle(rawValue: argument.split(separator: " ").first.map(String.init) ?? "") {
+                if argument.hasSuffix(" animated") { withAnimation(Motion.smooth) { AppSettings.shared.theme.style = style } }
+                else { AppSettings.shared.theme.style = style }
+            }
             if argument.hasPrefix("incognito-seamless") { AppSettings.shared.theme.incognitoSeamless = argument.hasSuffix("on") }
+        case "webstate":
+            // webstate — whether the selected tab's web view is in the window, and where.
+            let view = state.selectedTab?.webView
+            log("webstate window=\(view?.window != nil) superview=\(view?.superview.map { "\(ObjectIdentifier($0))" } ?? "nil") superwindow=\(view?.superview?.window != nil) alpha=\(view?.alphaValue ?? -1)")
         case "headercolor":
             log("headercolor \(state.selectedTab?.headerColor.map { "\($0)" } ?? "nil") tint=\(state.currentTint)")
         case "wait":
