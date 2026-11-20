@@ -336,6 +336,7 @@ extension AppDelegate: NSApplicationDelegate {
         TorrentBridge.setUp()
         showMainWindow()
         Onboarding.shared.showIfNeeded()
+        SyncManager.shared.start()
         #if DEBUG
         DebugHooks.runIfRequested()
         #else

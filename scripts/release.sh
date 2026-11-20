@@ -16,8 +16,7 @@
 #                            (the updater) offers to users. Needs `gh`; NOTES=file.md for the notes
 set -euo pipefail
 cd "$(dirname "$0")/.."
-
-xcodegen generate >/dev/null
+SECONDS=0
 
 ARGS=(-project TuffBrowser.xcodeproj -scheme TuffBrowser -configuration Release -derivedDataPath build)
 if [ -n "${MARKETING_VERSION:-}" ]; then
@@ -27,7 +26,8 @@ if [ -n "${DEVELOPER_ID:-}" ]; then
   ARGS+=("CODE_SIGN_IDENTITY=$DEVELOPER_ID" "DEVELOPMENT_TEAM=${TEAM_ID:?set TEAM_ID}" ENABLE_HARDENED_RUNTIME=YES "OTHER_CODE_SIGN_FLAGS=--timestamp")
 fi
 
-xcodebuild "${ARGS[@]}" build | grep -E "error|warning: |BUILD" || true
+# Progress bar, warnings and errors, and the build's own time; fails the release if the build fails.
+scripts/xcbuild.py --label "Release build" --gen -- xcodebuild "${ARGS[@]}" build
 
 APP="build/Build/Products/Release/Tuff.app"
 # Xcode never updates the .app folder's own date, and macOS caches icons by it: a stale date
@@ -69,3 +69,4 @@ if [ -n "${PUBLISH:-}" ]; then
   gh release create "v$VERSION" "$ZIP" "$DMG" "${GH[@]}"
 fi
 
+echo "Total time: $((SECONDS / 60))m $((SECONDS % 60))s"

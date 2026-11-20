@@ -358,6 +358,26 @@ final class ExtensionAPITests: XCTestCase {
         XCTAssertThrowsError(try ExtensionSettings.proxyConfigurations(for: ["mode": "fixed_servers", "rules": ["singleProxy": ["scheme": "socks4", "host": "x"]]]))
         XCTAssertThrowsError(try ExtensionSettings.proxyConfigurations(for: ["proxyType": "manual", "socks": "x:1", "socksVersion": 4]))
     }
+
+    func testDeclarativeContentURLFilters() {
+        let url = URL(string: "https://docs.example.com:8443/guide/intro?lang=en#top")!
+        let match = { ExtensionDeclarativeContent.urlMatches(url, $0) }
+        XCTAssertTrue(match([:]))
+        XCTAssertTrue(match(["hostSuffix": "example.com", "schemes": ["https"]]))
+        XCTAssertTrue(match(["hostEquals": "docs.example.com", "pathPrefix": "/guide"]))
+        XCTAssertTrue(match(["hostContains": ".example."]))
+        XCTAssertTrue(match(["queryContains": "lang=en", "urlSuffix": "lang=en"]))  // the fragment isn't part of the URL
+        XCTAssertTrue(match(["ports": [80, [8000, 9000]]]))
+        XCTAssertTrue(match(["urlMatches": "^https://docs\\.example\\.com"]))
+        XCTAssertTrue(match(["originAndPathMatches": "example\\.com:8443/guide/"]))
+        XCTAssertFalse(match(["hostSuffix": "example.org"]))
+        XCTAssertFalse(match(["hostSuffix": "example.com", "schemes": ["http"]]))
+        XCTAssertFalse(match(["ports": [443]]))
+        XCTAssertFalse(match(["pathEquals": "/guide"]))
+        XCTAssertEqual(ExtensionAPIPermissions.required(namespace: "declarativeContent", method: "addRules"), "declarativeContent")
+        XCTAssertEqual(ExtensionAPIPermissions.required(namespace: "bookmarks", method: "create"), "bookmarks")
+        XCTAssertNil(ExtensionAPIPermissions.required(namespace: "i18n", method: "detectLanguage"))
+    }
 }
 
 final class HistoryStoreTests: XCTestCase {

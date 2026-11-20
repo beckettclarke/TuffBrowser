@@ -1,14 +1,15 @@
 import AppKit
 
-/// Fills the History menu each time it opens: a Recently Closed submenu, and the pages
-/// visited most recently (as in Safari and Chrome). Choosing a page opens it in the tab you're
-/// on; ⌘-choosing opens it in a new tab.
+/// Fills the History menu each time it opens: a Recently Closed submenu, Tabs from Other Devices
+/// when signed in to sync, and the pages visited most recently (as in Safari and Chrome).
+/// Choosing a page opens it in the tab you're on; ⌘-choosing opens it in a new tab.
 final class HistoryMenuFiller: NSObject, NSMenuDelegate {
     static let shared = HistoryMenuFiller()
 
     /// How many recent pages and closed tabs are listed.
     static let recentLimit = 15
     static let closedLimit = 15
+    static let deviceTabLimit = 25
 
     /// Items this delegate added, so they can be replaced next time.
     private static let marker = 0x7475_6666  // "tuff"
@@ -41,6 +42,36 @@ final class HistoryMenuFiller: NSObject, NSMenuDelegate {
         let closedHolder = NSMenuItem(title: "Recently Closed", action: nil, keyEquivalent: "")
         closedHolder.submenu = closedMenu
         added.append(mark(closedHolder))
+
+        // Tabs open on the Mozilla account's other devices (Settings → Sync).
+        let sync = MainActor.assumeIsolated { SyncManager.shared }
+        let devices = MainActor.assumeIsolated { sync.isSignedIn && sync.isEnabled(.tabs) ? sync.devices : nil }
+        if let devices {
+            let devicesMenu = NSMenu(title: "Tabs from Other Devices")
+            if devices.isEmpty {
+                let none = NSMenuItem(title: "No Tabs from Other Devices", action: nil, keyEquivalent: "")
+                none.isEnabled = false
+                devicesMenu.addItem(none)
+            }
+            for (index, device) in devices.enumerated() {
+                if index > 0 { devicesMenu.addItem(.separator()) }
+                let heading = NSMenuItem(title: device.name, action: nil, keyEquivalent: "")
+                heading.isEnabled = false
+                heading.image = NSImage(systemSymbolName: device.symbol, accessibilityDescription: nil)
+                devicesMenu.addItem(heading)
+                for tab in device.tabs.prefix(Self.deviceTabLimit) {
+                    let item = NSMenuItem(title: Self.title(tab.title, tab.url), action: #selector(openPage(_:)), keyEquivalent: "")
+                    item.target = self
+                    item.representedObject = tab.url
+                    item.image = Self.icon(for: tab.url)
+                    item.toolTip = tab.url.absoluteString
+                    devicesMenu.addItem(item)
+                }
+            }
+            let devicesHolder = NSMenuItem(title: "Tabs from Other Devices", action: nil, keyEquivalent: "")
+            devicesHolder.submenu = devicesMenu
+            added.append(mark(devicesHolder))
+        }
 
         // Recent pages (not shown in Incognito, which keeps no History).
         if !state.isPrivate {

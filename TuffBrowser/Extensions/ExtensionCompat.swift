@@ -329,6 +329,15 @@ enum ExtensionCompat {
       // scripts only ever see a small part of it, so they get the fixes but no stand-ins.
       let privileged = false;
       try { privileged = /-extension:$/.test(scope.location.protocol); } catch (e) {}
+      // An extension page in a frame inside a website (1Password's fill menu) runs in that
+      // website's web process. WebKit kills the process if it calls an API only extension pages
+      // may use (tabs.query, tabs.create…), and Tuff then reloads the site, losing what was typed.
+      // Such frames get inert stand-ins and nothing from the shim that calls the browser.
+      let embedded = false;
+      // Only pages have a `top`; a background service worker has none and is never embedded.
+      if (privileged && scope.top) {
+        try { embedded = scope.top !== scope && !/-extension:$/.test(scope.top.location.protocol); } catch (e) { embedded = true; }
+      }
 
       // Chrome-only namespaces. Each is added only if WebKit has nothing under that name.
       const missing = [
@@ -337,6 +346,8 @@ enum ExtensionCompat {
         'pageCapture', 'proxy', 'omnibox', 'bookmarks',
         'debugger', 'enterprise', 'readingList', 'webAuthenticationProxy', 'loginState',
         'documentScan', 'printing', 'vpnProvider', 'wallpaper', 'certificateProvider', 'platformKeys', 'userScripts',
+        'declarativeContent', 'desktopCapture', 'tabCapture', 'accessibilityFeatures', 'processes', 'printerProvider',
+        'printingMetrics', 'systemLog', 'audio', 'fileBrowserHandler', 'fileSystemProvider', 'input', 'declarativeWebRequest',
         // Firefox-only.
         'contentScripts', 'dns', 'browserSettings', 'theme', 'contextualIdentities', 'find',
         'captivePortal', 'networkStatus', 'pkcs11', 'clipboard'
@@ -347,6 +358,8 @@ enum ExtensionCompat {
       // extensions which test for it take their fallback path.
       const methods = {
         webRequest: ['handlerBehaviorChanged'],
+        menus: ['refresh'],
+        extension: ['setUpdateUrlData'],
       };
 
       // Events Chrome has that WebKit may not, inside namespaces that otherwise exist.
@@ -765,7 +778,7 @@ enum ExtensionCompat {
       // tabs.create() with a private URL, which Tuff intercepts — no tab opens — and answers by
       // failing with a marked reply. tabs.create is the one browser call every extension
       // context, service workers included, can make without asking for a permission.
-      if (privileged) {
+      if (privileged && !embedded) {
         for (const { root, label } of roots) {
           let tabs;
           try { tabs = root.tabs; } catch (e) { continue; }
@@ -843,12 +856,13 @@ enum ExtensionCompat {
       // browsingData, management). They reach Tuff through the same tabs.create bridge as the side
       // panel, with a private tuff-api:// URL; the answer comes back in the call's error. The methods
       // are real; their events arrive through the native event relay below.
-      if (privileged) {
+      if (privileged && !embedded) {
         const nativePermissionNames = new Set([
           'topSites', 'history', 'browsingData', 'management', 'sessions', 'notifications', 'offscreen',
           'identity', 'downloads', 'system.cpu', 'system.memory', 'system.storage', 'power', 'idle', 'tts',
           'search', 'userScripts', 'tabGroups', 'contextualIdentities', 'contentSettings', 'find', 'omnibox',
-          'theme', 'privacy', 'proxy', 'fontSettings', 'browserSettings',
+          'theme', 'privacy', 'proxy', 'fontSettings', 'browserSettings', 'bookmarks', 'declarativeContent',
+          'system.display',
         ]);
         for (const { root, label } of roots) {
           let tabs;
@@ -992,6 +1006,7 @@ enum ExtensionCompat {
                   if (deliveryOrder.length > 1000) seenDeliveries.delete(deliveryOrder.shift());
                 }
                 const listeners = nativeEvents[msg.__tuffEvent];
+                if (!listeners.size) return;
                 resolve(msg).then((args) => {
                   for (const [fn, filter] of [...listeners]) {
                     if (!passes(filter, args)) continue;
@@ -1032,20 +1047,30 @@ enum ExtensionCompat {
             onVisitRemoved: event('history.onVisitRemoved'),
             onTitleChanged: event('history.onTitleChanged'),
           });
-          implement('browsingData', {
+          const browsingData = {
             remove: api((options, dataToRemove) => call('browsingData', 'remove', Object.assign({}, options, { dataToRemove: dataToRemove }))),
             removeCache: api((options) => call('browsingData', 'removeCache', options)),
             removeCookies: api((options) => call('browsingData', 'removeCookies', options)),
             removeLocalStorage: api((options) => call('browsingData', 'removeLocalStorage', options)),
             removeHistory: api((options) => call('browsingData', 'removeHistory', options)),
             settings: api(() => call('browsingData', 'settings', {})),
-          });
+          };
+          // The one-type shortcuts are remove() with that type.
+          for (const [method, type] of [['removeAppcache', 'appcache'], ['removeCacheStorage', 'cacheStorage'],
+            ['removeDownloads', 'downloads'], ['removeFileSystems', 'fileSystems'], ['removeFormData', 'formData'],
+            ['removeIndexedDB', 'indexedDB'], ['removePasswords', 'passwords'], ['removePluginData', 'pluginData'],
+            ['removeServiceWorkers', 'serviceWorkers'], ['removeWebSQL', 'webSQL']]) {
+            browsingData[method] = api((options) => call('browsingData', 'remove', Object.assign({}, options, { dataToRemove: { [type]: true } })));
+          }
+          implement('browsingData', browsingData);
           implement('management', {
             getAll: api(() => call('management', 'getAll', {})),
             get: api((id) => call('management', 'get', { id: id })),
             getSelf: api(() => call('management', 'getSelf', {})),
             getPermissionWarningsById: api((id) => call('management', 'getPermissionWarningsById', { id: id })),
+            getPermissionWarningsByManifest: api((manifest) => call('management', 'getPermissionWarningsByManifest', { manifest: manifest })),
             setEnabled: api((id, enabled) => call('management', 'setEnabled', { id: id, enabled: enabled })),
+            uninstall: api((id) => call('management', 'uninstall', { id: id })),
             uninstallSelf: api((options) => call('management', 'uninstallSelf', options || {})),
             onInstalled: event('management.onInstalled'),
             onUninstalled: event('management.onUninstalled'),
@@ -1072,6 +1097,7 @@ enum ExtensionCompat {
             onClosed: event('notifications.onClosed'),
             onButtonClicked: event('notifications.onButtonClicked'),
             onPermissionLevelChanged: event('notifications.onPermissionLevelChanged'),
+            onShowSettings: stub(label + '.notifications.onShowSettings', true),
           });
           implement('offscreen', {
             createDocument: api((parameters) => call('offscreen', 'createDocument', parameters)),
@@ -1105,11 +1131,24 @@ enum ExtensionCompat {
             show: api((id) => call('downloads', 'show', { id: id })),
             pause: api((id) => call('downloads', 'pause', { id: id })),
             resume: api((id) => call('downloads', 'resume', { id: id })),
+            removeFile: api((id) => call('downloads', 'removeFile', { id: id })),
+            getFileIcon: api((id, options) => call('downloads', 'getFileIcon', { id: id, size: options && options.size })),
+            showDefaultFolder: api(() => call('downloads', 'showDefaultFolder', {})),
+            // Tuff doesn't hold back dangerous files, and has no download shelf to hide.
+            acceptDanger: api(() => undefined),
+            setShelfEnabled: api(() => undefined),
+            setUiOptions: api(() => undefined),
+            drag: () => undefined,
             onCreated: event('downloads.onCreated'),
             onChanged: event('downloads.onChanged'),
             onErased: event('downloads.onErased'),
           });
           implement('system', {
+            display: {
+              getInfo: api(() => call('system.display', 'getInfo', {})),
+              getDisplayLayout: api(() => []),
+              onDisplayChanged: stub(label + '.system.display.onDisplayChanged', true),
+            },
             cpu: { getInfo: api(() => call('system.cpu', 'getInfo', {})) },
             memory: { getInfo: api(() => call('system.memory', 'getInfo', {})) },
             storage: { getInfo: api(() => call('system.storage', 'getInfo', {})) },
@@ -1131,10 +1170,18 @@ enum ExtensionCompat {
             isSpeaking: api(() => call('tts', 'isSpeaking', {})),
             getVoices: api(() => call('tts', 'getVoices', {})),
             onEvent: event('tts.onEvent'),
+            onVoicesChanged: stub(label + '.tts.onVoicesChanged', true),
           });
           implement('search', {
             query: api((query) => call('search', 'query', query)),
             get: api(() => call('search', 'get', {})),
+            // Firefox: { query, engine, disposition, tabId }. Tuff searches with its own engine.
+            search: api(async (properties) => {
+              const p = properties || {};
+              const args = { text: p.query, disposition: p.disposition || (p.tabId === undefined ? undefined : 'CURRENT_TAB') };
+              if (p.tabId !== undefined && p.tabId !== null) args.tabIndex = (await root.tabs.get(p.tabId)).index;
+              return call('search', 'query', args);
+            }),
           });
           // Tab ids <-> Tuff's indexes in the window (Tuff can't know WebKit's ids).
           const indexOf = async (tabId) => (await root.tabs.get(tabId)).index;
@@ -1391,6 +1438,138 @@ enum ExtensionCompat {
             OnInputEnteredDisposition: { CURRENT_TAB: 'currentTab', NEW_FOREGROUND_TAB: 'newForegroundTab', NEW_BACKGROUND_TAB: 'newBackgroundTab' },
             DescriptionStyleType: { URL: 'url', MATCH: 'match', DIM: 'dim' },
           });
+
+          // chrome.bookmarks, on Tuff's bookmarks (ExtensionBookmarks).
+          implement('bookmarks', {
+            get: api((idOrIdList) => call('bookmarks', 'get', { ids: [].concat(idOrIdList) })),
+            getChildren: api((id) => call('bookmarks', 'getChildren', { id: String(id) })),
+            getRecent: api((numberOfItems) => call('bookmarks', 'getRecent', { numberOfItems: numberOfItems })),
+            getTree: api(() => call('bookmarks', 'getTree', {})),
+            getSubTree: api((id) => call('bookmarks', 'getSubTree', { id: String(id) })),
+            search: api((query) => call('bookmarks', 'search', { query: query })),
+            create: api((bookmark) => call('bookmarks', 'create', { bookmark: bookmark || {} })),
+            update: api((id, changes) => call('bookmarks', 'update', { id: String(id), changes: changes || {} })),
+            move: api((id, destination) => call('bookmarks', 'move', { id: String(id), destination: destination || {} })),
+            remove: api((id) => call('bookmarks', 'remove', { id: String(id) })),
+            removeTree: api((id) => call('bookmarks', 'removeTree', { id: String(id) })),
+            onCreated: event('bookmarks.onCreated'),
+            onRemoved: event('bookmarks.onRemoved'),
+            onChanged: event('bookmarks.onChanged'),
+            onMoved: event('bookmarks.onMoved'),
+            onChildrenReordered: stub(label + '.bookmarks.onChildrenReordered', true),
+            onImportBegan: stub(label + '.bookmarks.onImportBegan', true),
+            onImportEnded: stub(label + '.bookmarks.onImportEnded', true),
+            MAX_WRITE_OPERATIONS_PER_HOUR: 1000000,
+            MAX_SUSTAINED_WRITE_OPERATIONS_PER_MINUTE: 1000000,
+          });
+
+          // chrome.declarativeContent: Tuff keeps the rules and checks each page against them
+          // (ExtensionDeclarativeContent), then asks here for the action to be turned on or off,
+          // which only the extension itself can do.
+          const declarative = (name) => function (options) {
+            Object.assign(this, options || {});
+            this.instanceType = 'declarativeContent.' + name;
+          };
+          // Icons are left out: Tuff doesn't apply SetIcon, and ImageData doesn't travel well.
+          const plainRules = (rules) => JSON.parse(JSON.stringify(rules || [], (key, value) => key === 'imageData' ? undefined : value));
+          implement('declarativeContent', {
+            PageStateMatcher: declarative('PageStateMatcher'),
+            ShowAction: declarative('ShowAction'),
+            ShowPageAction: declarative('ShowPageAction'),
+            SetIcon: declarative('SetIcon'),
+            RequestContentScript: declarative('RequestContentScript'),
+            onPageChanged: {
+              addRules: api((rules) => call('declarativeContent', 'addRules', { rules: plainRules(rules) })),
+              removeRules: api((ids) => call('declarativeContent', 'removeRules', { ids: Array.isArray(ids) ? ids : undefined })),
+              getRules: api((ids) => call('declarativeContent', 'getRules', { ids: Array.isArray(ids) ? ids : undefined })),
+              addListener: () => undefined, removeListener: () => undefined, hasListener: () => false, hasListeners: () => false,
+            },
+          });
+          if (declared.includes('declarativeContent')) {
+            event('declarativeContent.__apply').addListener((details) => {
+              let action;
+              try { action = root.action || root.pageAction || root.browserAction; } catch (e) {}
+              if (!action || !details || typeof details.tabId !== 'number' || details.tabId < 0) return;
+              try {
+                const result = details.show ? action.enable(details.tabId) : action.disable(details.tabId);
+                if (result && result.catch) result.catch(() => {});
+              } catch (e) {}
+            });
+          }
+
+          // Gaps inside namespaces WebKit has.
+          const fill = (namespace, name, value) => {
+            let object;
+            try { object = root[namespace]; } catch (e) { return; }
+            if (!object || typeof object !== 'object' || !absent(object, name)) return;
+            add(object, name, value);
+            pins.push(object);
+          };
+          fill('i18n', 'detectLanguage', api((text) => call('i18n', 'detectLanguage', { text: String(text || '') })));
+          fill('tabs', 'discard', api(async (tabId) => {
+            if (typeof tabId !== 'number') throw new Error('Tuff needs the id of the tab to discard.');
+            await call('tabs', 'discard', { tabIndex: await indexOf(tabId) });
+            return root.tabs.get(tabId);
+          }));
+          // Chrome's highlight names tabs by their index in the window, as Tuff does.
+          fill('tabs', 'highlight', api(async (info) => {
+            await call('tabs', 'highlight', { tabs: info && info.tabs });
+            return root.windows.getLastFocused({ populate: true });
+          }));
+          fill('tabs', 'getZoomSettings', api(() => call('tabs', 'zoomSettings', {})));
+          fill('tabs', 'setZoomSettings', api((tabId, settings) => {
+            const s = (tabId && typeof tabId === 'object') ? tabId : (settings || {});
+            if ((s.mode && s.mode !== 'automatic') || (s.scope && s.scope !== 'per-origin')) {
+              throw new Error('Tuff only supports automatic, per-site zoom.');
+            }
+            return undefined;
+          }));
+          fill('tabs', 'print', api(() => call('tabs', 'print', {})));
+          fill('tabs', 'warmup', api(() => undefined));
+          // Firefox's page action shows and hides; WebKit's enables and disables.
+          let pageAction;
+          try { pageAction = root.pageAction; } catch (e) {}
+          if (pageAction && typeof pageAction.enable === 'function') {
+            fill('pageAction', 'show', api((tabId) => pageAction.enable(tabId)));
+            fill('pageAction', 'hide', api((tabId) => pageAction.disable(tabId)));
+            fill('pageAction', 'isShown', api((details) => pageAction.isEnabled(details)));
+          }
+          // Badge colours: Tuff draws the badge, so it needs them too (ExtensionBadgeColors).
+          const badgeTab = async (details) => (details && typeof details.tabId === 'number') ? indexOf(details.tabId) : undefined;
+          for (const name of ['action', 'browserAction']) {
+            let action;
+            try { action = root[name]; } catch (e) { continue; }
+            if (!action || typeof action !== 'object') continue;
+            const setBackground = action.setBadgeBackgroundColor;
+            if (typeof setBackground === 'function' && !setBackground.__tuff) {
+              const wrapped = api(async (details) => {
+                await setBackground(details);
+                await call('action', 'setBadgeColor', { kind: 'background', color: details && details.color, tabIndex: await badgeTab(details) });
+              });
+              wrapped.__tuff = true;
+              add(action, 'setBadgeBackgroundColor', wrapped);
+            }
+            fill(name, 'setBadgeTextColor', api(async (details) =>
+              call('action', 'setBadgeColor', { kind: 'text', color: details && details.color, tabIndex: await badgeTab(details) })));
+            fill(name, 'getBadgeTextColor', api(async (details) => call('action', 'getBadgeTextColor', { tabIndex: await badgeTab(details) })));
+            fill(name, 'getUserSettings', api(() => ({ isOnToolbar: true })));
+            // Chrome's isEnabled takes a tab id; WebKit wants Firefox's `{ tabId }`.
+            const isEnabled = action.isEnabled;
+            if (typeof isEnabled === 'function' && !isEnabled.__tuff) {
+              const tolerant = (details, ...rest) => isEnabled(typeof details === 'number' ? { tabId: details } : details, ...rest);
+              tolerant.__tuff = true;
+              add(action, 'isEnabled', tolerant);
+            }
+            pins.push(action);
+          }
+          fill('runtime', 'requestUpdateCheck', api(() => call('runtime', 'requestUpdateCheck', {})));
+          // Only for Firefox extensions: Chrome ones often take its presence to mean Firefox.
+          let manifest = {};
+          try { manifest = root.runtime.getManifest() || {}; } catch (e) {}
+          if ((manifest.browser_specific_settings && manifest.browser_specific_settings.gecko) || (manifest.applications && manifest.applications.gecko)) {
+            fill('runtime', 'getBrowserInfo', api(() => call('runtime', 'getBrowserInfo', {})));
+            fill('commands', 'openShortcutSettings', api(() => call('commands', 'openShortcutSettings', {})));
+          }
 
           // Scripts registered at run time with inline code (WebKit only registers files). Tuff
           // adds them to every tab as user scripts limited to the requested URLs; see

@@ -134,6 +134,19 @@ final class PasswordStore {
         persist()
     }
 
+    /// What sync brought: logins to add or replace (by ID), and ones deleted elsewhere.
+    func applySync(_ upserts: [SavedLogin], removing removals: Set<UUID>) {
+        guard !upserts.isEmpty || !removals.isEmpty else { return }
+        logins.removeAll { removals.contains($0.id) }
+        for login in upserts {
+            if let index = logins.firstIndex(where: { $0.id == login.id }) { logins[index] = login } else { logins.append(login) }
+        }
+        persist()
+    }
+
+    /// Posted whenever passwords change (sync uploads the changes).
+    static let didChange = Notification.Name("TuffPasswordsChanged")
+
     // MARK: CSV
 
     /// Reads the CSV Chrome, Safari, Firefox and 1Password export (a header row naming the
@@ -178,6 +191,7 @@ final class PasswordStore {
     // MARK: Disk
 
     private func persist() {
+        NotificationCenter.default.post(name: Self.didChange, object: self)
         guard let key, let data = try? JSONEncoder().encode(Vault(logins: logins, never: never)),
               let sealed = try? AES.GCM.seal(data, using: key).combined else { return }
         let file = file

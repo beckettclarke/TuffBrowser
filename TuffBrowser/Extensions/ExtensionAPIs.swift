@@ -1,4 +1,5 @@
 import AppKit
+import NaturalLanguage
 import WebKit
 
 /// Native implementations of WebExtension APIs that WebKit does not provide, exposed to the
@@ -21,7 +22,8 @@ enum ExtensionAPIPermissions {
         "power": "power", "idle": "idle", "tts": "tts", "search": "search",
         "userScripts": "userScripts", "tabGroups": "tabGroups", "contextualIdentities": "contextualIdentities",
         "contentSettings": "contentSettings", "clipboard": "clipboardWrite", "find": "find",
-        "omnibox": "omnibox", "theme": "theme",
+        "omnibox": "omnibox", "theme": "theme", "bookmarks": "bookmarks", "declarativeContent": "declarativeContent",
+        "system.display": "system.display",
     ]
 
     static func setting(_ path: String) -> String? {
@@ -167,7 +169,28 @@ final class ExtensionAPIBridge {
             }
             finish(managementInfo(record))
         case ("management", "getPermissionWarningsById"):
-            finish([String]())
+            guard let id = args["id"] as? String, let other = extensions.contexts[id] else {
+                throw APIError("No extension with id: \(args["id"] ?? "?").")
+            }
+            finish(ExtensionManager.permissionSummary(other.webExtension.manifest).map(\.text))
+        case ("management", "getPermissionWarningsByManifest"):
+            guard let text = args["manifest"] as? String,
+                  let manifest = (try? JSONSerialization.jsonObject(with: Data(text.utf8), options: [.json5Allowed])) as? [String: Any] else {
+                throw APIError("Manifest is not valid JSON.")
+            }
+            finish(ExtensionManager.permissionSummary(manifest).map(\.text))
+        case ("management", "uninstall"):
+            guard let id = args["id"] as? String, extensions.records.contains(where: { $0.id == id }) else {
+                throw APIError("No extension with id: \(args["id"] ?? "?").")
+            }
+            // Removing another extension always asks, whatever the caller passes.
+            Task { @MainActor in
+                if await self.extensions.confirmUninstall(id: id) {
+                    finish(nil)
+                } else {
+                    fail(APIError("User cancelled uninstall request."))
+                }
+            }
         case ("management", "setEnabled"):
             guard let id = args["id"] as? String, let enabled = args["enabled"] as? Bool else {
                 throw APIError("id and enabled are required.")
@@ -188,12 +211,18 @@ final class ExtensionAPIBridge {
         case ("sessions", "getRecentlyClosed"):
             finish(browser.recentlyClosedSessions(maxResults: args["maxResults"] as? Int ?? 25))
         case ("sessions", "restore"):
+            // A tab from another device (getDevices): open it here.
+            if let id = args["sessionId"] as? String, let remote = MainActor.assumeIsolated({ Self.syncedTab(sessionID: id) }) {
+                browser.newTab(url: remote.url)
+                finish(nil)
+                break
+            }
             guard let restored = browser.restoreSession(id: args["sessionId"] as? String) else {
                 throw APIError("No recently closed session to restore.")
             }
             finish(restored)
         case ("sessions", "getDevices"):
-            finish([[String: Any]]())
+            finish(MainActor.assumeIsolated { Self.syncedDevices(maxResults: args["maxResults"] as? Int ?? 25) })
 
         // chrome.notifications
         case ("notifications", "create"):
@@ -256,6 +285,13 @@ final class ExtensionAPIBridge {
             ExtensionDownloads.shared.pause(id: try Self.int(args["id"]), finish: finish, fail: fail)
         case ("downloads", "resume"):
             ExtensionDownloads.shared.resume(id: try Self.int(args["id"]), finish: finish, fail: fail)
+        case ("downloads", "removeFile"):
+            ExtensionDownloads.shared.removeFile(id: try Self.int(args["id"]), finish: finish, fail: fail)
+        case ("downloads", "getFileIcon"):
+            ExtensionDownloads.shared.fileIcon(id: try Self.int(args["id"]), size: args["size"] as? Int ?? 32, finish: finish, fail: fail)
+        case ("downloads", "showDefaultFolder"):
+            NSWorkspace.shared.open(DownloadManager.downloadsFolder())
+            finish(nil)
 
         // chrome.system / power / idle
         case ("system.cpu", "getInfo"):
@@ -294,7 +330,9 @@ final class ExtensionAPIBridge {
         case ("search", "query"):
             guard let text = args["text"] as? String else { throw APIError("text is required.") }
             let url = AppSettings.shared.general.searchEngine.searchURL(for: text)
-            if (args["disposition"] as? String) == "CURRENT_TAB", let tab = browser.selectedTab {
+            // The current tab unless asked otherwise, as in Chrome and Firefox.
+            let disposition = args["disposition"] as? String ?? "CURRENT_TAB"
+            if disposition == "CURRENT_TAB", let tab = args["tabIndex"] != nil ? try ExtensionFind.tab(args["tabIndex"]) : browser.selectedTab {
                 tab.load(url)
             } else {
                 browser.newTab(url: url)
@@ -427,6 +465,94 @@ final class ExtensionAPIBridge {
             ExtensionOmnibox.shared.suggest(request: try Self.int(args["request"]), results: args["suggestions"] as? [[String: Any]] ?? [])
             finish(nil)
 
+        // chrome.bookmarks (ExtensionBookmarks)
+        case ("bookmarks", "get"):
+            let ids = (args["ids"] as? [Any] ?? []).map { "\($0)" }
+            finish(try ExtensionBookmarks.shared.get(ids))
+        case ("bookmarks", "getChildren"):
+            finish(try ExtensionBookmarks.shared.getChildren(try Self.string(args["id"])))
+        case ("bookmarks", "getRecent"):
+            finish(try ExtensionBookmarks.shared.getRecent(args["numberOfItems"] as? Int ?? 0))
+        case ("bookmarks", "getTree"):
+            finish(try ExtensionBookmarks.shared.getTree())
+        case ("bookmarks", "getSubTree"):
+            finish(try ExtensionBookmarks.shared.getSubTree(try Self.string(args["id"])))
+        case ("bookmarks", "search"):
+            finish(try ExtensionBookmarks.shared.search(args["query"]))
+        case ("bookmarks", "create"):
+            finish(try ExtensionBookmarks.shared.create(args["bookmark"] as? [String: Any] ?? [:]))
+        case ("bookmarks", "update"):
+            finish(try ExtensionBookmarks.shared.update(try Self.string(args["id"]), changes: args["changes"] as? [String: Any] ?? [:]))
+        case ("bookmarks", "move"):
+            finish(try ExtensionBookmarks.shared.move(try Self.string(args["id"]), destination: args["destination"] as? [String: Any] ?? [:]))
+        case ("bookmarks", "remove"), ("bookmarks", "removeTree"):
+            try ExtensionBookmarks.shared.remove(try Self.string(args["id"]), recursive: method == "removeTree")
+            finish(nil)
+
+        // chrome.declarativeContent (ExtensionDeclarativeContent)
+        case ("declarativeContent", "addRules"):
+            finish(try ExtensionDeclarativeContent.shared.addRules(args["rules"] as? [[String: Any]] ?? [], extensionID: context.uniqueIdentifier))
+        case ("declarativeContent", "removeRules"):
+            ExtensionDeclarativeContent.shared.removeRules(args["ids"] as? [String], extensionID: context.uniqueIdentifier)
+            finish(nil)
+        case ("declarativeContent", "getRules"):
+            finish(ExtensionDeclarativeContent.shared.getRules(args["ids"] as? [String], extensionID: context.uniqueIdentifier))
+
+        // Badge colours (Tuff draws the badge; see ExtensionBadgeColors).
+        case ("action", "setBadgeColor"):
+            let tab = args["tabIndex"] != nil ? try ExtensionFind.tab(args["tabIndex"]) : nil
+            try ExtensionBadgeColors.shared.set(try Self.string(args["kind"]), value: args["color"], tab: tab, extensionID: context.uniqueIdentifier)
+            finish(nil)
+        case ("action", "getBadgeTextColor"):
+            let tab = args["tabIndex"] != nil ? try ExtensionFind.tab(args["tabIndex"]) : nil
+            finish(ExtensionBadgeColors.shared.textColor(for: context.uniqueIdentifier, tab: tab))
+
+        // Gaps in namespaces WebKit has.
+        case ("i18n", "detectLanguage"):
+            finish(Self.detectLanguage(args["text"] as? String ?? ""))
+        case ("system.display", "getInfo"):
+            finish(ExtensionSystem.shared.displayInfo())
+        case ("tabs", "discard"):
+            let tab = try ExtensionFind.tab(args["tabIndex"])
+            guard !browser.isOnScreen(tab) else { throw APIError("Cannot discard the active tab.") }
+            tab.sleep()
+            finish(nil)
+        case ("tabs", "highlight"):
+            let indexes = (args["tabs"] as? [Int]) ?? (args["tabs"] as? Int).map { [$0] } ?? []
+            guard let first = indexes.first else { throw APIError("No highlighted tab.") }
+            browser.select(try ExtensionFind.tab(first))
+            finish(nil)
+        case ("tabs", "zoomSettings"):
+            finish(["mode": "automatic", "scope": "per-origin", "defaultZoomFactor": SiteZoom.defaultZoom])
+        case ("tabs", "print"):
+            AppDelegate.shared?.printPage(nil)
+            finish(nil)
+        case ("runtime", "getBrowserInfo"):
+            let info = Bundle.main.infoDictionary ?? [:]
+            finish([
+                "name": "Tuff", "vendor": "Tuff",
+                "version": info["CFBundleShortVersionString"] as? String ?? "",
+                "buildID": info["CFBundleVersion"] as? String ?? "",
+            ])
+        case ("runtime", "requestUpdateCheck"):
+            guard let record = extensions.records.first(where: { $0.id == context.uniqueIdentifier }), record.source != .unpacked else {
+                finish(["status": "no_update"])
+                break
+            }
+            Task { @MainActor in
+                guard let latest = await ExtensionManager.latestVersion(of: record),
+                      ExtensionManager.isVersion(latest, newerThan: record.version) else {
+                    finish(["status": "no_update"])
+                    return
+                }
+                finish(["status": "update_available", "version": latest])
+                // Tuff installs updates straight away (Chrome waits for a restart or runtime.reload).
+                self.extensions.updateFromStore(id: record.id)
+            }
+        case ("commands", "openShortcutSettings"):
+            AppDelegate.shared?.showSettings(tab: .extensions)
+            finish(nil)
+
         // Internal permission calls for native-only names WebKit rejects in permissions.*.
         case ("__permissions", "contains"):
             let names = args["permissions"] as? [String] ?? []
@@ -474,12 +600,62 @@ final class ExtensionAPIBridge {
         return id
     }
 
+    // MARK: sessions on other devices
+
+    /// Open tabs on the other devices of the Firefox account (Settings → Sync), as Chrome's
+    /// `sessions.Device`: each device has one window holding its tabs, most recent first.
+    @MainActor
+    private static func syncedDevices(maxResults: Int) -> [[String: Any]] {
+        SyncManager.shared.devices.map { device in
+            let tabs: [[String: Any]] = device.tabs.prefix(max(1, maxResults)).enumerated().map { index, tab in
+                [
+                    "index": index, "windowId": -1, "url": tab.url.absoluteString, "title": tab.title,
+                    "active": index == 0, "highlighted": index == 0, "selected": index == 0, "pinned": false,
+                    "incognito": false, "discarded": false, "autoDiscardable": true, "groupId": -1,
+                    "sessionId": "\(device.id):\(index)",
+                ]
+            }
+            return [
+                "deviceName": device.name,
+                "sessions": [[
+                    "lastModified": Int(device.tabs.first?.lastUsed.timeIntervalSince1970 ?? 0),
+                    "window": [
+                        "id": -1, "focused": false, "incognito": false, "alwaysOnTop": false,
+                        "type": "normal", "state": "normal", "sessionId": device.id, "tabs": tabs,
+                    ],
+                ]],
+            ]
+        }
+    }
+
+    /// The synced tab a `sessionId` from `syncedDevices` names.
+    @MainActor
+    private static func syncedTab(sessionID: String) -> SyncDevice.OpenTab? {
+        let parts = sessionID.split(separator: ":", omittingEmptySubsequences: false)
+        guard parts.count >= 2, let index = Int(parts.last!) else { return nil }
+        let deviceID = parts.dropLast().joined(separator: ":")
+        guard let device = SyncManager.shared.devices.first(where: { $0.id == deviceID }), device.tabs.indices.contains(index) else { return nil }
+        return device.tabs[index]
+    }
+
+    // MARK: i18n.detectLanguage
+
+    /// Chrome's answer shape: up to three languages with a percentage each.
+    private static func detectLanguage(_ text: String) -> [String: Any] {
+        let recognizer = NLLanguageRecognizer()
+        recognizer.processString(text)
+        let hypotheses = recognizer.languageHypotheses(withMaximum: 3).sorted { $0.value > $1.value }
+        let languages = hypotheses.map { ["language": $0.key.rawValue, "percentage": Int(($0.value * 100).rounded())] }
+        return ["isReliable": (hypotheses.first?.value ?? 0) >= 0.8, "languages": languages.isEmpty ? [["language": "und", "percentage": 100]] : languages]
+    }
+
     // MARK: browsingData
 
     /// The data types Tuff can actually remove, for `browsingData.settings`.
     private static let removableDataTypes: [String: Bool] = [
         "cache": true, "cookies": true, "localStorage": true, "sessionStorage": true,
         "indexedDB": true, "webSQL": true, "serviceWorkers": true, "fileSystems": true, "history": true,
+        "cacheStorage": true, "appcache": true,
         "downloads": true, "formData": true, "passwords": true,
     ]
 
@@ -495,6 +671,8 @@ final class ExtensionAPIBridge {
         if types["webSQL"] as? Bool == true { dataTypes.insert(WKWebsiteDataTypeWebSQLDatabases) }
         if types["serviceWorkers"] as? Bool == true { dataTypes.insert(WKWebsiteDataTypeServiceWorkerRegistrations) }
         if types["fileSystems"] as? Bool == true { dataTypes.insert(WKWebsiteDataTypeFileSystem) }
+        if types["cacheStorage"] as? Bool == true { dataTypes.insert(WKWebsiteDataTypeFetchCache) }
+        if types["appcache"] as? Bool == true { dataTypes.insert(WKWebsiteDataTypeOfflineWebApplicationCache) }
         if types["history"] as? Bool == true {
             if since > 0 {
                 HistoryStore.shared.deleteRange(startTime: since, endTime: Date().timeIntervalSince1970 * 1000)

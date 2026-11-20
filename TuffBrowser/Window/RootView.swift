@@ -480,8 +480,14 @@ struct WebCard: View {
                 shape.fill(.primary.opacity(0.05))
             }
             if tab == nil {
-                EmptyStateView()
-                    .transition(.opacity.combined(with: .scale(scale: 0.98)))
+                // The vertical layout shows the same faded mark as an empty New Tab page.
+                if state.tabLayout == .vertical {
+                    NewTabPageView()
+                        .transition(.opacity)
+                } else {
+                    EmptyStateView()
+                        .transition(.opacity.combined(with: .scale(scale: 0.98)))
+                }
             } else if newTabPage {
                 NewTabPageView()
                     .transition(.opacity)

@@ -1,4 +1,5 @@
 import AppKit
+import UniformTypeIdentifiers
 import WebKit
 
 /// Native `chrome.downloads` for extensions, backed by the same items as page downloads.
@@ -15,6 +16,7 @@ final class ExtensionDownloads {
         var totalBytes: Int64
         var url: String
         var error: String?
+        var exists: Bool
 
         init(_ item: DownloadItem) {
             state = ExtensionDownloads.chromeState(item)
@@ -23,6 +25,7 @@ final class ExtensionDownloads {
             totalBytes = item.totalBytes
             url = item.url?.absoluteString ?? ""
             if case .failed(let reason) = item.state, !item.isPaused && !item.isQueued { error = reason }
+            exists = item.destination.map { FileManager.default.fileExists(atPath: $0.path) } ?? false
         }
     }
 
@@ -53,6 +56,7 @@ final class ExtensionDownloads {
             if old.totalBytes != now.totalBytes { change("totalBytes", old.totalBytes, now.totalBytes) }
             if old.url != now.url { change("url", old.url, now.url) }
             if old.error != now.error { change("error", old.error, now.error) }
+            if old.exists != now.exists { change("exists", old.exists, now.exists) }
             if delta.count > 1 { ExtensionEventPush.shared.emit("downloads.onChanged", args: [delta]) }
         } else if item.chromeID != nil {
             previous[key] = now
@@ -194,6 +198,45 @@ final class ExtensionDownloads {
         guard item.isPaused else { fail(error("Download \(id) is not paused.")); return }
         manager.retry(item)
         finish(nil)
+    }
+
+    /// Deletes a finished download's file (the entry stays, with `exists: false`).
+    func removeFile(id: Int, finish: @escaping (Any?) -> Void, fail: @escaping (Error) -> Void) {
+        guard let item = item(id: id) else { fail(error("No download with id \(id).")); return }
+        guard item.state == .finished, let url = item.destination else { fail(error("Download \(id) must be complete.")); return }
+        do {
+            try FileManager.default.trashItem(at: url, resultingItemURL: nil)
+        } catch {
+            fail(error)
+            return
+        }
+        changed(item)
+        finish(nil)
+    }
+
+    /// The icon Finder shows for the file, as a PNG data URL of `size` (16 or 32) points.
+    func fileIcon(id: Int, size: Int, finish: @escaping (Any?) -> Void, fail: @escaping (Error) -> Void) {
+        guard let item = item(id: id) else { fail(error("No download with id \(id).")); return }
+        let side = CGFloat(size == 16 ? 16 : 32)
+        let icon: NSImage
+        if let url = item.destination, FileManager.default.fileExists(atPath: url.path) {
+            icon = NSWorkspace.shared.icon(forFile: url.path)
+        } else {
+            icon = NSWorkspace.shared.icon(for: UTType(filenameExtension: (item.filename as NSString).pathExtension) ?? .data)
+        }
+        let scale = NSScreen.main?.backingScaleFactor ?? 2
+        guard let bitmap = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: Int(side * scale), pixelsHigh: Int(side * scale),
+                                            bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+                                            colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0) else {
+            fail(error("The icon couldn’t be drawn."))
+            return
+        }
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: bitmap)
+        icon.draw(in: NSRect(x: 0, y: 0, width: side * scale, height: side * scale))
+        NSGraphicsContext.restoreGraphicsState()
+        guard let png = bitmap.representation(using: .png, properties: [:]) else { fail(error("The icon couldn’t be drawn.")); return }
+        finish("data:image/png;base64," + png.base64EncodedString())
     }
 
     static func isValidFilename(_ filename: String) -> Bool {

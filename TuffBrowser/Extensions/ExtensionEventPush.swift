@@ -20,14 +20,22 @@ final class ExtensionEventPush {
     func subscribe(extensionID: String, event: String, context: WKWebExtensionContext) {
         subscriptions[extensionID, default: []].insert(event)
         if event == "idle.onStateChanged" { ExtensionSystem.shared.startIdleMonitoring() }
+        // Bookmark events compare the tree before and after each change, from here on.
+        if event.hasPrefix("bookmarks.") { _ = ExtensionBookmarks.shared }
         if relays[extensionID] == nil {
             let url = context.baseURL.appendingPathComponent(ExtensionCompat.eventRelayPage)
             relays[extensionID] = EventRelay(configuration: context.webViewConfiguration, url: url)
         }
+        if event == ExtensionDeclarativeContent.applyEvent { ExtensionDeclarativeContent.shared.listenerAdded(extensionID: extensionID) }
     }
 
     func unsubscribe(extensionID: String, event: String) {
         subscriptions[extensionID]?.remove(event)
+    }
+
+    /// Whether any extension listens for one of `events`, so the work of producing them can be skipped.
+    func isListening(to events: Set<String>) -> Bool {
+        subscriptions.values.contains { !$0.isDisjoint(with: events) }
     }
 
     /// Sends an event to every extension listening for it. `extra` asks the shim to fill
@@ -60,6 +68,18 @@ final class ExtensionEventPush {
             guard allows(id, event), let context = ExtensionManager.shared.contexts[id], allowed(context) else { continue }
             relays[id]?.send(event: event, args: [details], extra: ["tabs": indexes])
         }
+    }
+
+    /// Sends a tab event to one extension, if it listens; returns whether it was sent. The tab
+    /// travels as in `emit(_:details:tabs:allowed:)`.
+    @discardableResult
+    func emit(_ event: String, details: [String: Any], tab: Tab, to extensionID: String) -> Bool {
+        guard tab.browser === BrowserState.shared, !(tab.browser?.isPrivate ?? true),
+              let index = BrowserState.shared.allTabs.firstIndex(where: { $0 === tab }),
+              subscriptions[extensionID]?.contains(event) == true, allows(extensionID, event),
+              let relay = relays[extensionID] else { return false }
+        relay.send(event: event, args: [details], extra: ["tabs": ["tabId": index]])
+        return true
     }
 
     /// Sends a window event; the shim passes the listener the window as `windows.getLastFocused`
@@ -120,7 +140,9 @@ private final class EventRelay: NSObject, WKNavigationDelegate {
               let json = String(data: data, encoding: .utf8) else { return }
         sending = true
         let generation = self.generation
-        webView.evaluateJavaScript("try { chrome.runtime.sendMessage(\(json)); } catch (e) {}") { [weak self] _, error in
+        // Ends in `void 0`: the script's value would otherwise be sendMessage's promise, which
+        // evaluateJavaScript can't return and reports as an error (resending the same event forever).
+        webView.evaluateJavaScript("try { chrome.runtime.sendMessage(\(json)); } catch (e) {} void 0;") { [weak self] _, error in
             DispatchQueue.main.async {
                 guard let self, self.generation == generation else { return }
                 self.sending = false

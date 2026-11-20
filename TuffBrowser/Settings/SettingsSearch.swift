@@ -233,6 +233,11 @@ enum SettingsSearch {
         .row("When a language isn’t on this Mac", .privacy, in: "Translation", named: "Translation", "translate google translation language download"),
         .row("Share anonymous usage statistics", .privacy, in: "Analytics", "analytics telemetry tracking posthog usage data statistics"),
 
+        // Sync
+        .row("Sign in to sync", .sync, in: "Mozilla account", "sync mozilla firefox zen account sign in cloud"),
+        .group("What to sync", .sync, named: "What to sync", "sync bookmarks history passwords open tabs devices"),
+        .group("Google account", .sync, named: "Google account", "chrome google sync account"),
+
         // Passwords
         .row("Save and fill passwords", .passwords, in: nil, "passwords logins autofill sign in save offer"),
         .group("Saved passwords", .passwords, named: "Saved passwords", "passwords logins show copy edit delete add"),

@@ -39,6 +39,9 @@ struct ExtensionActionInfo: Identifiable {
     let name: String
     let icon: NSImage?
     let badge: String
+    /// Set by the extension (`setBadgeBackgroundColor` / `setBadgeTextColor`); nil for Tuff's own.
+    var badgeColor: NSColor? = nil
+    var badgeTextColor: NSColor? = nil
     let enabled: Bool
     /// Whether the extension has a side panel, and whether it is the one open now.
     let hasPanel: Bool
@@ -357,6 +360,8 @@ final class ExtensionManager: NSObject {
         ExtensionEventPush.shared.extensionUnloaded(id)
         ExtensionContentScripts.shared.extensionUnloaded(id)
         SidePanelManager.shared.extensionUnloaded(id)
+        ExtensionDeclarativeContent.shared.extensionUnloaded(id)
+        ExtensionBadgeColors.shared.extensionUnloaded(id)
         guard let context = contexts.removeValue(forKey: id) else { return }
         try? controller.unload(context)
         revision += 1
@@ -380,6 +385,7 @@ final class ExtensionManager: NSObject {
         ExtensionEventPush.shared.emit("management.onUninstalled", args: [id])
         unload(id)
         extensionRemoved(id)
+        ExtensionDeclarativeContent.shared.extensionUninstalled(id)
         if record.path == nil {
             try? FileManager.default.removeItem(at: directory(for: record))
         } else {
@@ -872,11 +878,14 @@ final class ExtensionManager: NSObject {
             let action = context.action(for: tab)
             let size = CGSize(width: 18, height: 18)
             let icon = action?.icon(for: size) ?? context.webExtension.actionIcon(for: size) ?? context.webExtension.icon(for: size)
+            let colors = ExtensionBadgeColors.shared.colors(for: record.id, tab: tab)
             return ExtensionActionInfo(
                 id: record.id,
                 name: action?.label.isEmpty == false ? action!.label : record.name,
                 icon: icon,
                 badge: action?.badgeText ?? "",
+                badgeColor: colors.background,
+                badgeTextColor: colors.text,
                 enabled: action?.isEnabled ?? true,
                 hasPanel: hasPanel,
                 panelOpen: hasPanel && panels.openID == record.id && panels.isShowing,

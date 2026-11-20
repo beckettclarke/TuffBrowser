@@ -4,12 +4,13 @@ import UniformTypeIdentifiers
 import WebKit
 
 enum SettingsTab: String, CaseIterable, Identifiable {
-    case general, importData, appearance, layout, tabs, spaces, search, downloads, privacy, passwords, websites, extensions, mods, shortcuts, advanced, about
+    case general, sync, importData, appearance, layout, tabs, spaces, search, downloads, privacy, passwords, websites, extensions, mods, shortcuts, advanced, about
     var id: String { rawValue }
 
     var label: String {
         switch self {
         case .general: "General"
+        case .sync: "Sync"
         case .importData: "Import"
         case .appearance: "Theme"
         case .layout: "Layout"
@@ -31,6 +32,7 @@ enum SettingsTab: String, CaseIterable, Identifiable {
     var symbol: String {
         switch self {
         case .general: "gearshape.fill"
+        case .sync: "arrow.triangle.2.circlepath"
         case .importData: "square.and.arrow.down.fill"
         case .appearance: "paintpalette.fill"
         case .layout: "rectangle.split.3x1.fill"
@@ -54,6 +56,7 @@ enum SettingsTab: String, CaseIterable, Identifiable {
     var keywords: String {
         switch self {
         case .general: "startup quit default browser"
+        case .sync: "cloud mozilla firefox zen account sign in google chrome devices"
         case .importData: "migrate switch from another browser"
         case .appearance: "appearance look colour"
         case .layout: "sidebar tab position"
@@ -74,7 +77,7 @@ enum SettingsTab: String, CaseIterable, Identifiable {
 
     /// Sidebar groups, separated by a little space; a group with a title gets a heading.
     static let groups: [(title: String?, tabs: [SettingsTab])] = [
-        (nil, [.general, .importData]),
+        (nil, [.general, .sync, .importData]),
         ("Appearance", [.appearance, .layout]),
         ("Browsing", [.tabs, .spaces, .search, .downloads]),
         ("Privacy", [.privacy, .passwords, .websites]),
@@ -233,6 +236,7 @@ struct SettingsView: View {
     private func page(_ tab: SettingsTab) -> some View {
         switch tab {
         case .general: GeneralPage()
+        case .sync: SyncPage()
         case .importData: ImportPage()
         case .appearance: AppearancePage()
         case .layout: LayoutPage()

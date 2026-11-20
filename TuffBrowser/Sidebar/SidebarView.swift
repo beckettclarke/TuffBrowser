@@ -300,10 +300,10 @@ struct ExtensionActionButton: View {
                 if !action.badge.isEmpty {
                     Text(action.badge)
                         .font(.system(size: 8, weight: .bold, design: .rounded))
-                        .foregroundStyle(.white)
+                        .foregroundStyle(action.badgeTextColor.map { Color(nsColor: $0) } ?? .white)
                         .padding(.horizontal, 3)
                         .padding(.vertical, 1)
-                        .background(Capsule().fill(Color.red))
+                        .background(Capsule().fill(action.badgeColor.map { Color(nsColor: $0) } ?? .red))
                         .offset(x: 2, y: 1)
                 }
             }

@@ -541,3 +541,71 @@ final class ExtensionOmnibox {
         return text
     }
 }
+
+// MARK: - Action badge colours
+
+/// The badge colours of extension buttons: `action.setBadgeBackgroundColor` (which WebKit keeps
+/// but doesn't hand out) and `setBadgeTextColor` (which WebKit lacks). The shim passes both here
+/// as well; Tuff draws the badge. A colour set for a tab wins over the extension's own; with no
+/// text colour, the text is black or white, whichever reads on the background (as in Chrome).
+final class ExtensionBadgeColors {
+    static let shared = ExtensionBadgeColors()
+
+    struct Colors {
+        var background: NSColor?
+        var text: NSColor?
+    }
+
+    private struct Entry {
+        var global = Colors()
+        let tabs = NSMapTable<Tab, Box>.weakToStrongObjects()
+    }
+
+    private final class Box {
+        var colors = Colors()
+    }
+
+    private var colors: [String: Entry] = [:]
+
+    func set(_ kind: String, value: Any?, tab: Tab?, extensionID: String) throws {
+        let color: NSColor?
+        if let value, !(value is NSNull) {
+            guard let parsed = ExtensionTheme.color(value) else { throw ExtensionTheme.Failure("Tuff can’t read the colour \(value).") }
+            color = parsed
+        } else {
+            color = nil
+        }
+        var entry = colors[extensionID] ?? Entry()
+        if let tab {
+            let box = entry.tabs.object(forKey: tab) ?? Box()
+            if kind == "text" { box.colors.text = color } else { box.colors.background = color }
+            entry.tabs.setObject(box, forKey: tab)
+        } else if kind == "text" {
+            entry.global.text = color
+        } else {
+            entry.global.background = color
+        }
+        colors[extensionID] = entry
+        ExtensionManager.shared.revision += 1
+    }
+
+    /// The colours for an extension's badge in `tab`.
+    func colors(for extensionID: String, tab: Tab?) -> Colors {
+        guard let entry = colors[extensionID] else { return Colors() }
+        let own = tab.flatMap { entry.tabs.object(forKey: $0)?.colors }
+        let background = own?.background ?? entry.global.background
+        var text = own?.text ?? entry.global.text
+        if text == nil, let background { text = background.luminance > 0.6 ? .black : .white }
+        return Colors(background: background, text: text)
+    }
+
+    /// `getBadgeTextColor`: Chrome's `[r, g, b, a]`.
+    func textColor(for extensionID: String, tab: Tab?) -> [Int] {
+        let color = (colors(for: extensionID, tab: tab).text ?? .white).usingColorSpace(.sRGB) ?? .white
+        return [color.redComponent, color.greenComponent, color.blueComponent, color.alphaComponent].map { Int(($0 * 255).rounded()) }
+    }
+
+    func extensionUnloaded(_ id: String) {
+        colors[id] = nil
+    }
+}

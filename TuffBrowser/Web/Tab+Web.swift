@@ -27,6 +27,13 @@ extension Tab: WKNavigationDelegate {
             return
         }
 
+        // The end of signing in to sync (Settings → Sync): Tuff takes the code; the page never loads.
+        if navigationAction.targetFrame?.isMainFrame ?? true,
+           MainActor.assumeIsolated({ SyncManager.shared.handleRedirect(url, from: self) }) {
+            decisionHandler(.cancel, preferences)
+            return
+        }
+
         // Magnet links open Tuff's own torrent client (its add sheet asks before anything starts).
         if url.scheme?.lowercased() == "magnet" {
             decisionHandler(.cancel, preferences)
@@ -234,6 +241,7 @@ extension Tab: WKNavigationDelegate {
             pdfDidCommit(u)
         }
         browser?.tabDidNavigate(self)
+        ExtensionDeclarativeContent.shared.evaluate(self)
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
@@ -320,6 +328,7 @@ extension Tab: WKNavigationDelegate {
             fragmentOnly ? "webNavigation.onReferenceFragmentUpdated" : "webNavigation.onHistoryStateUpdated",
             details: details, tabs: ["tabId": self], allowed: { $0.hasPermission(.webNavigation) }
         )
+        ExtensionDeclarativeContent.shared.evaluate(self)
     }
 
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {

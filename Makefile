@@ -17,22 +17,22 @@ LSREGISTER := /System/Library/Frameworks/CoreServices.framework/Frameworks/Launc
 gen:
 	xcodegen generate
 
-## Debug build
-build: gen
-	$(XCODEBUILD) -configuration Debug build | grep -E "error:|warning: |BUILD" || true
+## Debug build, with a progress bar and the total time (scripts/xcbuild.py; the full log is build/debug-build.log)
+build:
+	@scripts/xcbuild.py --label "Debug build" --gen -- $(XCODEBUILD) -configuration Debug build
 	@touch $(DEBUG_APP)
 
 ## Unit tests (TuffBrowserTests). Hosted in a Tuff that opens no windows and loads no profile.
-test: gen
-	$(XCODEBUILD) -configuration Debug test 2>&1 | grep -E "error:|Test Case .* failed|Executed|TEST (SUCCEEDED|FAILED)" || true
+test:
+	@scripts/xcbuild.py --label "Unit tests" --gen --tests -- $(XCODEBUILD) -configuration Debug test
 
 ## Build and launch
 run: build
 	open $(DEBUG_APP)
 
 ## Optimised build
-release: gen
-	$(XCODEBUILD) -configuration Release build | grep -E "error:|BUILD" || true
+release:
+	@scripts/xcbuild.py --label "Release build" --gen -- $(XCODEBUILD) -configuration Release build
 	@touch $(RELEASE_APP)
 	@$(MAKE) size
 

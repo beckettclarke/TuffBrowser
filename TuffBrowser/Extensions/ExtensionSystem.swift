@@ -15,6 +15,32 @@ final class ExtensionSystem {
     private var idleInterval = 60
     private var lastIdleState = "active"
 
+    // MARK: system.display
+
+    /// `system.display.getInfo`: the Mac's screens as Chrome's `DisplayUnitInfo`, in Chrome's
+    /// coordinates (top-left of the main screen is 0, 0; y grows downwards).
+    func displayInfo() -> [[String: Any]] {
+        let screens = NSScreen.screens
+        let top = screens.first?.frame.maxY ?? 0
+        func rect(_ r: NSRect) -> [String: Int] {
+            ["left": Int(r.minX), "top": Int(top - r.maxY), "width": Int(r.width), "height": Int(r.height)]
+        }
+        return screens.enumerated().map { index, screen in
+            let number = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID ?? 0
+            let dpi = (screen.deviceDescription[.resolution] as? NSSize)?.width ?? 72 * screen.backingScaleFactor
+            return [
+                "id": String(number), "name": screen.localizedName, "isPrimary": index == 0,
+                "isInternal": CGDisplayIsBuiltin(number) != 0, "isEnabled": true, "isUnified": false,
+                "dpiX": dpi, "dpiY": dpi, "rotation": Int(CGDisplayRotation(number)),
+                "bounds": rect(screen.frame), "workArea": rect(screen.visibleFrame),
+                "overscan": ["left": 0, "top": 0, "right": 0, "bottom": 0],
+                "mirroringSourceId": "", "mirroringDestinationIds": [String](),
+                "displayZoomFactor": 1, "availableDisplayZoomFactors": [1],
+                "hasTouchSupport": false, "hasAccelerometerSupport": false, "modes": [[String: Any]](),
+            ]
+        }
+    }
+
     // MARK: system.cpu / memory / storage
 
     func cpuInfo() -> [String: Any] {

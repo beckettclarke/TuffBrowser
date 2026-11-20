@@ -103,6 +103,7 @@ enum DebugHooks {
             state.showHistory()
         case "bookmark":
             // bookmark — bookmarks the page on screen; bookmark folder <name>; bookmark bar on|off;
+            // bookmark add <url> <title>; bookmark remove <title>; bookmark rename <title>=<new>;
             // bookmark list
             let words = argument.split(separator: " ", maxSplits: 1).map(String.init)
             let profile = state.bookmarksProfileID
@@ -111,6 +112,26 @@ enum DebugHooks {
                 if let profile { BookmarkStore.shared.addFolder(named: words.count > 1 ? words[1] : "Folder", profile: profile) }
             case "bar":
                 AppSettings.shared.tabs.showBookmarksBar = words.count > 1 && words[1] == "on"
+            case "add":
+                // bookmark add <url> <title>
+                let parts = (words.count > 1 ? words[1] : "").split(separator: " ", maxSplits: 1).map(String.init)
+                if let profile, let url = parts.first.flatMap(URL.init(string:)) {
+                    BookmarkStore.shared.add(url: url, title: parts.count > 1 ? parts[1] : url.displayHost, profile: profile)
+                }
+            case "remove", "rename":
+                // bookmark remove <title>; bookmark rename <title>=<new title>
+                let pair = (words.count > 1 ? words[1] : "").split(separator: "=", maxSplits: 1).map(String.init)
+                func find(_ items: [Bookmark]) -> Bookmark? {
+                    for item in items {
+                        if item.displayTitle == pair.first { return item }
+                        if let found = find(item.children) { return found }
+                    }
+                    return nil
+                }
+                if let profile, let item = find(BookmarkStore.shared.items(for: profile)) {
+                    if words[0] == "remove" { BookmarkStore.shared.remove(item.id, profile: profile) }
+                    else if pair.count > 1 { BookmarkStore.shared.update(item.id, title: pair[1], url: item.url, profile: profile) }
+                }
             case "list":
                 let items = profile.map { BookmarkStore.shared.items(for: $0) } ?? []
                 log("bookmarks \(items.map { $0.isFolder ? "[\($0.displayTitle): \($0.children.count)]" : $0.displayTitle })")
@@ -459,6 +480,34 @@ enum DebugHooks {
             default:
                 let step = Onboarding.Step.allCases.first { "\($0)".lowercased() == argument.lowercased() }
                 if let step { onboarding.go(to: step) } else { log("onboarding: no step \(argument)") }
+            }
+        case "password":
+            // password add <origin> <username> <password>; password list
+            let words = argument.split(separator: " ").map(String.init)
+            if words.first == "add", words.count == 4, let profile = state.profiles.first?.id {
+                PasswordStore.shared.save(origin: words[1], username: words[2], password: words[3], profile: profile)
+            } else {
+                log("passwords \(PasswordStore.shared.logins.map { "\($0.origin) \($0.username) \($0.password)" })")
+            }
+        case "sync":
+            // sync signin|fake|now|status|dump — Settings → Sync's sign-in tab, signing in to
+            // scripts/fake-sync-server.py (TUFF_SYNC_SERVER), a sync, where sync is at, or this
+            // profile's bookmarks as a tree.
+            MainActor.assumeIsolated {
+                let sync = SyncManager.shared
+                switch argument {
+                case "signin": sync.beginSignIn()
+                case "fake": sync.debugSignIn(syncKey: "dHVmZi1mYWtlLXN5bmMta2V5LWZvci10ZXN0aW5nLW9ubHktMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYg")
+                case "dump":
+                    func lines(_ items: [Bookmark], _ depth: Int) -> [String] {
+                        items.flatMap { [String(repeating: "  ", count: depth) + $0.displayTitle] + lines($0.children, depth + 1) }
+                    }
+                    let profile = sync.profileID ?? state.profiles.first?.id
+                    log("bookmarks " + lines(profile.map { BookmarkStore.shared.items(for: $0) } ?? [], 0).joined(separator: " | "))
+                case "now": sync.syncNow()
+                default:
+                    log("sync signedIn=\(sync.isSignedIn) status=\(sync.status) last=\(sync.lastSynced.map { "\($0)" } ?? "-") devices=\(sync.devices.map { "\($0.name):\($0.tabs.count)" })")
+                }
             }
         case "prompt":
             // prompt yes|no|alt — answers the card on screen (alt: its second way to say yes).

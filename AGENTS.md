@@ -44,7 +44,11 @@
 
 ## Build and test
 
-- `make build` regenerates the Xcode project from `project.yml` (XcodeGen) and builds Debug.
+- `make build` regenerates the Xcode project from `project.yml` (XcodeGen) and builds Debug. `make build`,
+  `make test` and `make release` run xcodebuild through `scripts/xcbuild.py`: a progress bar (Swift files
+  compiled, ETA from the last full run, kept in `build/.xcbuild-history.json`), warnings and errors at the
+  end, the total time, and the full output in `build/<label>.log`. It exits with xcodebuild's status, so a
+  failed build stops `make run`.
 - `make run` builds and launches.
 - `make test` runs the unit tests (`TuffBrowserTests`). Under XCTest the host app opens no window and
   loads no profile (`App/main.swift`), so tests must not rely on `AppDelegate.shared`.
@@ -90,6 +94,22 @@ Examples:
 - Translate (`Web/PageTranslation.swift`): Apple's Translation framework through `.translationTask`
   (`TranslationHost` in `WebCard`), or Google's keyless endpoint when the user picks it. Never send a
   page to Google without the user's choice (Settings or the card); Incognito always asks.
+
+## Sync
+
+- `Sync/`: Firefox Sync with a Mozilla account, so Tuff syncs with Firefox, Zen and other Tuffs
+  (bookmarks, history, passwords, open tabs; not extensions). Settings → Sync (`SyncSettings.swift`).
+- Sign-in is Mozilla's own page in a tab, as the Firefox for iOS OAuth client (Mozilla registers no
+  clients for other browsers): `Tab+Web` hands the redirect to `SyncManager.handleRedirect`, and the
+  sync key arrives as a JWE for a one-off key pair (`ScopedKeysRequest`). Account and sync state are
+  AES-GCM sealed in `Sync/` (`SealedFolder`), not the keychain, for the same reason as passwords.
+- Bookmarks are a three-way merge (`BookmarkMerge`, tested in `SyncTests`): Firefox's toolbar is the
+  bar, its Menu / Other / Mobile folders are folders at the end of the bar (as the Firefox import makes
+  them), and separators / queries are kept on the server untouched. Other kinds keep the server's last
+  record and upload only changes. Unknown record fields are always preserved.
+- Chrome sync isn't possible: Google only lets Chrome use it. The page points to Import instead.
+- Testing without an account: `scripts/fake-sync-server.py 8765`, then a debug build with
+  `TUFF_SYNC_SERVER=http://127.0.0.1:8765` and `sync fake; sync now; sync dump` in `TUFF_DEBUG_SCRIPT`.
 
 ## Downloads and torrents
 

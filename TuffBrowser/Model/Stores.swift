@@ -278,6 +278,7 @@ final class HistoryStore {
         keys.forEach { entries.removeValue(forKey: $0) }
         saver.schedule { [weak self] in self?.saveNow() }
         ExtensionEventPush.shared.emit("history.onVisitRemoved", args: [["allHistory": false, "urls": urls.map(\.absoluteString)]])
+        Self.postRemoved(urls, profileID: profileID)
     }
 
     func deleteVisit(url: URL, at time: Double, profileID: UUID) {
@@ -348,6 +349,20 @@ final class HistoryStore {
     func count(profileID: UUID) -> Int {
         ensureLoaded()
         return entries.values.filter { $0.profileID == profileID }.count
+    }
+
+    /// Every page in a profile's history, for sync.
+    func entries(profileID: UUID) -> [HistoryEntry] {
+        ensureLoaded()
+        return entries.values.filter { $0.profileID == profileID }
+    }
+
+    /// Posted when pages are deleted one by one (not when all history or a stretch of time is
+    /// cleared), so sync can delete them on other devices too. `userInfo`: "urls", "profileID".
+    static let pagesRemoved = Notification.Name("TuffHistoryPagesRemoved")
+
+    private static func postRemoved(_ urls: [URL], profileID: UUID) {
+        NotificationCenter.default.post(name: pagesRemoved, object: nil, userInfo: ["urls": urls, "profileID": profileID])
     }
 
     func clear(profileID: UUID, synchronously: Bool = false) {
@@ -437,6 +452,7 @@ final class HistoryStore {
         entries.removeValue(forKey: HistoryEntry.storageKey(url: url, profileID: profileID))
         saver.schedule { [weak self] in self?.saveNow() }
         ExtensionEventPush.shared.emit("history.onVisitRemoved", args: [["allHistory": false, "urls": [url.absoluteString]]])
+        Self.postRemoved([url], profileID: profileID)
     }
 
     func deleteRange(startTime: Double, endTime: Double, profileID: UUID? = nil) {

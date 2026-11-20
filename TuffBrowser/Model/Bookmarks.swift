@@ -102,9 +102,9 @@ final class BookmarkStore {
     }
 
     @discardableResult
-    func addFolder(named name: String, profile: UUID, at index: Int? = nil) -> Bookmark {
+    func addFolder(named name: String, profile: UUID, into parent: UUID? = nil, at index: Int? = nil) -> Bookmark {
         let folder = Bookmark(title: name.trimmed, url: nil)
-        insert(folder, into: nil, at: index, profile: profile)
+        insert(folder, into: parent, at: index, profile: profile)
         return folder
     }
 
@@ -147,6 +147,16 @@ final class BookmarkStore {
         lists[old] = nil
         scheduleSave()
     }
+
+    /// Replaces a profile's bookmarks with what sync merged.
+    func replaceAll(_ list: [Bookmark], profile: UUID) {
+        guard list != items(for: profile) else { return }
+        lists[profile] = list
+        scheduleSave()
+    }
+
+    /// Posted whenever bookmarks change (sync uploads the changes).
+    static let didChange = Notification.Name("TuffBookmarksChanged")
 
     private func insert(_ bookmark: Bookmark, into folder: UUID?, at index: Int?, profile: UUID) {
         change(profile) { list in
@@ -206,6 +216,7 @@ final class BookmarkStore {
     // MARK: Saving
 
     private func scheduleSave() {
+        NotificationCenter.default.post(name: Self.didChange, object: self)
         unsaved = true
         saver.schedule { [weak self] in self?.saveNow() }
     }
