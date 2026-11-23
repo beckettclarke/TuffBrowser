@@ -212,7 +212,37 @@ final class AdvancedContentBlocker {
         parts.append(end)
         let secrets = parts.compactMap(scriptletSecret)
         guard parts.count > 2, secrets.count == parts.count, Set(secrets).count == 1 else { return nil }
-        return parts.joined(separator: "\n")
+        return compactingDataLiterals(parts.joined(separator: "\n"))
+    }
+
+    /// These scripts run in every frame of every page, and most of their bulk is data: arrays of
+    /// thousands of hostnames and arguments (`const scriptletHostnames = /* 14236 */ ["*", …];`).
+    /// JavaScriptCore turns each element of an array literal into a node of its own, twice (a
+    /// syntax check when the script is read, a full parse when the function runs), for every
+    /// frame. The same array as one JSON string handed to `JSON.parse` is a single token to the
+    /// parser, and only built if the code reaches it. Only lines that are plain JSON change.
+    static func compactingDataLiterals(_ source: String) -> String {
+        var changed = false
+        let lines = source.split(separator: "\n", omittingEmptySubsequences: false).map { line -> Substring in
+            guard line.count > 2048, let replacement = compactDataLine(line) else { return line }
+            changed = true
+            return Substring(replacement)
+        }
+        return changed ? lines.joined(separator: "\n") : source
+    }
+
+    /// `const name = /* count */ [json];` → `const name = /* count */ JSON.parse("json");`
+    private static func compactDataLine(_ line: Substring) -> String? {
+        guard let declaration = line.range(of: #"^\s*const [A-Za-z_$][\w$]* = (/\* \d+ \*/ )?"#, options: .regularExpression),
+              line.hasSuffix("];") else { return nil }
+        let literal = line[declaration.upperBound..<line.index(before: line.endIndex)]
+        guard literal.first == "[",
+              let data = literal.data(using: .utf8),
+              let array = try? JSONSerialization.jsonObject(with: data) as? [Any],
+              array.allSatisfy({ $0 is String || $0 is NSNumber }),
+              let encoded = try? JSONSerialization.data(withJSONObject: String(literal), options: [.fragmentsAllowed, .withoutEscapingSlashes]),
+              let string = String(data: encoded, encoding: .utf8) else { return nil }
+        return line[..<declaration.upperBound] + "JSON.parse(" + string + ");"
     }
 
     private static func scriptletSecret(_ source: String) -> String? {
@@ -261,9 +291,144 @@ final class AdvancedContentBlocker {
         return String(data: output, encoding: .utf8)
     }
 
-    private static func cosmeticScript(api: String, dataSets: [String]) -> String {
-        """
+    /// What the cosmetic script looks up, worked out once here instead of in every frame: the
+    /// rulesets' hostname → selector-list indirection resolved and merged into one table.
+    struct CosmeticIndex: Equatable {
+        /// Procedural filters (uBO's JSON), each once.
+        var selectors: [String] = []
+        /// Hostname or entity (`example.*`) → selector indices; an exception is stored as `~index`.
+        var hosts: [String: [Int]] = [:]
+        /// Hostname substring, regex, selector indices.
+        var regexes: [(needle: String, pattern: String, refs: [Int])] = []
+
+        static func == (a: Self, b: Self) -> Bool {
+            a.selectors == b.selectors && a.hosts == b.hosts
+                && a.regexes.map { "\($0.needle)\t\($0.pattern)\t\($0.refs)" } == b.regexes.map { "\($0.needle)\t\($0.pattern)\t\($0.refs)" }
+        }
+    }
+
+    /// Merges uBO Lite's per-ruleset data (as `proceduralOnly` leaves it).
+    static func cosmeticIndex(_ dataSets: [String]) -> CosmeticIndex {
+        var index = CosmeticIndex()
+        var position: [String: Int] = [:]
+        func number(_ value: Any?) -> Int? {
+            if let n = value as? Int { return n }
+            if let s = value as? String { return Int(s) }
+            return nil
+        }
+        for text in dataSets {
+            guard let object = (try? JSONSerialization.jsonObject(with: Data(text.utf8))) as? [String: Any],
+                  let selectors = object["selectors"] as? [String],
+                  let lists = object["selectorLists"] as? [String] else { continue }
+            // One ruleset's list (by index) → signed indices into the merged selectors.
+            func refs(_ listIndex: Int?) -> [Int] {
+                guard let listIndex, lists.indices.contains(listIndex) else { return [] }
+                return lists[listIndex].split(separator: ",").compactMap { token -> Int? in
+                    guard let local = Int(token) else { return nil }
+                    let exception = local < 0
+                    let slot = exception ? ~local : local
+                    guard selectors.indices.contains(slot) else { return nil }
+                    let selector = selectors[slot]
+                    let merged: Int
+                    if let known = position[selector] {
+                        merged = known
+                    } else {
+                        merged = index.selectors.count
+                        position[selector] = merged
+                        index.selectors.append(selector)
+                    }
+                    return exception ? ~merged : merged
+                }
+            }
+            let hostnames = object["hostnames"] as? [String] ?? []
+            let listRefs = object["selectorListRefs"] as? [Any] ?? []
+            for (i, host) in hostnames.enumerated() where i < listRefs.count {
+                guard !host.isEmpty, !host.contains("\n"), !host.contains("\t") else { continue }
+                let found = refs(number(listRefs[i]))
+                if !found.isEmpty { index.hosts[host, default: []].append(contentsOf: found) }
+            }
+            let regexes = object["regexes"] as? [Any] ?? []
+            for i in stride(from: 0, to: regexes.count - 2, by: 3) {
+                guard let needle = regexes[i] as? String, let pattern = regexes[i + 1] as? String else { continue }
+                let found = refs(number(regexes[i + 2]))
+                if !found.isEmpty { index.regexes.append((needle, pattern, found)) }
+            }
+        }
+        return index
+    }
+
+    /// The isolated-world script that applies the procedural filters for the frame's host.
+    ///
+    /// It runs in every frame, and most frames have no such filters, so it is kept light: the
+    /// table is one string searched for `\nhost\t`, the filters stay a JSON string until a host
+    /// matches, and uBO's procedural engine is only evaluated then.
+    static func cosmeticScript(api: String, dataSets: [String]) -> String {
+        let index = cosmeticIndex(dataSets)
+        func jsString(_ text: String) -> String {
+            let data = try? JSONSerialization.data(withJSONObject: text, options: [.fragmentsAllowed, .withoutEscapingSlashes])
+            return data.flatMap { String(data: $0, encoding: .utf8) } ?? "\"\""
+        }
+        func json(_ value: Any) -> String {
+            let data = try? JSONSerialization.data(withJSONObject: value, options: [.withoutEscapingSlashes])
+            return data.flatMap { String(data: $0, encoding: .utf8) } ?? "[]"
+        }
+        func refs(_ list: [Int]) -> String { list.map(String.init).joined(separator: ",") }
+        var table = "\n"
+        for host in index.hosts.keys.sorted() {
+            table += host + "\t" + refs(index.hosts[host]!) + "\n"
+        }
+        let regexes = index.regexes.flatMap { [$0.needle, $0.pattern, refs($0.refs)] }
+        return """
         (() => {
+        const table = \(jsString(table));
+        const regexes = \(json(regexes));
+        const hostname = location.hostname.toLowerCase();
+        if (!hostname) return;
+        const hostnames = [hostname];
+        for (let pos = hostname.indexOf('.'); pos !== -1; pos = hostname.indexOf('.', pos + 1)) {
+          hostnames.push(hostname.slice(pos + 1));
+        }
+        hostnames.push('*');
+        const needles = hostnames.slice();
+        for (const hn of hostnames) {
+          let value = hn;
+          for (;;) {
+            const pos = value.lastIndexOf('.');
+            if (pos === -1) break;
+            value = value.slice(0, pos);
+            needles.push(value + '.*');
+          }
+        }
+        let refs = '';
+        const add = (list) => { if (list) refs += (refs ? ',' : '') + list; };
+        for (const needle of needles) {
+          const key = '\\n' + needle + '\\t';
+          const at = table.indexOf(key);
+          if (at === -1) continue;
+          const start = at + key.length;
+          add(table.slice(start, table.indexOf('\\n', start)));
+        }
+        for (let i = 0; i < regexes.length; i += 3) {
+          try {
+            if (hostname.includes(regexes[i]) && new RegExp(regexes[i + 1]).test(hostname)) add(regexes[i + 2]);
+          } catch (e) {}
+        }
+        if (!refs) return;
+        const selectors = JSON.parse(\(jsString(json(index.selectors))));
+        const selected = new Set();
+        const exceptions = new Set();
+        for (const token of refs.split(',')) {
+          const ref = Number(token);
+          const selector = selectors[ref < 0 ? ~ref : ref];
+          if (selector === undefined) continue;
+          (ref < 0 ? exceptions : selected).add(selector);
+        }
+        for (const selector of exceptions) selected.delete(selector);
+        const filters = [];
+        for (const encoded of selected) {
+          try { filters.push(JSON.parse(encoded)); } catch (e) {}
+        }
+        if (!filters.length) return;
         if (!self.chrome) self.chrome = { dom: {}, runtime: { sendMessage: () => Promise.resolve() } };
         self.cssAPI = { insert(css) {
           try {
@@ -276,63 +441,10 @@ final class AdvancedContentBlocker {
             (document.head || document.documentElement).appendChild(style);
           }
         }};
-        })();
-        \(api)
         (() => {
-        const dataSets = [\(dataSets.joined(separator: ","))];
-        const hostname = location.hostname.toLowerCase();
-        if (!hostname) return;
-        const hostnames = [hostname];
-        for (let pos = hostname.indexOf('.'); pos !== -1; pos = hostname.indexOf('.', pos + 1)) {
-          hostnames.push(hostname.slice(pos + 1));
-        }
-        hostnames.push('*');
-        const entities = [];
-        for (const hn of hostnames) {
-          let value = hn;
-          for (;;) {
-            const pos = value.lastIndexOf('.');
-            if (pos === -1) break;
-            value = value.slice(0, pos);
-            entities.push(value + '.*');
-          }
-        }
-        const selected = new Set();
-        const exceptions = new Set();
-        for (const data of dataSets) {
-          const add = (ref) => {
-            const list = data.selectorLists[Number(ref)] || '';
-            if (!list) return;
-            for (const token of list.split(',')) {
-              const ref = Number(token);
-              const selector = data.selectors[ref < 0 ? ~ref : ref];
-              if (selector === undefined) continue;
-              (ref < 0 ? exceptions : selected).add(selector);
-            }
-          };
-          const map = new Map(data.hostnames.map((hostname, index) => [hostname, index]));
-          for (const needle of hostnames) {
-            const index = map.get(needle);
-            if (index !== undefined) add(data.selectorListRefs[index]);
-          }
-          if (data.hasEntities) {
-            for (const needle of entities) {
-              const index = map.get(needle);
-              if (index !== undefined) add(data.selectorListRefs[index]);
-            }
-          }
-          for (let i = 0; i < data.regexes.length; i += 3) {
-            try {
-              if (hostname.includes(data.regexes[i]) && new RegExp(data.regexes[i + 1]).test(hostname)) add(data.regexes[i + 2]);
-            } catch (e) {}
-          }
-        }
-        for (const selector of exceptions) selected.delete(selector);
-        const filters = [];
-        for (const encoded of selected) {
-          try { filters.push(JSON.parse(encoded)); } catch (e) {}
-        }
-        if (!filters.length) return;
+        \(api)
+        })();
+        if (typeof self.ProceduralFiltererAPI !== 'function') return;
         const filterer = new self.ProceduralFiltererAPI();
         const declaratives = filters.filter(filter => filter.cssable);
         const procedurals = filters.filter(filter => !filter.cssable);

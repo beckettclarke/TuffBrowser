@@ -30,12 +30,12 @@ struct CapturedLogin: Equatable {
     var profile: UUID
 }
 
-/// Saving and filling passwords in pages. A script in its own content world (pages can't see
+/// Saving and filling passwords in pages. A script in Tuff's content world (pages can't see
 /// it or its messages) reports when a sign-in field gets the keyboard and when a form with a
 /// password is sent; Tuff lists matching logins under the field (`PasswordSuggestionList`) and
 /// offers to save new ones on a card after the page moves on.
 enum PasswordAutofill {
-    static let world = WKContentWorld.world(name: "TuffPasswords")
+    static let world = WebEngine.scriptWorld
     static let handlerName = "tuffPasswords"
     private static let handler = MessageHandler()
 
@@ -178,17 +178,40 @@ enum PasswordAutofill {
         return ac.indexOf('username') >= 0 || ac.indexOf('webauthn') >= 0 ? 'username' : null;
       }
 
+      // The listeners for every click, key press and scroll are added only once a sign-in
+      // field has had the keyboard or been typed in (or filled by a password manager). Most
+      // pages never have one, and on them a click costs nothing: the click handler searches the
+      // document for inputs, which doubled the time of Speedometer's TodoMVC steps that click
+      // or press Return 100 times.
+      var armed = false;
+      function isSignInField(el) { return isPassword(el) || isUsernameLike(el); }
+      function arm() {
+        if (armed) return;
+        armed = true;
+        document.removeEventListener('input', armOnInput, true);
+        document.addEventListener('keydown', onKeyDown, true);
+        document.addEventListener('click', onClick, true);
+        window.addEventListener('scroll', onScroll, true);
+      }
+      function armOnInput(e) { if (isSignInField(e.target)) arm(); }
+      document.addEventListener('input', armOnInput, true);
+
       var focused = null, filling = false;
       document.addEventListener('focusin', function (e) {
         if (filling) return;
-        var el = e.target, kind = fieldKind(el);
+        var el = e.target;
+        if (!isSignInField(el)) return;
+        arm();
+        var kind = fieldKind(el);
         if (!kind) return;
         focused = el;
         var r = el.getBoundingClientRect();
         post({ type: 'focus', field: kind, rect: [r.left, r.top, r.width, r.height] });
       }, true);
       document.addEventListener('focusout', function (e) { if (e.target === focused) post({ type: 'blur' }); }, true);
-      window.addEventListener('scroll', function () { if (focused) post({ type: 'blur' }); }, true);
+      function onScroll() { if (focused) post({ type: 'blur' }); }
+      // A field that took the keyboard before this script ran (autofocus).
+      if (isSignInField(document.activeElement)) arm();
 
       // What was typed when a form with a password is sent. A form with several passwords
       // (sign-up, change password) sends the one typed twice: the new one.
@@ -217,18 +240,18 @@ enum PasswordAutofill {
         if (fields.length && !passwords(scope).length) { try { sessionStorage.setItem('__tuffUsername', fields[0].value); } catch (e) {} }
       }
       document.addEventListener('submit', function (e) { rememberUsername(e.target); capture(e.target); }, true);
-      document.addEventListener('keydown', function (e) {
+      function onKeyDown(e) {
         if (e.key !== 'Enter' || !isInput(e.target)) return;
         rememberUsername(scopeOf(e.target)); capture(scopeOf(e.target));
-      }, true);
-      document.addEventListener('click', function (e) {
+      }
+      function onClick(e) {
         var b = e.target && e.target.closest && e.target.closest('button, input[type=submit], input[type=button], [role=button], a');
         if (!b) return;
         var scope = scopeOf(b);
         rememberUsername(scope);
         if (passwords(scope).some(function (p) { return p.value; })) capture(scope);
         else if (scope !== document && passwords(document).some(function (p) { return p.value; })) capture(document);
-      }, true);
+      }
       window.addEventListener('pagehide', function () { capture(document); }, true);
 
       function setValue(el, value) {

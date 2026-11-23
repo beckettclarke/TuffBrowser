@@ -599,8 +599,9 @@ struct SpacePage: View {
 
                     NewTabRow()
 
-                    let tabsPair = SplitTabRow.Pair(in: space.tabs, split: space.split)
-                    ForEach(space.tabs) { tab in
+                    let visibleTabs = space.tabs.filter { !$0.isHidden }
+                    let tabsPair = SplitTabRow.Pair(in: visibleTabs, split: space.split)
+                    ForEach(visibleTabs) { tab in
                         // A split's two tabs share one row, where the first of them is.
                         if let pair = tabsPair, tab === pair.first {
                             SplitTabRow(pair: pair, section: .tabs, space: space, selectedID: selectedID)
@@ -1522,6 +1523,17 @@ struct TabContextMenu: View {
             state.show(Toast(symbol: "link", text: "Copied link"))
         }
         .disabled(tab.url == nil)
+        if let url = tab.url, ["http", "https"].contains(url.scheme?.lowercased() ?? ""), !SyncManager.shared.sendTargets.isEmpty {
+            Menu("Send to Device") {
+                ForEach(SyncManager.shared.sendTargets) { target in
+                    Button {
+                        SyncManager.shared.send(url, title: tab.displayTitle, to: target)
+                    } label: {
+                        Label(target.name, systemImage: target.symbol)
+                    }
+                }
+            }
+        }
         Button(tab.isMuted ? "Unmute" : "Mute") { tab.setMuted(!tab.isMuted) }
         if tab.cameraInUse || tab.microphoneInUse {
             Button("Stop Camera and Microphone") { tab.stopCapture() }

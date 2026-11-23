@@ -252,7 +252,9 @@ enum BookmarkMerge {
             var guid = ids[item.id] ?? SyncGUID.make()
             if roots.contains(guid) { guid = SyncGUID.make() }
             ids[item.id] = guid
-            if item.isFolder {
+            if item.isSeparator {
+                tree[guid] = SyncBookmarkNode(kind: .other, title: "", url: nil, parent: parent)
+            } else if item.isFolder {
                 let children = item.children.map { add($0, parent: guid) }
                 tree[guid] = SyncBookmarkNode(kind: .folder, title: item.title, parent: parent, children: children)
             } else {
@@ -292,6 +294,15 @@ enum BookmarkMerge {
         for (uuid, guid) in ids { uuids[guid] = uuid }
         var used: [UUID: String] = [:]
 
+        var previousDates: [UUID: (added: Date?, modified: Date?)] = [:]
+        func collectDates(_ items: [Bookmark]) {
+            for item in items {
+                previousDates[item.id] = (item.dateAdded, item.dateGroupModified)
+                if item.isFolder { collectDates(item.children) }
+            }
+        }
+        collectDates(previous)
+
         func uuid(for guid: String) -> UUID {
             let id = uuids[guid] ?? UUID()
             used[id] = guid
@@ -299,12 +310,14 @@ enum BookmarkMerge {
         }
         func build(_ guid: String, depth: Int = 0) -> Bookmark? {
             guard let node = tree[guid], depth < 100 else { return nil }
+            let id = uuid(for: guid)
+            let dates = previousDates[id]
             switch node.kind {
             case .bookmark:
                 guard let url = node.url.flatMap(URL.init(string:)) else { return nil }
-                return Bookmark(id: uuid(for: guid), title: node.title, url: url)
+                return Bookmark(id: id, title: node.title, url: url, dateAdded: dates?.added)
             case .folder:
-                return Bookmark(id: uuid(for: guid), title: node.title, url: nil, children: node.children.compactMap { build($0, depth: depth + 1) })
+                return Bookmark(id: id, title: node.title, url: nil, children: node.children.compactMap { build($0, depth: depth + 1) }, dateAdded: dates?.added, dateGroupModified: dates?.modified)
             case .other:
                 return nil
             }
@@ -316,9 +329,10 @@ enum BookmarkMerge {
             let children = tree[root]?.children.compactMap { build($0) } ?? []
             guard !children.isEmpty else { continue }
             let id = uuid(for: root)
+            let dates = previousDates[id]
             let index = previous.firstIndex { $0.id == id } ?? Int.max
             let title = previous.first { $0.id == id }?.title ?? rootNames[root] ?? root
-            placed.append((index, Bookmark(id: id, title: title, url: nil, children: children)))
+            placed.append((index, Bookmark(id: id, title: title, url: nil, children: children, dateAdded: dates?.added, dateGroupModified: dates?.modified)))
         }
         for (index, folder) in placed.sorted(by: { $0.index < $1.index }) {
             list.insert(folder, at: min(index, list.count))

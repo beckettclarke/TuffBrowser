@@ -8,13 +8,13 @@ import WebKit
 /// own PiP buttons, the video context menu's "Enter Picture in Picture" and
 /// `requestPictureInPicture()` all dead. `enable(_:)` turns it on.
 ///
-/// A small script in every frame (in its own content world, out of the page's reach) tells the
+/// A small script in every frame (in Tuff's content world, out of the page's reach) tells the
 /// tab when one of its videos enters or leaves PiP, and does the entering and leaving when the
 /// app asks: the menu command, the sidebar button, and popping a playing video out when you
 /// switch away from its tab. Calls from the app count as a user gesture, which PiP requires.
 enum PictureInPicture {
     static let handlerName = "tuffPiP"
-    static let world = WKContentWorld.world(name: "TuffPiP")
+    static let world = WebEngine.scriptWorld
     private static let handler = PictureInPictureMessageHandler()
 
     /// What the page script did when asked.

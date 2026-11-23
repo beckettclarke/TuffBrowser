@@ -2,7 +2,8 @@ import AppKit
 import SwiftUI
 import WebKit
 
-/// How a tab hands PDFs to `PDFViewer` instead of WebKit's built-in viewer.
+/// How a tab hands PDFs (and office documents, `DocumentFormat`) to `PDFViewer` instead of
+/// WebKit's built-in viewer (or a download).
 ///
 /// 1. `decidePolicyFor navigationResponse` sees a main-frame PDF and turns the response into a
 ///    download (`.download`): the one network fetch streams to a temporary file, and WebKit never
@@ -15,9 +16,9 @@ import WebKit
 extension Tab {
     /// Puts up a viewer for `url`. The download (or file) is attached by the caller.
     @discardableResult
-    func startPDF(url: URL, filename: String?) -> PDFViewer {
+    func startPDF(url: URL, filename: String?, format: DocumentFormat = .pdf) -> PDFViewer {
         pdf?.close()
-        let viewer = PDFViewer(url: url, filename: filename, tab: self)
+        let viewer = PDFViewer(url: url, filename: filename, format: format, tab: self)
         viewer.onDownloaded = { [weak self, weak viewer] file in
             guard let self, let viewer, self.pdf === viewer, let file else { return }
             self.remember(file, for: viewer.url)
@@ -34,8 +35,9 @@ extension Tab {
 
     /// Shows a PDF that is already on disk (a local file, or one downloaded before).
     /// `commit`: also commit its placeholder page (false when that page is already showing).
-    func showPDF(file: URL, url: URL, filename: String?, commit: Bool) {
-        let viewer = startPDF(url: url, filename: filename)
+    /// `format`: what it is (by default, from the file's extension).
+    func showPDF(file: URL, url: URL, filename: String?, format: DocumentFormat? = nil, commit: Bool) {
+        let viewer = startPDF(url: url, filename: filename, format: format ?? .of(file: file))
         viewer.open(file: file)
         if commit {
             commitPDFPage(viewer)
@@ -56,7 +58,7 @@ extension Tab {
         if let item = webView.backForwardList.currentItem, PDFViewer.key(item.url) == key {
             pdfAwaitingCommit = false
             pdfWithoutPage = true
-            favicon = PDFViewer.favicon
+            favicon = viewer.favicon
             if title != viewer.displayTitle {
                 title = viewer.displayTitle
                 browser?.tabDidChange(self, properties: .title)
@@ -128,28 +130,28 @@ extension Tab {
     }
 
     /// From `decidePolicyFor navigationResponse`. Returns the policy when the response is a PDF
-    /// the viewer takes over, nil to carry on as normal.
+    /// or office document the viewer takes over, nil to carry on as normal.
     func pdfPolicy(for navigationResponse: WKNavigationResponse) -> WKNavigationResponsePolicy? {
         guard navigationResponse.isForMainFrame else { return nil }
         mainResponseSeen = true
         let response = navigationResponse.response
-        guard PDFViewer.isPDF(response), let responseURL = response.url else { return nil }
+        guard let format = DocumentFormat.of(response), let responseURL = response.url else { return nil }
         let key = PDFViewer.key(responseURL)
         // The address as asked for keeps a `#page=` fragment the response doesn't have.
         let shown = pendingURL.flatMap { PDFViewer.key($0) == key ? $0 : nil } ?? responseURL
         let name = response.suggestedFilename
 
         if responseURL.isFileURL {
-            // A PDF on this Mac: read it where it is.
-            showPDF(file: responseURL, url: shown, filename: responseURL.lastPathComponent, commit: true)
+            // A file on this Mac: read it where it is.
+            showPDF(file: responseURL, url: shown, filename: responseURL.lastPathComponent, format: format, commit: true)
             return .cancel
         }
         if lastMainNavigationType != .reload, lastMainNavigationType != .formSubmitted,
            lastMainNavigationType != .formResubmitted, let file = cachedPDF(for: responseURL) {
-            showPDF(file: file, url: shown, filename: name, commit: true)
+            showPDF(file: file, url: shown, filename: name, format: format, commit: true)
             return .cancel
         }
-        startPDF(url: shown, filename: name)
+        startPDF(url: shown, filename: name, format: format)
         return .download
     }
 
@@ -168,7 +170,7 @@ extension Tab {
         if let pdf, committingPDF == key || (pdfAwaitingCommit && PDFViewer.key(pdf.url) == key) {
             committingPDF = nil
             pdfAwaitingCommit = false
-            favicon = PDFViewer.favicon
+            favicon = pdf.favicon
             return
         }
         // The placeholder page back from WebKit's back / forward cache.
@@ -176,7 +178,7 @@ extension Tab {
             if pdf.map({ PDFViewer.key($0.url) != key }) ?? true {
                 showPDF(file: file, url: url, filename: nil, commit: false)
             }
-            favicon = PDFViewer.favicon
+            favicon = pdf?.favicon ?? DocumentFormat.of(file: file).favicon
             return
         }
         closePDF()

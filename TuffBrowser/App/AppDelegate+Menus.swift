@@ -7,12 +7,12 @@ import WebKit
 extension AppDelegate {
     // MARK: File
 
-    /// ⌘O: opens files from the Mac (web pages, PDFs, pictures, text) in new tabs.
+    /// ⌘O: opens files from the Mac (web pages, PDFs, office documents, pictures, text) in new tabs.
     @objc func openFile(_ sender: Any?) {
         let panel = NSOpenPanel()
         panel.allowsMultipleSelection = true
         panel.canChooseDirectories = false
-        panel.allowedContentTypes = [.html, .pdf, .image, .plainText, .svg, .webArchive, .xml, .json, .movie, .audio]
+        panel.allowedContentTypes = [.html, .image, .plainText, .svg, .webArchive, .xml, .json, .movie, .audio] + DocumentFormat.contentTypes
         panel.allowsOtherFileTypes = true
         let state = self.state
         let open: (NSApplication.ModalResponse) -> Void = { response in

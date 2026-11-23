@@ -6,7 +6,7 @@ import WebKit
 /// otherwise any page, or a redirect, could launch apps (and feed them a payload) by itself.
 /// "Always allow" is kept per site and app link type; Incognito's choices stay in memory.
 enum ExternalAppLinks {
-    private static let defaultsKey = "externalAppLinksAllowed"
+    static let defaultsKey = "externalAppLinksAllowed"
     /// Remembered "always allow" answers, as "origin|scheme".
     private static var allowed: Set<String> = Set(UserDefaults.standard.stringArray(forKey: defaultsKey) ?? [])
     private static var incognitoAllowed: Set<String> = []

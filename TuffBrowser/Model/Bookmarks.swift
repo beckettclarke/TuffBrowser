@@ -1,25 +1,36 @@
 import AppKit
 import Observation
 
-/// A saved page, or a folder of them (`url == nil`).
+/// A saved page, a folder of them (`url == nil && !isSeparator`), or a separator.
 struct Bookmark: Codable, Identifiable, Equatable {
     var id = UUID()
-    /// Empty for a page shown as just its icon on the bookmarks bar.
+    /// Empty for a page shown as just its icon on the bookmarks bar, or for a separator.
     var title: String
     var url: URL?
     var children: [Bookmark] = []
+    var dateAdded: Date? = nil
+    var dateGroupModified: Date? = nil
+    /// Firefox bookmark separator (`type: "separator"`). Nil for pages and folders so older JSON decodes cleanly.
+    var separator: Bool? = nil
 
-    var isFolder: Bool { url == nil }
+    var isSeparator: Bool { separator == true }
+    var isFolder: Bool { url == nil && !isSeparator }
 
     /// The title, or the site's name when there is none.
     var displayTitle: String {
+        if isSeparator { return "Separator" }
         let text = title.trimmed
         if !text.isEmpty { return text }
         return url?.displayHost ?? "Untitled Folder"
     }
 
     /// Every page in this folder and the folders inside it.
-    var pages: [Bookmark] { children.flatMap { $0.isFolder ? $0.pages : [$0] } }
+    var pages: [Bookmark] {
+        children.flatMap { item -> [Bookmark] in
+            if item.isSeparator { return [] }
+            return item.isFolder ? item.pages : [item]
+        }
+    }
 
     /// Pages that can be saved: not blank tabs or extensions' own pages.
     static func canSave(_ url: URL?) -> Bool {
@@ -79,7 +90,10 @@ final class BookmarkStore {
     func search(_ query: String, limit: Int, profile: UUID) -> [Bookmark] {
         let words = query.lowercased().split(separator: " ").map(String.init)
         guard !words.isEmpty else { return [] }
-        let pages = items(for: profile).flatMap { $0.isFolder ? $0.pages : [$0] }
+        let pages = items(for: profile).flatMap { item -> [Bookmark] in
+            if item.isSeparator { return [] }
+            return item.isFolder ? item.pages : [item]
+        }
         let hits = pages.filter { page in
             let haystack = page.title.lowercased() + " " + (page.url?.absoluteString.lowercased() ?? "")
             return words.allSatisfy(haystack.contains)
@@ -96,21 +110,31 @@ final class BookmarkStore {
     /// Adds a page at the end of the bar (or of `folder`), or at `index` there.
     @discardableResult
     func add(url: URL, title: String, profile: UUID, into folder: UUID? = nil, at index: Int? = nil) -> Bookmark {
-        let bookmark = Bookmark(title: title.trimmed, url: url)
+        let now = Date()
+        let bookmark = Bookmark(title: title.trimmed, url: url, dateAdded: now)
         insert(bookmark, into: folder, at: index, profile: profile)
         return bookmark
     }
 
     @discardableResult
     func addFolder(named name: String, profile: UUID, into parent: UUID? = nil, at index: Int? = nil) -> Bookmark {
-        let folder = Bookmark(title: name.trimmed, url: nil)
+        let now = Date()
+        let folder = Bookmark(title: name.trimmed, url: nil, dateAdded: now, dateGroupModified: now)
         insert(folder, into: parent, at: index, profile: profile)
         return folder
+    }
+
+    @discardableResult
+    func addSeparator(profile: UUID, into parent: UUID? = nil, at index: Int? = nil) -> Bookmark {
+        let sep = Bookmark(title: "", url: nil, dateAdded: Date(), separator: true)
+        insert(sep, into: parent, at: index, profile: profile)
+        return sep
     }
 
     func update(_ id: UUID, title: String, url: URL?, profile: UUID) {
         change(profile) { list in
             _ = Self.modify(id, in: &list) { bookmark in
+                guard !bookmark.isSeparator else { return }
                 bookmark.title = title.trimmed
                 // A folder stays a folder, a page stays a page.
                 if !bookmark.isFolder, let url { bookmark.url = url }
@@ -152,11 +176,13 @@ final class BookmarkStore {
     func replaceAll(_ list: [Bookmark], profile: UUID) {
         guard list != items(for: profile) else { return }
         lists[profile] = list
-        scheduleSave()
+        scheduleSave(bulk: true)
     }
 
     /// Posted whenever bookmarks change (sync uploads the changes).
     static let didChange = Notification.Name("TuffBookmarksChanged")
+    /// In `didChange`'s user info when many changes may have come at once (sync), not from one action.
+    static let bulkKey = "bulk"
 
     private func insert(_ bookmark: Bookmark, into folder: UUID?, at index: Int?, profile: UUID) {
         change(profile) { list in
@@ -186,7 +212,10 @@ final class BookmarkStore {
     private static func take(_ id: UUID, from list: inout [Bookmark]) -> Bookmark? {
         if let index = list.firstIndex(where: { $0.id == id }) { return list.remove(at: index) }
         for index in list.indices where list[index].isFolder {
-            if let found = take(id, from: &list[index].children) { return found }
+            if let found = take(id, from: &list[index].children) {
+                list[index].dateGroupModified = Date()
+                return found
+            }
         }
         return nil
     }
@@ -210,13 +239,14 @@ final class BookmarkStore {
         }
         return modify(folder, in: &list) { target in
             target.children.insert(bookmark, at: min(max(0, index ?? target.children.count), target.children.count))
+            target.dateGroupModified = Date()
         }
     }
 
     // MARK: Saving
 
-    private func scheduleSave() {
-        NotificationCenter.default.post(name: Self.didChange, object: self)
+    private func scheduleSave(bulk: Bool = false) {
+        NotificationCenter.default.post(name: Self.didChange, object: self, userInfo: bulk ? [Self.bulkKey: true] : nil)
         unsaved = true
         saver.schedule { [weak self] in self?.saveNow() }
     }

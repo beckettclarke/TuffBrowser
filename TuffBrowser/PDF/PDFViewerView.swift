@@ -37,8 +37,38 @@ struct PDFViewerView: View {
 
     var body: some View {
         let palette = PDFPalette(tint: state.currentTint, dark: scheme == .dark)
+        if viewer.format.isPDF {
+            pdfBody(palette)
+        } else {
+            documentBody(palette)
+        }
+    }
+
+    /// An office document: Quick Look draws it under a smaller toolbar.
+    private func documentBody(_ palette: PDFPalette) -> some View {
         let ready = viewer.isReady
-        VStack(spacing: 0) {
+        return VStack(spacing: 0) {
+            DocumentToolbar(viewer: viewer)
+                .frame(height: Self.toolbarHeight)
+                .background(palette.chrome)
+            Rectangle().fill(.primary.opacity(0.1)).frame(height: 0.5)
+            ZStack {
+                Color(nsColor: palette.canvas)
+                QuickLookCanvas(viewer: viewer)
+                    .opacity(ready ? 1 : 0)
+                    .allowsHitTesting(ready)
+                if !ready {
+                    PDFStatusView(viewer: viewer)
+                        .transition(.opacity.combined(with: .scale(scale: 0.97)))
+                }
+            }
+            .clipped()
+        }
+    }
+
+    private func pdfBody(_ palette: PDFPalette) -> some View {
+        let ready = viewer.isReady
+        return VStack(spacing: 0) {
             PDFToolbar(viewer: viewer)
                 .frame(height: Self.toolbarHeight)
                 .background(palette.chrome)
@@ -299,7 +329,7 @@ private struct PDFMoreMenu: View {
         VStack(spacing: 1) {
             MenuRow(symbol: "play.rectangle", title: "Presentation Mode") { run { viewer.startPresentation() } }
             MenuRow(symbol: "link", title: "Copy Link to Page \(viewer.pageIndex + 1)") { run { viewer.copyLinkToPage() } }
-            MenuRow(symbol: "arrow.up.forward.app", title: "Open in Preview") { run { viewer.openInPreview() } }
+            MenuRow(symbol: "arrow.up.forward.app", title: "Open in \(viewer.appName ?? "Preview")") { run { viewer.openInApp() } }
             MenuDivider()
             MenuRow(symbol: "arrow.up.to.line", title: "Go to First Page", disabled: viewer.pageIndex == 0) { run { viewer.firstPage() } }
             MenuRow(symbol: "arrow.down.to.line", title: "Go to Last Page", disabled: viewer.pageIndex >= viewer.pageCount - 1) {
@@ -832,7 +862,7 @@ private struct PDFStatusView: View {
 
     private var symbol: String {
         switch viewer.phase {
-        case .downloading, .ready: "doc.richtext"
+        case .downloading, .ready: viewer.format.isPDF ? "doc.richtext" : viewer.format.symbol
         case .failed: "exclamationmark.triangle"
         case .locked: "lock.fill"
         }
@@ -849,7 +879,7 @@ private struct PDFStatusView: View {
     private var title: String {
         switch viewer.phase {
         case .downloading, .ready: viewer.filename
-        case .failed: "Couldn’t open this PDF"
+        case .failed: viewer.format.isPDF ? "Couldn’t open this PDF" : "Couldn’t open this document"
         case .locked: "This PDF is locked"
         }
     }

@@ -23,6 +23,8 @@ final class Tab: NSObject, Identifiable {
     var canGoForward = false
     var isPlayingAudio = false
     var isMuted = false
+    /// Muted by a per-site content setting (`contentSettings.sound`), separate from the user's mute toggle.
+    @ObservationIgnored private var siteMuted = false
     /// One of the page's videos is showing in a picture-in-picture window.
     var isInPictureInPicture = false
     /// The page is using the camera / microphone (shown on the tab, with a click to stop).
@@ -56,6 +58,8 @@ final class Tab: NSObject, Identifiable {
     /// Opened by ⌘T with the New Tab page on (`TabSettings.newTabPage`): it shows Tuff's mark
     /// until something is loaded in it.
     var isNewTabPage = false
+    /// Hidden from the tab strip by an extension (`tabs.hide`, Firefox).
+    var isHidden = false
     var showsNewTabPage: Bool { isNewTabPage && url == nil }
 
     /// The page a pinned / favourite tab was pinned on: where it returns to when it is
@@ -95,6 +99,9 @@ final class Tab: NSObject, Identifiable {
     /// `tabs.create({openerTabId})`). Surfaced to extensions as `openerTabId`. Weak, so it goes
     /// nil on its own if the opener is closed.
     @ObservationIgnored weak var openerTab: Tab?
+    /// The tab to activate when this tab closes (`tabs.moveInSuccession`, Firefox). Weak so it
+    /// clears automatically when the successor is gone.
+    @ObservationIgnored weak var successorTab: Tab?
     @ObservationIgnored var readerModeRequested = false
     /// The address last reported to extensions for a same-document navigation (or the page's
     /// committed address), so WebKit's duplicate reports aren't sent twice.
@@ -163,9 +170,6 @@ final class Tab: NSObject, Identifiable {
     @ObservationIgnored var internalPageLoad: URL?
     /// The "Open in another app?" card is up (see `openInOtherApp`).
     @ObservationIgnored var externalAppPromptShowing = false
-    /// "Save Image As…" / "Save Linked File As…" was just picked from the page's context menu:
-    /// the download WebKit creates next asks where to save.
-    @ObservationIgnored var contextSaveAsRequested: Date?
 
     private static let audioKeyPath = "_isPlayingAudio"
 
@@ -266,7 +270,8 @@ final class Tab: NSObject, Identifiable {
         view.uiDelegate = self
         pageZoom = CGFloat(SiteZoom.shared.zoom(for: url, incognito: browser?.isPrivate ?? false))
         view.pageZoom = pageZoom
-        if isMuted { Self.applyMute(true, to: view) }
+        siteMuted = !SiteSettings.shared.soundAllowed(for: url, incognito: browser?.isPrivate ?? false)
+        if isMuted || siteMuted { Self.applyMute(true, to: view) }
         webView = view
         observe(view)
         isAwake = true
@@ -415,7 +420,8 @@ final class Tab: NSObject, Identifiable {
     /// this page?").
     var isBusy: Bool {
         if isPlayingAudio || isLoading || isInPictureInPicture || permissionRequest != nil
-            || !dialogWaiters.isEmpty || beforeUnloadShowing || pendingClose != nil { return true }
+            || !dialogWaiters.isEmpty || beforeUnloadShowing || pendingClose != nil
+            || ExtensionDebugger.shared.isDebugging(self) { return true }
         if let webView, webView.cameraCaptureState != .none || webView.microphoneCaptureState != .none { return true }
         return false
     }
@@ -426,7 +432,7 @@ final class Tab: NSObject, Identifiable {
     /// unloaded behind the user's back either.
     func checkUnsavedInput(_ completion: @escaping (Bool) -> Void) {
         guard let webView, !awaitingExtension else { completion(false); return }
-        webView.evaluateJavaScript(Self.unsavedInputScript, in: nil, in: .defaultClient) { result in
+        webView.evaluateJavaScript(Self.unsavedInputScript, in: nil, in: WebEngine.scriptWorld) { result in
             switch result {
             case .success(let value): completion((value as? Bool) ?? false)
             case .failure: completion(false)
@@ -437,15 +443,20 @@ final class Tab: NSObject, Identifiable {
     static func installUnsavedInputTracking(into controller: WKUserContentController) {
         controller.addUserScript(WKUserScript(
             source: contentEditableTrackingSource, injectionTime: .atDocumentStart,
-            forMainFrameOnly: true, in: .defaultClient
+            forMainFrameOnly: true, in: WebEngine.scriptWorld
         ))
     }
 
     private static let contentEditableTrackingSource = """
     (() => {
       const initial = new WeakMap(), dirty = new WeakSet();
+      // Runs on every keystroke and focus change. `isContentEditable` can bring style up to date,
+      // so it is only asked inside a [contenteditable] (the only kind `unsavedInputScript` looks
+      // at); text fields, the usual target, leave at once.
       const editor = (target) => {
-        let el = target instanceof Element ? target : null;
+        if (!(target instanceof Element) || target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement) return null;
+        if (!target.closest('[contenteditable]')) return null;
+        let el = target;
         while (el && !el.isContentEditable) el = el.parentElement;
         return el && el.isContentEditable ? el : null;
       };
@@ -550,6 +561,7 @@ final class Tab: NSObject, Identifiable {
         view.stopLoading()
         view.navigationDelegate = nil
         view.uiDelegate = nil
+        ExtensionDebugger.shared.webViewWillTearDown(view)
         view.removeFromSuperview()
         webView = nil
         isAwake = false
@@ -798,15 +810,66 @@ final class Tab: NSObject, Identifiable {
         return zoomSteps.last { $0 < zoom - 0.005 } ?? zoomSteps[0]
     }
 
-    /// Zooms the page and remembers it for the site: other open tabs on the same site follow.
+    /// How `tabs.setZoomSettings` configures zoom for this tab.
+    enum ZoomMode: String { case automatic, manual, disabled }
+    enum ZoomScope: String { case perOrigin = "per-origin", perTab = "per-tab" }
+
+    @ObservationIgnored var zoomMode: ZoomMode = .automatic
+    @ObservationIgnored var zoomScope: ZoomScope = .perOrigin
+
+    var zoomSettingsDictionary: [String: Any] {
+        [
+            "mode": zoomMode.rawValue,
+            "scope": zoomScope.rawValue,
+            "defaultZoomFactor": SiteZoom.defaultZoom,
+        ]
+    }
+
+    func setZoomSettings(mode: String?, scope: String?) throws {
+        let nextMode: ZoomMode
+        if let mode {
+            guard let parsed = ZoomMode(rawValue: mode) else {
+                throw NSError(domain: "Tuff.Tabs", code: 1, userInfo: [NSLocalizedDescriptionKey: "Invalid zoom mode '\(mode)'."])
+            }
+            nextMode = parsed
+        } else {
+            nextMode = .automatic
+        }
+        let nextScope: ZoomScope
+        if let scope {
+            guard let parsed = ZoomScope(rawValue: scope) else {
+                throw NSError(domain: "Tuff.Tabs", code: 1, userInfo: [NSLocalizedDescriptionKey: "Invalid zoom scope '\(scope)'."])
+            }
+            nextScope = parsed
+        } else {
+            nextScope = nextMode == .manual ? .perTab : .perOrigin
+        }
+        if nextMode == .manual && nextScope == .perOrigin {
+            throw NSError(domain: "Tuff.Tabs", code: 1, userInfo: [NSLocalizedDescriptionKey: "Manual zoom mode requires per-tab scope."])
+        }
+        zoomMode = nextMode
+        zoomScope = nextScope
+        if nextMode == .disabled {
+            applyZoom(CGFloat(SiteZoom.defaultZoom))
+        } else if nextMode == .automatic && nextScope == .perOrigin {
+            applySiteZoom()
+        }
+    }
+
+    /// Zooms the page and remembers it for the site (or keeps it per-tab when `zoomScope == .perTab`).
     func setZoom(_ zoom: CGFloat) {
+        if zoomMode == .disabled {
+            applyZoom(CGFloat(SiteZoom.defaultZoom))
+            return
+        }
         let level = max(0.3, min(4, zoom))
+        applyZoom(level)
+        guard zoomMode == .automatic, zoomScope == .perOrigin else { return }
         let incognito = browser?.isPrivate ?? false
         SiteZoom.shared.set(Double(level), for: url, incognito: incognito)
-        applyZoom(level)
         guard let key = SiteZoom.key(for: url) else { return }
         for state in BrowserState.all where state.isPrivate == incognito {
-            for tab in state.allTabs where tab !== self && SiteZoom.key(for: tab.url) == key {
+            for tab in state.allTabs where tab !== self && tab.zoomMode == .automatic && tab.zoomScope == .perOrigin && SiteZoom.key(for: tab.url) == key {
                 tab.applyZoom(level)
             }
         }
@@ -816,7 +879,18 @@ final class Tab: NSObject, Identifiable {
     /// a new site has its own level, and WebKit can drop the zoom when a load moves the page
     /// to a new web process.
     func applySiteZoom() {
-        applyZoom(CGFloat(SiteZoom.shared.zoom(for: url, incognito: browser?.isPrivate ?? false)))
+        switch zoomMode {
+        case .disabled:
+            applyZoom(CGFloat(SiteZoom.defaultZoom))
+        case .manual:
+            if let webView, webView.pageZoom != pageZoom { webView.pageZoom = pageZoom }
+        case .automatic:
+            if zoomScope == .perTab {
+                if let webView, webView.pageZoom != pageZoom { webView.pageZoom = pageZoom }
+            } else {
+                applyZoom(CGFloat(SiteZoom.shared.zoom(for: url, incognito: browser?.isPrivate ?? false)))
+            }
+        }
     }
 
     private func applyZoom(_ level: CGFloat) {
@@ -826,10 +900,10 @@ final class Tab: NSObject, Identifiable {
         if let webView, webView.pageZoom != level { webView.pageZoom = level }
         guard changed else { return }
         browser?.tabDidChange(self, properties: .zoomFactor)
-        // WebKit has no tabs.onZoomChange; Tuff sends it (zoom is per site, automatic mode).
+        // WebKit has no tabs.onZoomChange; Tuff sends it with the tab's zoom settings.
         ExtensionEventPush.shared.emit("tabs.onZoomChange", details: [
             "oldZoomFactor": Double(old), "newZoomFactor": Double(level),
-            "zoomSettings": ["mode": "automatic", "scope": "per-origin", "defaultZoomFactor": 1.0],
+            "zoomSettings": zoomSettingsDictionary,
         ], tabs: ["tabId": self])
     }
 
@@ -837,8 +911,16 @@ final class Tab: NSObject, Identifiable {
     func setMuted(_ muted: Bool) {
         guard muted != isMuted else { return }
         isMuted = muted
-        if let webView { Self.applyMute(muted, to: webView) }
+        if let webView { Self.applyMute(isMuted || siteMuted, to: webView) }
         browser?.tabDidChange(self, properties: .muted)
+    }
+
+    /// Re-evaluates the per-site sound setting (`contentSettings.sound`) for this tab's current page.
+    func applySiteSound() {
+        let shouldMute = !SiteSettings.shared.soundAllowed(for: url, incognito: browser?.isPrivate ?? false)
+        guard shouldMute != siteMuted else { return }
+        siteMuted = shouldMute
+        if let webView { Self.applyMute(isMuted || siteMuted, to: webView) }
     }
 
     /// WebKit has no public per-page mute; `_setPageMuted:` takes a bitmask (1 = audio). The

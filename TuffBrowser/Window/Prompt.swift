@@ -110,6 +110,14 @@ enum PromptPresenter {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { showNext() }
     }
 
+    /// Takes a card away unanswered (as Cancel): the one on screen, or one still waiting its turn.
+    static func withdraw(_ id: UUID) {
+        if current?.id == id { return resolve(false) }
+        guard let index = queue.firstIndex(where: { $0.0.id == id }) else { return }
+        let (prompt, continuation) = queue.remove(at: index)
+        continuation.resume(returning: PromptResult(confirmed: false, fields: prompt.fields.map(\.text), checked: prompt.checked))
+    }
+
     private static func showNext() {
         guard current == nil, !queue.isEmpty else { return }
         let (prompt, continuation) = queue.removeFirst()

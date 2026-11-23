@@ -8,6 +8,77 @@ final class ExtensionDownloads {
 
     private var initiators: [Int: DownloadInitiator] = [:]
     private var previous: [ObjectIdentifier: Snapshot] = [:]
+    private var activeDragSource: DownloadDragSource?
+
+    private final class FilenameDetermination {
+        var remaining: Set<String>
+        var filename: String?
+        var conflictAction: DownloadConflictAction?
+        let completion: (String?, DownloadConflictAction?) -> Void
+        var finished = false
+
+        init(listeners: Set<String>, completion: @escaping (String?, DownloadConflictAction?) -> Void) {
+            self.remaining = listeners
+            self.completion = completion
+        }
+
+        func complete() {
+            guard !finished else { return }
+            finished = true
+            completion(filename, conflictAction)
+        }
+    }
+
+    private var pendingFilenames: [Int: FilenameDetermination] = [:]
+    private var nextFilenameRequestID = 1
+
+    /// Asks listening extensions (`downloads.onDeterminingFilename`) for an optional filename and
+    /// conflict action override before deciding where a download lands.
+    func determineFilename(
+        for item: DownloadItem, suggestedFilename: String, mimeType: String?,
+        completion: @escaping (String?, DownloadConflictAction?) -> Void
+    ) {
+        let listeners = ExtensionEventPush.shared.listeners(for: "downloads.onDeterminingFilename")
+        guard !listeners.isEmpty else { completion(nil, nil); return }
+        let requestID = nextFilenameRequestID
+        nextFilenameRequestID += 1
+        let state = FilenameDetermination(listeners: listeners, completion: completion)
+        pendingFilenames[requestID] = state
+
+        var dict = Self.chromeItem(item)
+        dict["filename"] = suggestedFilename
+        if let mimeType, !mimeType.isEmpty { dict["mime"] = mimeType }
+        for extID in listeners {
+            ExtensionEventPush.shared.emit(
+                "downloads.onDeterminingFilename",
+                args: [dict],
+                extra: ["filenameRequest": requestID],
+                to: extID
+            )
+        }
+
+        // Never stall a download forever if an extension fails to call suggest().
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
+            guard let self, let pending = self.pendingFilenames.removeValue(forKey: requestID) else { return }
+            pending.complete()
+        }
+    }
+
+    /// Answer from one extension's `downloads.onDeterminingFilename` listener.
+    func suggestFilename(requestID: Int, extensionID: String, filename: String?, conflictAction: String?) {
+        guard let state = pendingFilenames[requestID] else { return }
+        if let filename, !filename.isEmpty, Self.isValidFilename(filename) {
+            state.filename = filename
+        }
+        if let conflictAction, let action = DownloadConflictAction(rawValue: conflictAction) {
+            state.conflictAction = action
+        }
+        state.remaining.remove(extensionID)
+        if state.remaining.isEmpty {
+            pendingFilenames.removeValue(forKey: requestID)
+            state.complete()
+        }
+    }
 
     private struct Snapshot: Equatable {
         var state: String
@@ -239,6 +310,56 @@ final class ExtensionDownloads {
         finish("data:image/png;base64," + png.base64EncodedString())
     }
 
+    /// Initiates a native macOS file drag session (`chrome.downloads.drag`) for a completed download.
+    func drag(id: Int, finish: @escaping (Any?) -> Void, fail: @escaping (Error) -> Void) {
+        guard let item = item(id: id), let url = item.destination,
+              FileManager.default.fileExists(atPath: url.path) else {
+            fail(error("No downloaded file for id \(id)."))
+            return
+        }
+        guard let window = NSApp.keyWindow ?? BrowserState.shared.window,
+              let contentView = window.contentView else {
+            finish(nil)
+            return
+        }
+        let mouseScreen = NSEvent.mouseLocation
+        let windowPoint = window.convertPoint(fromScreen: mouseScreen)
+        let viewPoint = contentView.convert(windowPoint, from: nil)
+        let event: NSEvent
+        if let current = NSApp.currentEvent,
+           current.type == .leftMouseDown || current.type == .leftMouseDragged {
+            event = current
+        } else if let synthetic = NSEvent.mouseEvent(
+            with: .leftMouseDragged,
+            location: windowPoint,
+            modifierFlags: [],
+            timestamp: ProcessInfo.processInfo.systemUptime,
+            windowNumber: window.windowNumber,
+            context: nil,
+            eventNumber: 0,
+            clickCount: 1,
+            pressure: 1
+        ) {
+            event = synthetic
+        } else {
+            finish(nil)
+            return
+        }
+
+        let icon = NSWorkspace.shared.icon(forFile: url.path)
+        icon.size = NSSize(width: 48, height: 48)
+        let draggingItem = NSDraggingItem(pasteboardWriter: url as NSURL)
+        let frame = NSRect(x: viewPoint.x - 24, y: viewPoint.y - 24, width: 48, height: 48)
+        draggingItem.setDraggingFrame(frame, contents: icon)
+
+        let source = DownloadDragSource { [weak self] in
+            self?.activeDragSource = nil
+        }
+        activeDragSource = source
+        contentView.beginDraggingSession(with: [draggingItem], event: event, source: source)
+        finish(nil)
+    }
+
     static func isValidFilename(_ filename: String) -> Bool {
         let trimmed = filename.trimmed
         guard !trimmed.isEmpty, trimmed == filename, !filename.hasPrefix("/"), !filename.contains("\0") else { return false }
@@ -343,5 +464,18 @@ private final class DownloadInitiator: NSObject, WKNavigationDelegate {
 
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
         failed(error)
+    }
+}
+
+private final class DownloadDragSource: NSObject, NSDraggingSource {
+    private let onEnd: () -> Void
+    init(onEnd: @escaping () -> Void) { self.onEnd = onEnd }
+
+    func draggingSession(_ session: NSDraggingSession, sourceOperationMaskFor context: NSDraggingContext) -> NSDragOperation {
+        context == .outsideApplication ? [.copy, .link] : .copy
+    }
+
+    func draggingSession(_ session: NSDraggingSession, endedAt screenPoint: NSPoint, operation: NSDragOperation) {
+        onEnd()
     }
 }

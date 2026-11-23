@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import Flint
 import SwiftUI
 import WebKit
@@ -30,6 +31,8 @@ final class AppDelegate: NSObject {
     static var confirmQuitInTests = false
     /// Set when another copy was already running; this one hands over and quits.
     private var runningCopy: NSRunningApplication?
+    /// Tells extensions (`runtime.onBrowserUpdateAvailable`) when an update of Tuff is ready to install.
+    private var updateWatch: AnyCancellable?
 
     override init() {
         super.init()
@@ -186,20 +189,20 @@ final class AppDelegate: NSObject {
     @objc func zoomIn(_ sender: Any?) {
         guard let tab = state.selectedTab else { return }
         if tab.reader != nil { ReaderSettings.shared.grow(); return }
-        if let pdf = tab.pdf, pdf.isReady { pdf.zoomIn(); return }
+        if let pdf = tab.pdf { if pdf.isPDFReady { pdf.zoomIn() }; return }
         tab.setZoom(Tab.zoomStep(from: tab.pageZoom, up: true))
     }
 
     @objc func zoomOut(_ sender: Any?) {
         guard let tab = state.selectedTab else { return }
         if tab.reader != nil { ReaderSettings.shared.shrink(); return }
-        if let pdf = tab.pdf, pdf.isReady { pdf.zoomOut(); return }
+        if let pdf = tab.pdf { if pdf.isPDFReady { pdf.zoomOut() }; return }
         tab.setZoom(Tab.zoomStep(from: tab.pageZoom, up: false))
     }
 
     @objc func zoomReset(_ sender: Any?) {
         if state.selectedTab?.reader != nil { ReaderSettings.shared.resetSize(); return }
-        if let pdf = state.selectedTab?.pdf, pdf.isReady { pdf.setZoom(.auto); return }
+        if let pdf = state.selectedTab?.pdf { if pdf.isPDFReady { pdf.setZoom(.auto) }; return }
         state.selectedTab?.setZoom(CGFloat(AppSettings.shared.advanced.defaultZoom))
     }
 
@@ -222,7 +225,7 @@ final class AppDelegate: NSObject {
     @objc func selectSpaceByNumber(_ sender: NSMenuItem) { state.switchSpace(to: sender.tag - 1) }
 
     @objc func printPage(_ sender: Any?) {
-        if let pdf = state.selectedTab?.pdf, pdf.isReady { pdf.print(); return }
+        if let pdf = state.selectedTab?.pdf { if pdf.isPDFReady { pdf.print() }; return }
         // In reader mode, the article prints rather than the page.
         guard let webView = state.selectedTab?.reader?.view ?? state.selectedTab?.webView, let window = state.window else { return }
         let operation = webView.printOperation(with: NSPrintInfo.shared)
@@ -240,7 +243,8 @@ extension AppDelegate: NSMenuItemValidation {
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
         let state = self.state
         let tab = state.selectedTab
-        let pdfReady = tab?.pdf?.isReady ?? false
+        // An office document in the viewer: no page to print, zoom or search.
+        let document = tab?.pdf.map { !$0.format.isPDF } ?? false
         switch menuItem.action {
         case #selector(goBack(_:)):
             return tab.map { $0.canGoBack || $0.pdfAwaitingCommit } ?? false
@@ -251,9 +255,10 @@ extension AppDelegate: NSMenuItemValidation {
         case #selector(stopLoading(_:)):
             return tab.map { $0.isLoading || $0.pdf?.phase == .downloading } ?? false
         case #selector(printPage(_:)):
-            return pdfReady || tab?.webView != nil
+            if let pdf = tab?.pdf { return pdf.isPDFReady }
+            return tab?.webView != nil
         case #selector(findInPage(_:)), #selector(zoomIn(_:)), #selector(zoomOut(_:)), #selector(zoomReset(_:)):
-            return tab != nil
+            return tab != nil && !document
         case #selector(copyLink(_:)), #selector(duplicateTab(_:)):
             return tab?.url != nil
         case #selector(toggleReader(_:)):
@@ -318,6 +323,9 @@ extension AppDelegate: NSApplicationDelegate {
             other.activate()
             return
         }
+        // A restore from a backup waits for this moment, before anything has read the files it replaces.
+        BackupRestore.applyPendingFiles()
+        BackupRestore.applyPendingSettings()
         NSApp.mainMenu = MainMenu.build(target: self)
         ExtensionManager.shared.start()
         mainState.restore()
@@ -337,12 +345,18 @@ extension AppDelegate: NSApplicationDelegate {
         showMainWindow()
         Onboarding.shared.showIfNeeded()
         SyncManager.shared.start()
+        Task { @MainActor in
+            await BackupRestore.applyPendingCookies()
+        }
         #if DEBUG
         DebugHooks.runIfRequested()
         #else
         // Checks shortly after launch, then daily. Debug builds have their own bundle ID, which a
         // release would never match.
         Updater.app.start()
+        updateWatch = Updater.app.$phase.removeDuplicates().sink { phase in
+            if case .ready = phase { ExtensionEventPush.shared.emit("runtime.onBrowserUpdateAvailable", args: []) }
+        }
         #endif
         Analytics.start()
     }
@@ -365,6 +379,12 @@ extension AppDelegate: NSApplicationDelegate {
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
+
+    /// Quits with no card: the user has already agreed (restoring a backup restarts Tuff).
+    func quitWithoutAsking() {
+        quitConfirmed = true
+        NSApp.terminate(nil)
+    }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         if quitConfirmed { return pauseDownloadsThenQuit() }
@@ -452,7 +472,9 @@ extension AppDelegate: NSApplicationDelegate {
             HistoryStore.shared.saveNow(synchronously: true)
         }
         BookmarkStore.shared.saveNow(synchronously: true)
+        ExtensionSessionValues.saveIfNeeded()
         DownloadManager.shared.saveNow(quitting: true)
+        SiteSettings.shared.clearSessionOnlyCookies()
         TorrentSession.shared.shutdown()
     }
 

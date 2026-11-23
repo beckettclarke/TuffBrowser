@@ -1,6 +1,7 @@
 import AppKit
 import Observation
 import PDFKit
+import Quartz
 import SwiftUI
 import UniformTypeIdentifiers
 import WebKit
@@ -20,6 +21,9 @@ import WebKit
 ///
 /// The tab still navigates normally: once the file is in, a tiny placeholder page is committed at
 /// the PDF's address (`Tab.commitPDFPage`), so history, the address bar and Back all behave.
+///
+/// Office documents (`DocumentFormat`, anything but a PDF) come in the same way and are shown by
+/// Quick Look (`quickLook`) under a smaller toolbar; the PDF-only features stay off for them.
 @Observable
 final class PDFViewer: NSObject {
     enum Phase: Equatable { case downloading, ready, locked, failed(String) }
@@ -32,6 +36,7 @@ final class PDFViewer: NSObject {
 
     /// The PDF's address as the tab shows it (a `#page=` fragment included).
     let url: URL
+    let format: DocumentFormat
     var filename: String
     var phase: Phase = .downloading
     var receivedBytes: Int64 = 0
@@ -64,6 +69,8 @@ final class PDFViewer: NSObject {
     private(set) var searching = false
 
     @ObservationIgnored let view = TuffPDFView()
+    /// Shows an office document; nil for a PDF.
+    @ObservationIgnored let quickLook: TuffQuickLookView?
     @ObservationIgnored weak var tab: Tab?
     /// The file the document is read from (a temporary download, or a local file).
     @ObservationIgnored private(set) var fileURL: URL?
@@ -82,26 +89,37 @@ final class PDFViewer: NSObject {
     @ObservationIgnored var onDownloaded: ((URL?) -> Void)?
 
     private static let sidebarKey = "pdf.sidebarVisible"
-    static let favicon: NSImage = {
-        let config = NSImage.SymbolConfiguration(pointSize: 13, weight: .semibold)
-            .applying(.init(paletteColors: [.systemRed]))
-        return NSImage(systemSymbolName: "doc.richtext.fill", accessibilityDescription: "PDF")?
-            .withSymbolConfiguration(config) ?? NSImage()
-    }()
 
-    init(url: URL, filename: String?, tab: Tab?) {
+    init(url: URL, filename: String?, format: DocumentFormat = .pdf, tab: Tab?) {
         self.url = url
-        self.filename = Self.cleanFilename(filename, url: url)
+        self.format = format
+        self.filename = Self.cleanFilename(filename, url: url, format: format)
         self.tab = tab
+        if format.isPDF {
+            quickLook = nil
+        } else {
+            let preview = TuffQuickLookView(frame: .zero, style: .normal)
+            // The view moves between windows with its tab; it is closed with the viewer (`close`).
+            preview?.shouldCloseWithWindow = false
+            preview?.autostarts = false
+            quickLook = preview
+        }
         let defaults = UserDefaults.standard
         sidebarVisible = defaults.object(forKey: Self.sidebarKey) as? Bool ?? false
         initialPage = Self.pageFragment(url)
         super.init()
         view.viewer = self
         view.delegate = self
+        quickLook?.viewer = self
     }
 
     var isReady: Bool { phase == .ready }
+    /// A PDF is showing: the PDF-only commands (zoom, find, print) apply.
+    var isPDFReady: Bool { isReady && format.isPDF }
+    /// The view that shows the document and takes the keyboard.
+    var contentView: NSView { quickLook ?? view }
+    /// The tab's icon while it shows this.
+    var favicon: NSImage { format.favicon }
 
     /// What the tab and window title show.
     var displayTitle: String { documentTitle ?? filename }
@@ -115,22 +133,13 @@ final class PDFViewer: NSObject {
         return parts.string ?? url.absoluteString
     }
 
-    /// A response the viewer should take over: a PDF by its type, or a generic binary type
-    /// served from an address ending in `.pdf` (common on file hosts).
-    static func isPDF(_ response: URLResponse) -> Bool {
-        let type = response.mimeType?.lowercased() ?? ""
-        if ["application/pdf", "application/x-pdf", "application/acrobat", "text/pdf", "text/x-pdf"].contains(type) { return true }
-        let generic = type.isEmpty || type == "application/octet-stream" || type == "binary/octet-stream"
-        return generic && response.url?.pathExtension.lowercased() == "pdf"
-    }
-
-    private static func cleanFilename(_ suggested: String?, url: URL) -> String {
+    private static func cleanFilename(_ suggested: String?, url: URL, format: DocumentFormat) -> String {
         var name = suggested?.trimmed ?? ""
         if name.isEmpty || name == "Unknown" {
             name = url.lastPathComponent.removingPercentEncoding ?? url.lastPathComponent
         }
         if name.isEmpty || name == "/" { name = url.host ?? "document" }
-        if !name.lowercased().hasSuffix(".pdf") { name += ".pdf" }
+        if !format.names(name) { name += "." + format.ext }
         return name
     }
 
@@ -175,6 +184,7 @@ final class PDFViewer: NSObject {
         guard phase != .downloading else { return }
         initialPage = pageIndex
         if url.isFileURL, let fileURL {
+            quickLook?.previewItem = nil
             open(file: fileURL)
             return
         }
@@ -192,6 +202,14 @@ final class PDFViewer: NSObject {
         download = nil
         endFind()
         fileURL = file
+        appName = Self.appName(toOpen: file, format: format)
+        if let quickLook {
+            // Quick Look draws it out of process (as Finder's preview does), page by page as it scrolls.
+            quickLook.previewItem = file as NSURL
+            withAnimation(Motion.quick) { phase = .ready }
+            focus()
+            return
+        }
         guard let document = PDFDocument(url: file) else {
             withAnimation(Motion.quick) { phase = .failed("This file isn’t a PDF Tuff can read.") }
             return
@@ -267,6 +285,8 @@ final class PDFViewer: NSObject {
         view.delegate = nil
         view.document = nil
         view.removeFromSuperview()
+        quickLook?.close()
+        quickLook?.removeFromSuperview()
         document = nil
         thumbnails.reset()
     }
@@ -358,11 +378,13 @@ final class PDFViewer: NSObject {
     }
 
     func zoomIn() {
+        guard format.isPDF else { return }
         let next = Self.zoomSteps.first { $0 > view.scaleFactor * 1.01 } ?? Self.zoomSteps.last!
         setZoom(.custom, scale: next)
     }
 
     func zoomOut() {
+        guard format.isPDF else { return }
         let next = Self.zoomSteps.last { $0 < view.scaleFactor * 0.99 } ?? Self.zoomSteps.first!
         setZoom(.custom, scale: next)
     }
@@ -537,7 +559,19 @@ final class PDFViewer: NSObject {
         tab?.browser?.show(Toast(symbol: "link", text: "Copied link to page \(pageIndex + 1)"))
     }
 
-    func openInPreview() {
+    /// The app that opens this kind of file (Preview for a PDF), for "Open in …".
+    private(set) var appName: String?
+
+    private static func appName(toOpen file: URL, format: DocumentFormat) -> String? {
+        let app = format.isPDF
+            ? NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.Preview")
+            : NSWorkspace.shared.urlForApplication(toOpen: file)
+        guard let app, app.lastPathComponent != Bundle.main.bundleURL.lastPathComponent else { return nil }
+        return FileManager.default.displayName(atPath: app.path).replacingOccurrences(of: ".app", with: "")
+    }
+
+    /// Opens the file in Preview (a PDF) or the app that opens its kind (Pages, Word, Keynote…).
+    func openInApp() {
         guard let fileURL else { return }
         var target = fileURL
         if !url.isFileURL {
@@ -550,9 +584,11 @@ final class PDFViewer: NSObject {
                 target = named
             }
         }
-        let preview = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.Preview")
-        if let preview {
-            NSWorkspace.shared.open([target], withApplicationAt: preview, configuration: NSWorkspace.OpenConfiguration())
+        let app = format.isPDF
+            ? NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.Preview")
+            : NSWorkspace.shared.urlForApplication(toOpen: target)
+        if let app {
+            NSWorkspace.shared.open([target], withApplicationAt: app, configuration: NSWorkspace.OpenConfiguration())
         } else {
             NSWorkspace.shared.open(target)
         }
@@ -723,9 +759,13 @@ extension PDFViewer: WKDownloadDelegate {
         _ download: WKDownload, decideDestinationUsing response: URLResponse, suggestedFilename: String,
         completionHandler: @escaping (URL?) -> Void
     ) {
-        if let name = response.suggestedFilename, filename.hasPrefix("document") { filename = Self.cleanFilename(name, url: url) }
+        if let name = response.suggestedFilename, filename.hasPrefix("document") {
+            filename = Self.cleanFilename(name, url: url, format: format)
+        }
         if response.expectedContentLength > 0 { expectedBytes = response.expectedContentLength }
-        let file = PDFFiles.newFile()
+        // Quick Look picks how to draw a file by its extension: `.doc` and `.docx` differ.
+        let ext = (filename as NSString).pathExtension.lowercased()
+        let file = PDFFiles.newFile(extension: format.names(filename) ? ext : format.ext)
         destination = file
         completionHandler(file)
     }
@@ -735,7 +775,7 @@ extension PDFViewer: WKDownloadDelegate {
         guard self.download === download else { return }
         self.download = nil
         guard let file = destination, FileManager.default.fileExists(atPath: file.path) else {
-            fail("The PDF couldn’t be saved for viewing.")
+            fail("The \(format.isPDF ? "PDF" : "file") couldn’t be saved for viewing.")
             return
         }
         PDFFiles.secure(file, source: url)
@@ -799,8 +839,8 @@ enum PDFFiles {
         try? target.setResourceValues(values)
     }
 
-    static func newFile() -> URL {
-        directory.appendingPathComponent(UUID().uuidString).appendingPathExtension("pdf")
+    static func newFile(extension ext: String = "pdf") -> URL {
+        directory.appendingPathComponent(UUID().uuidString).appendingPathExtension(ext)
     }
 
     static func remove(_ urls: some Sequence<URL>) {

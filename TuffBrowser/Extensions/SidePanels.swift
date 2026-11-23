@@ -391,14 +391,55 @@ final class SidePanelHost: NSObject, WKNavigationDelegate, WKUIDelegate {
         _ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction,
         decisionHandler: @escaping (WKNavigationActionPolicy) -> Void
     ) {
+        if navigationAction.shouldPerformDownload {
+            decisionHandler(.download)
+            return
+        }
         guard let url = navigationAction.request.url, navigationAction.targetFrame?.isMainFrame ?? true,
               !ExtensionManager.isExtensionPage(url),
               !["about", "blob", "data"].contains(url.scheme ?? "") else {
             decisionHandler(.allow)
             return
         }
+        if navigationAction.navigationType == .linkActivated,
+           navigationAction.modifierFlags.contains(.option),
+           ["http", "https"].contains(url.scheme ?? "") {
+            decisionHandler(.download)
+            return
+        }
         decisionHandler(.cancel)
         if ["http", "https"].contains(url.scheme ?? "") { BrowserState.shared.newTab(url: url) }
+    }
+
+    func webView(
+        _ webView: WKWebView, decidePolicyFor navigationResponse: WKNavigationResponse,
+        decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void
+    ) {
+        if let http = navigationResponse.response as? HTTPURLResponse,
+           let disposition = http.value(forHTTPHeaderField: "Content-Disposition"),
+           disposition.lowercased().hasPrefix("attachment") {
+            decisionHandler(.download)
+            return
+        }
+        if navigationResponse.canShowMIMEType || Tab.isRenderable(navigationResponse.response.mimeType) {
+            decisionHandler(.allow)
+            return
+        }
+        decisionHandler(.download)
+    }
+
+    func webView(_ webView: WKWebView, navigationAction: WKNavigationAction, didBecome download: WKDownload) {
+        DownloadManager.shared.track(download)
+    }
+
+    func webView(_ webView: WKWebView, navigationResponse: WKNavigationResponse, didBecome download: WKDownload) {
+        DownloadManager.shared.track(download)
+    }
+
+    @objc(_webView:contextMenuDidCreateDownload:)
+    func webView(_ webView: WKWebView, contextMenuDidCreateDownload download: WKDownload) {
+        let asks = (webView as? TuffWebView)?.takeContextSaveAsRequest() ?? false
+        DownloadManager.shared.track(download, saveLocation: asks ? .ask : .downloadsFolder)
     }
 
     func webView(

@@ -103,7 +103,7 @@ final class BrowserState {
     /// `selectionDidChange(from:)`); `pipHandoffPending` says whether one is.
     @ObservationIgnored private weak var pipHandoffFrom: Tab?
     @ObservationIgnored private var pipHandoffPending = false
-    @ObservationIgnored private var restored = false
+    @ObservationIgnored private(set) var restored = false
     /// `restore` found no saved session: a new profile, so the welcome screen is due.
     @ObservationIgnored private(set) var startedFresh = false
     /// Tabs asked for before the session was restored (a link opened at launch, an extension
@@ -123,7 +123,7 @@ final class BrowserState {
     let isPrivate: Bool
 
     /// Extensions are told about the main window's tabs only.
-    private var ext: ExtensionManager? { isPrivate ? nil : ExtensionManager.shared }
+    var ext: ExtensionManager? { isPrivate ? nil : ExtensionManager.shared }
 
     /// The window tint of every Incognito window.
     static let incognitoTintHex = "#1C1B22"
@@ -363,6 +363,7 @@ final class BrowserState {
 
     func select(_ tab: Tab) {
         let previous = selectedTab
+        if tab.isHidden { ExtensionTabs.shared.unhide(tab) }
         if let owner = space(containing: tab), owner !== currentSpace, let index = spaces.firstIndex(where: { $0 === owner }) {
             switchSpace(to: index)
         }
@@ -413,6 +414,11 @@ final class BrowserState {
         for space in spaces where space.selectedTabID == tab.id {
             space.selectedTabID = space.split?.partner(of: tab.id) ?? neighbour(of: tab, in: space)?.id
         }
+        // Keep Firefox tab-succession chains intact when a middle tab closes.
+        let adoptedSuccessor = tab.successorTab
+        for other in allTabs where other !== tab && other.successorTab === tab {
+            other.successorTab = adoptedSuccessor === other ? nil : adoptedSuccessor
+        }
         for space in spaces where space.split?.contains(tab.id) == true {
             animate { space.split = nil }
         }
@@ -423,13 +429,17 @@ final class BrowserState {
             tab.sleep(resetToHome: true)
         case .tabs:
             if let url = tab.url, let space = space(containing: tab) {
+                let closedID = UUID()
                 closedTabs.append(ClosedTab(
                     url: url, title: tab.title, spaceID: space.id,
                     index: space.tabs.firstIndex { $0 === tab }, sessionState: tab.sessionState,
-                    id: UUID(), closedAt: Date()
+                    id: closedID, closedAt: Date()
                 ))
                 if closedTabs.count > Self.closedTabLimit { closedTabs.removeFirst(closedTabs.count - Self.closedTabLimit) }
-                if !isPrivate { ExtensionEventPush.shared.emit("sessions.onChanged", args: []) }
+                if !isPrivate {
+                    ExtensionSessionValues.shared.tabClosed(tab.id, as: closedID)
+                    ExtensionEventPush.shared.emit("sessions.onChanged", args: [])
+                }
             }
             ext?.didClose(tab)
             animate { spaces.forEach { $0.tabs.removeAll { $0 === tab } } }
@@ -458,20 +468,25 @@ final class BrowserState {
     }
 
     private func neighbour(of tab: Tab, in space: Space) -> Tab? {
+        let spaceTabs = space.tabs + space.allPinned + favorites(in: space)
+        if let successor = tab.successorTab, successor !== tab, spaceTabs.contains(where: { $0 === successor }) {
+            return successor
+        }
         if settings.tabs.afterClose == .recent {
-            return (space.tabs + space.allPinned + favorites(in: space))
-                .filter { $0 !== tab }
-                .max { $0.lastActive < $1.lastActive }
+            let candidates = spaceTabs.filter { $0 !== tab }
+            return candidates.filter { !$0.isHidden }.max { $0.lastActive < $1.lastActive }
+                ?? candidates.max { $0.lastActive < $1.lastActive }
         }
         if let i = space.tabs.firstIndex(where: { $0 === tab }) {
-            let below = i + 1 < space.tabs.count ? space.tabs[i + 1] : nil
-            let above = i > 0 ? space.tabs[i - 1] : nil
+            let below = space.tabs[(i + 1)...].first { !$0.isHidden } ?? (i + 1 < space.tabs.count ? space.tabs[i + 1] : nil)
+            let above = space.tabs[..<i].last { !$0.isHidden } ?? (i > 0 ? space.tabs[i - 1] : nil)
             return settings.tabs.afterClose == .above ? (above ?? below) : (below ?? above)
         }
         // A pinned / favourite tab was closed: fall back to the most recently used awake tab.
-        return (space.tabs + space.allPinned + favorites(in: space))
-            .filter { $0 !== tab && $0.isAwake }
+        return spaceTabs
+            .filter { $0 !== tab && $0.isAwake && !$0.isHidden }
             .max { $0.lastActive < $1.lastActive }
+            ?? spaceTabs.filter { $0 !== tab && $0.isAwake }.max { $0.lastActive < $1.lastActive }
     }
 
     func closeSelectedTab() {
@@ -490,6 +505,7 @@ final class BrowserState {
         if space !== currentSpace, let index = spaces.firstIndex(where: { $0 === space }) { switchSpace(to: index) }
         let tab = Tab(url: last.url, title: last.title, sessionState: last.sessionState)
         tab.browser = self
+        if !isPrivate, let closedID = last.id { ExtensionSessionValues.shared.tabReopened(closedID, as: tab.id) }
         let index = min(last.index ?? (settings.tabs.newTabPosition == .top ? 0 : space.tabs.count), space.tabs.count)
         animate { space.tabs.insert(tab, at: index) }
         tab.wake()
@@ -558,6 +574,19 @@ final class BrowserState {
         }
     }
 
+    /// The ids of the recently closed tabs (those saved with one).
+    var closedTabIDs: [UUID] { closedTabs.compactMap(\.id) }
+
+    /// `sessions.forgetClosedTab`: drops one closed tab from the list; false if there's no such tab.
+    func forgetClosedTab(id: String) -> Bool {
+        ensureClosedTabIDs()
+        guard let index = closedTabs.firstIndex(where: { $0.id?.uuidString == id }) else { return false }
+        closedTabs.remove(at: index)
+        if !isPrivate { ExtensionEventPush.shared.emit("sessions.onChanged", args: []) }
+        scheduleSave()
+        return true
+    }
+
     /// The recently closed tabs for the History menu, newest first.
     func recentlyClosedForMenu(limit: Int) -> [(id: String, title: String, url: URL)] {
         ensureClosedTabIDs()
@@ -578,6 +607,7 @@ final class BrowserState {
         if space !== currentSpace, let i = spaces.firstIndex(where: { $0 === space }) { switchSpace(to: i) }
         let tab = Tab(url: closed.url, title: closed.title, sessionState: closed.sessionState)
         tab.browser = self
+        if let closedID = closed.id { ExtensionSessionValues.shared.tabReopened(closedID, as: tab.id) }
         let atIndex = min(closed.index ?? (settings.tabs.newTabPosition == .top ? 0 : space.tabs.count), space.tabs.count)
         animate { space.tabs.insert(tab, at: atIndex) }
         tab.wake()
@@ -860,14 +890,14 @@ final class BrowserState {
     /// becomes the selected tab, so the toolbar, find and menus act on it.
     private func firstResponderDidChange() {
         guard let partner = splitPartner, let responder = window?.firstResponder as? NSView else { return }
-        let views = [partner.webView, partner.pdf?.isReady == true ? partner.pdf?.view : nil].compactMap { $0 }
+        let views = [partner.webView, partner.pdf?.isReady == true ? partner.pdf?.contentView : nil].compactMap { $0 }
         if views.contains(where: { responder === $0 || responder.isDescendant(of: $0) }) {
             select(partner)
         }
     }
 
     /// Forgets splits whose tabs have left their space (moved, or gone with a profile).
-    private func pruneSplits() {
+    func pruneSplits() {
         for space in spaces {
             guard let split = space.split else { continue }
             if tab(withID: split.leading, in: space) == nil || tab(withID: split.trailing, in: space) == nil {
@@ -1022,7 +1052,7 @@ final class BrowserState {
     /// milliseconds on the main thread (more for another profile's cookie store), which would
     /// stall that slide, so a sleeping tab is woken once it has landed. Scrolling through
     /// several spaces wakes only the one the scroll stops on.
-    private func spaceDidChange(previous: Tab?, settling: Bool = false) {
+    func spaceDidChange(previous: Tab?, settling: Bool = false) {
         ext?.spaceDidChange()
         let from = pendingSpaceActivation?.from ?? previous
         pendingSpaceActivation?.work.cancel()
@@ -1360,7 +1390,7 @@ final class BrowserState {
     func find(forward: Bool) {
         guard let tab = selectedTab else { return }
         if let pdf = tab.pdf, pdf.isReady {
-            pdf.nextMatch(forward: forward)
+            if pdf.format.isPDF { pdf.nextMatch(forward: forward) }
             return
         }
         if findQuery.isEmpty {
@@ -1424,7 +1454,7 @@ final class BrowserState {
                 if reader.view.window === window { window.makeFirstResponder(reader.view) }
             } else if let pdf = self.selectedTab?.pdf, pdf.isReady {
                 // Not in the window yet: it takes the keyboard as it arrives (`TuffPDFView`).
-                if pdf.view.window === window { window.makeFirstResponder(pdf.view) }
+                if pdf.contentView.window === window { window.makeFirstResponder(pdf.contentView) }
             } else if let view = self.selectedTab?.webView, view.window === window {
                 window.makeFirstResponder(view)
             }
@@ -1565,6 +1595,7 @@ final class BrowserState {
         var id: UUID
         var name: String
         var open: Bool
+        var color: String?
         var tabs: [TabSnapshot]
     }
 
@@ -1638,7 +1669,7 @@ final class BrowserState {
                     pinnedItems: s.pinnedItems.map { item in
                         switch item {
                         case .tab(let tab): PinnedItemSnapshot(tab: snap(tab))
-                        case .folder(let f): PinnedItemSnapshot(folder: FolderSnapshot(id: f.id, name: f.name, open: f.isOpen, tabs: f.tabs.map(snap)))
+                        case .folder(let f): PinnedItemSnapshot(folder: FolderSnapshot(id: f.id, name: f.name, open: f.isOpen, color: f.color, tabs: f.tabs.map(snap)))
                         }
                     },
                     tabs: s.tabs.filter { $0.url != nil }.map(snap), selected: s.selectedTabID,
@@ -1663,7 +1694,11 @@ final class BrowserState {
             try? data.write(to: file, options: .atomic)
         }
         if synchronously { Self.sessionWriter.sync(execute: write) } else { Self.sessionWriter.async(execute: write) }
+        if !synchronously { NotificationCenter.default.post(name: Self.didSave, object: self) }
     }
+
+    /// The session was saved: spaces, tabs or favourites may have changed (sidebar sync looks).
+    static let didSave = Notification.Name("BrowserState.didSave")
 
     /// Reads the saved session. A file that is there but can't be read (cut short, or written
     /// by a newer Tuff) is set aside rather than overwritten by the next save, and the copy kept
@@ -1746,7 +1781,7 @@ final class BrowserState {
                     space.pinnedItems = items.compactMap { item in
                         if let t = item.tab { return .tab(make(t)) }
                         guard let f = item.folder else { return nil }
-                        let folder = Folder(id: f.id, name: f.name, isOpen: f.open)
+                        let folder = Folder(id: f.id, name: f.name, isOpen: f.open, color: f.color)
                         folder.tabs = f.tabs.map(make)
                         return .folder(folder)
                     }

@@ -50,6 +50,45 @@ final class SyncTests: XCTestCase {
         XCTAssertThrowsError(try ScopedKeysRequest().decrypt(compact))
     }
 
+    /// Mozilla only sends the sync key when the public key goes out as `keys_jwk`.
+    func testSignInAsksForTheSyncKey() throws {
+        let signIn = MozillaAccount.SignIn()
+        let query = try XCTUnwrap(URLComponents(url: signIn.url, resolvingAgainstBaseURL: false)?.queryItems)
+        XCTAssertEqual(query.first { $0.name == "keys_jwk" }?.value, signIn.keys.jwkParameter)
+        XCTAssertTrue(query.contains { $0.name == "scope" && $0.value?.contains(MozillaAccount.syncScope) == true })
+        XCTAssertEqual(query.first { $0.name == "access_type" }?.value, "offline")
+    }
+
+    /// RFC 8291 appendix A: a Web Push message, byte for byte.
+    func testWebPushMatchesRFC8291() throws {
+        func data(_ text: String) throws -> Data { try XCTUnwrap(Data(base64URL: text)) }
+        let sender = try P256.KeyAgreement.PrivateKey(rawRepresentation: data("yfWPiYE-n46HLnH0KqZOF1fJJU3MYrct3AELtAQ-oRw"))
+        let receiver = try P256.KeyAgreement.PrivateKey(rawRepresentation: data("q1dXpw3UpT5VOmu_cf_v6ih07Aems3njxI-JWgLcM94"))
+        XCTAssertEqual(receiver.publicKey.x963Representation.base64URL, "BCVxsr7N_eNgVRqvHtD0zTZsEc6-VV-JvLexhqUzORcxaOzi6-AYWXvTBHm4bjyPjs7Vd8pZGH6SRpkNtoIAiw4")
+        let auth = try data("BTBZMqHH6r4Tts7J_aSIgg")
+        let plaintext = Data("When I grow up, I want to be a watermelon".utf8)
+        let message = try WebPushCrypto.encrypt(plaintext, to: receiver.publicKey, authSecret: auth, sender: sender, salt: data("DGv6ra1nlYgDCS1FRnbzlw"))
+        XCTAssertEqual(message.base64URL, "DGv6ra1nlYgDCS1FRnbzlwAAEABBBP4z9KsN6nGRTbVYI_c7VJSPQTBtkgcy27mlmlMoZIIgDll6e3vCYLocInmYWAmS6TlzAC8wEqKK6PBru3jl7A_yl95bQpu6cVPTpK4Mqgkf1CXztLVBSt2Ks3oZwbuwXPXLWyouBWLVWGNWQexSgSxsj_Qulcy4a-fN")
+        XCTAssertEqual(try WebPushCrypto.decrypt(message, with: receiver, authSecret: auth), plaintext)
+        XCTAssertThrowsError(try WebPushCrypto.decrypt(message, with: .init(), authSecret: auth))
+    }
+
+    /// A tab sent to this device opens here: the keys in the device list, sealed with the sync
+    /// key, then a payload made the way Firefox makes it.
+    func testSendTabRoundTrip() throws {
+        let syncKey = SyncKeyBundle.random()
+        let keys = SendTab.Keys.make()
+        let listed = try keys.commandData(syncKey: syncKey, keyID: "1-YWJj")
+        let url = URL(string: "https://example.com/page")!
+        let payload = try SendTab.payload(url: url, title: "Example", to: listed, syncKey: syncKey, keyID: "1-YWJj")
+        let page = try SendTab.page(from: payload, keys: keys)
+        XCTAssertEqual(page.url, url)
+        XCTAssertEqual(page.title, "Example")
+        XCTAssertThrowsError(try SendTab.payload(url: url, title: "", to: listed, syncKey: syncKey, keyID: "2-bmV3"), "keys from an older sync key")
+        // Firefox names the key by its fingerprint in hex.
+        XCTAssertEqual(SendTab.kid("1573930172878-qaNBKVZcofqGMUHwiTuIQw"), "a9a34129565ca1fa863141f0893b8843")
+    }
+
     func testRecordsRoundTripAndRejectTampering() throws {
         let bundle = SyncKeyBundle.random()
         let payload = try bundle.encrypt(Data(#"{"id":"abc","title":"Hi"}"#.utf8))

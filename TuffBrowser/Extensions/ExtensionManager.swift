@@ -24,8 +24,11 @@ struct ExtensionRecord: Codable, Identifiable, Equatable {
     /// Whether its button sits in the sidebar (true) or only in the page menu (false, the
     /// default).
     var pinned: Bool?
+    /// True for static Firefox themes installed through `management.install`.
+    var isTheme: Bool?
 
     var isPinned: Bool { pinned ?? false }
+    var isStaticTheme: Bool { isTheme == true }
 }
 
 struct SidePanelPrefs: Codable, Equatable {
@@ -75,6 +78,9 @@ final class ExtensionManager: NSObject {
     @ObservationIgnored private var iconCache: [String: NSImage] = [:]
     /// Drives the periodic store update check (`ExtensionUpdates.swift`).
     @ObservationIgnored var updateTimer: Timer?
+    /// Action popups currently shown, so `runtime.getContexts` can report `POPUP`.
+    @ObservationIgnored private var openPopups: [String: WKWebExtension.Action] = [:]
+    @ObservationIgnored private var popupObservers: [String: NSObjectProtocol] = [:]
 
     private let recordsFile = Paths.appSupport.appendingPathComponent("extensions.json")
     let extensionsDirectory = Paths.appSupport.appendingPathComponent("Extensions", isDirectory: true)
@@ -284,6 +290,14 @@ final class ExtensionManager: NSObject {
     @MainActor
     private func load(_ record: ExtensionRecord) async {
         guard record.enabled, contexts[record.id] == nil, !loading.contains(record.id) else { return }
+        if record.isStaticTheme {
+            let folder = directory(for: record)
+            if let manifest = try? Self.readManifest(in: folder),
+               let theme = manifest["theme"] as? [String: Any] {
+                try? ExtensionTheme.shared.update(theme, extensionID: record.id, resources: folder)
+            }
+            return
+        }
         loading.insert(record.id)
         defer { loading.remove(record.id) }
         do {
@@ -293,6 +307,9 @@ final class ExtensionManager: NSObject {
                 ExtensionCompat.refresh(extensionAt: resources)
             } else {
                 resources = try await stageUnpacked(record)
+            }
+            if let rawManifest = try? Self.readManifest(in: resources) {
+                ExtensionDNR.shared.applyDisabledRules(extensionID: record.id, manifest: rawManifest, resources: resources)
             }
             let webExtension = try await WKWebExtension(resourceBaseURL: resources)
             let context = WKWebExtensionContext(for: webExtension)
@@ -327,6 +344,9 @@ final class ExtensionManager: NSObject {
             guard shouldRun(id: record.id) else { return }
             try controller.load(context)
             contexts[record.id] = context
+            ExtensionCommands.shared.extensionLoaded(context, id: record.id)
+            ExtensionTTS.shared.extensionLoaded(record.id, manifest: webExtension.manifest)
+            ExtensionContentScripts.shared.extensionLoaded(record.id, manifest: webExtension.manifest, resources: resources)
             update(record.id) {
                 $0.name = webExtension.displayName ?? $0.name
                 $0.version = webExtension.displayVersion ?? webExtension.version ?? $0.version
@@ -362,12 +382,28 @@ final class ExtensionManager: NSObject {
         SidePanelManager.shared.extensionUnloaded(id)
         ExtensionDeclarativeContent.shared.extensionUnloaded(id)
         ExtensionBadgeColors.shared.extensionUnloaded(id)
+        ExtensionDebugger.shared.extensionUnloaded(id)
+        ExtensionTTS.shared.extensionUnloaded(id)
+        ExtensionWebAuthn.shared.extensionUnloaded(id)
+        ExtensionTabs.shared.extensionUnloaded(id)
+        ExtensionMenus.shared.extensionUnloaded(id)
+        ExtensionManagedStorage.shared.extensionUnloaded(id)
+        ExtensionProxyRelay.shared.extensionUnloaded(id)
+        openPopups.removeValue(forKey: id)
+        if let observer = popupObservers.removeValue(forKey: id) {
+            NotificationCenter.default.removeObserver(observer)
+        }
         guard let context = contexts.removeValue(forKey: id) else { return }
         try? controller.unload(context)
         revision += 1
     }
 
     func setEnabled(_ enabled: Bool, id: String) {
+        if enabled, records.first(where: { $0.id == id })?.isStaticTheme == true {
+            for other in records where other.isStaticTheme && other.id != id && other.enabled {
+                setEnabled(false, id: other.id)
+            }
+        }
         update(id) { $0.enabled = enabled }
         guard let record = records.first(where: { $0.id == id }) else { return }
         ExtensionEventPush.shared.emit(enabled ? "management.onEnabled" : "management.onDisabled", args: [ExtensionAPIBridge.shared.managementInfo(record)])
@@ -386,6 +422,9 @@ final class ExtensionManager: NSObject {
         unload(id)
         extensionRemoved(id)
         ExtensionDeclarativeContent.shared.extensionUninstalled(id)
+        ExtensionCommands.shared.extensionUninstalled(id)
+        ExtensionSessionValues.shared.extensionUninstalled(id)
+        ExtensionDNR.shared.extensionUninstalled(id)
         if record.path == nil {
             try? FileManager.default.removeItem(at: directory(for: record))
         } else {
@@ -650,6 +689,93 @@ final class ExtensionManager: NSObject {
         ))
     }
 
+    /// Verifies an optional `"sha256:<hex>"` or `"sha512:<hex>"` digest (as in Firefox `management.install`).
+    static func verifyHash(_ hash: String, of data: Data) -> Bool {
+        let parts = hash.split(separator: ":", maxSplits: 1).map(String.init)
+        guard parts.count == 2 else { return false }
+        let algo = parts[0].lowercased()
+        let expected = parts[1].lowercased()
+        let actual: String
+        switch algo {
+        case "sha256":
+            actual = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+        case "sha512":
+            actual = SHA512.hash(data: data).map { String(format: "%02x", $0) }.joined()
+        default:
+            return false
+        }
+        return actual == expected
+    }
+
+    /// Firefox `management.install({ url, hash })`: downloads and installs a static theme `.xpi`.
+    @MainActor
+    func installTheme(url: URL, hash: String?, confirm: Bool = true) async throws -> String {
+        guard let scheme = url.scheme?.lowercased(), ["https", "http", "file"].contains(scheme) else {
+            throw NSError(domain: "Tuff.Extensions", code: 1, userInfo: [NSLocalizedDescriptionKey: "Invalid theme URL."])
+        }
+        let package: Data
+        if scheme == "file" {
+            package = try Data(contentsOf: url)
+        } else {
+            package = try await Self.download(url)
+        }
+        if let hash, !hash.isEmpty {
+            guard Self.verifyHash(hash, of: package) else {
+                throw NSError(domain: "Tuff.Extensions", code: 2, userInfo: [NSLocalizedDescriptionKey: "Downloaded theme did not match the expected hash."])
+            }
+        }
+        guard let zip = Self.zipPayload(of: package) else { throw InstallError.badArchive }
+        let fm = FileManager.default
+        let staging = fm.temporaryDirectory.appendingPathComponent("tuff-theme-\(UUID().uuidString)", isDirectory: true)
+        let zipFile = staging.appendingPathComponent("theme.zip")
+        let unpacked = staging.appendingPathComponent("contents", isDirectory: true)
+        try fm.createDirectory(at: unpacked, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: staging) }
+        try zip.write(to: zipFile)
+        try await Self.unzip(zipFile, to: unpacked)
+
+        var root = unpacked
+        if !fm.fileExists(atPath: root.appendingPathComponent("manifest.json").path),
+           let only = try? fm.contentsOfDirectory(at: root, includingPropertiesForKeys: nil).filter({ $0.hasDirectoryPath }),
+           only.count == 1 {
+            root = only[0]
+        }
+        let manifest = try Self.readManifest(in: root)
+        guard let theme = manifest["theme"] as? [String: Any] else {
+            throw NSError(domain: "Tuff.Extensions", code: 3, userInfo: [NSLocalizedDescriptionKey: "management.install only installs static themes."])
+        }
+        let name = Self.rawName(manifest)
+        let id = ExtensionManagedStorage.geckoID(from: manifest) ?? Self.generatedID(from: "theme:" + url.absoluteString)
+        if confirm {
+            let ok = await PromptPresenter.present(Prompt(
+                icon: Self.manifestIcon(manifest, in: root),
+                symbol: "paintpalette.fill",
+                title: "Install theme “\(name)”?",
+                message: "The window’s colours and appearance will switch to this theme.",
+                confirmTitle: "Install Theme"
+            ))
+            guard ok else { throw InstallError.cancelled }
+        }
+
+        let destination = extensionsDirectory.appendingPathComponent(id, isDirectory: true)
+        try? fm.removeItem(at: destination)
+        try fm.moveItem(at: root, to: destination)
+
+        for other in records where other.isStaticTheme && other.id != id && other.enabled {
+            setEnabled(false, id: other.id)
+        }
+        let record = ExtensionRecord(
+            id: id, source: .firefox, storeID: nil, name: name,
+            version: manifest["version"] as? String ?? "", enabled: true, path: nil, isTheme: true
+        )
+        records.removeAll { $0.id == id }
+        records.append(record)
+        saveRecords()
+        try ExtensionTheme.shared.update(theme, extensionID: id, resources: destination)
+        ExtensionEventPush.shared.emit("management.onInstalled", args: [ExtensionAPIBridge.shared.managementInfo(record)])
+        return id
+    }
+
     static func preservingState(of existing: ExtensionRecord?, into new: ExtensionRecord) -> ExtensionRecord {
         guard let existing else { return new }
         var record = new
@@ -675,6 +801,10 @@ final class ExtensionManager: NSObject {
             // background worker down before the new files are loaded under the same origin.
             if isUpdate { try? await Task.sleep(nanoseconds: 800_000_000) }
             await self.load(record)
+            // WebKit doesn't tell a newly added extension it was installed (it does say onStartup).
+            var installed: [String: Any] = ["reason": isUpdate ? "update" : "install"]
+            if isUpdate, let previous = existing?.version, !previous.isEmpty { installed["previousVersion"] = previous }
+            ExtensionEventPush.shared.emitWhenListening("runtime.onInstalled", args: [installed], to: record.id)
             if !isUpdate {
                 SidePanelManager.shared.extensionInstalled(record.id)
                 ExtensionEventPush.shared.emit("management.onInstalled", args: [ExtensionAPIBridge.shared.managementInfo(record)])
@@ -715,6 +845,8 @@ final class ExtensionManager: NSObject {
         (["history", "tabs", "webNavigation", "declarativeNetRequestFeedback"], "clock.arrow.circlepath", "Read your browsing history"),
         (["declarativeNetRequest"], "hand.raised", "Block content on any page"),
         (["bookmarks"], "bookmark", "Read and change your bookmarks"),
+        (["readingList"], "eyeglasses", "Read and change your reading list"),
+        (["userScripts"], "applescript", "Run user scripts on websites"),
         (["downloads"], "arrow.down.circle", "Manage your downloads"),
         (["clipboardRead"], "doc.on.clipboard", "Read data you copy and paste"),
         (["clipboardWrite"], "doc.on.clipboard", "Change data you copy and paste"),
@@ -896,8 +1028,22 @@ final class ExtensionManager: NSObject {
 
     /// Moves an extension's button between the sidebar and the page menu.
     func setPinned(_ pinned: Bool, id: String) {
+        let wasPinned = records.first(where: { $0.id == id })?.isPinned ?? false
         update(id) { $0.pinned = pinned }
         revision += 1
+        if wasPinned != pinned {
+            ExtensionEventPush.shared.emit("action.onUserSettingsChanged", args: [["isOnToolbar": pinned]], to: id)
+        }
+    }
+
+    func openPopup(for id: String) -> WKWebExtension.Action? {
+        guard let action = openPopups[id] else { return nil }
+        if action.popupPopover?.isShown == true { return action }
+        openPopups.removeValue(forKey: id)
+        if let observer = popupObservers.removeValue(forKey: id) {
+            NotificationCenter.default.removeObserver(observer)
+        }
+        return nil
     }
 
     /// Runs an extension's action from somewhere other than its own button (the page menu), with
@@ -933,6 +1079,13 @@ final class ExtensionManager: NSObject {
 
     func contextMenuItems(for tab: Tab) -> [NSMenuItem] {
         contexts.values.flatMap { $0.menuItems(for: tab) }
+    }
+
+    func contextMenuItemsByExtension(for tab: Tab) -> [(extensionID: String, items: [NSMenuItem])] {
+        contexts.compactMap { id, context in
+            let items = context.menuItems(for: tab)
+            return items.isEmpty ? nil : (id, items)
+        }
     }
 
     /// Gives extensions a chance to handle a keyboard shortcut they registered.
@@ -980,6 +1133,8 @@ final class ExtensionManager: NSObject {
     func didClose(_ tab: Tab) {
         controller.didCloseTab(tab, windowIsClosing: false)
         SidePanelManager.shared.tabClosed(tab)
+        ExtensionDebugger.shared.tabClosed(tab)
+        ExtensionWebAuthn.shared.cancelRequests(for: tab.webView)
     }
     func didActivate(_ tab: Tab, previous: Tab?) {
         controller.didActivateTab(tab, previousActiveTab: previous)
@@ -1226,7 +1381,20 @@ extension ExtensionManager: WKWebExtensionControllerDelegate {
             return
         }
         popover.behavior = .transient
-        if let anchor = anchors.object(forKey: context.uniqueIdentifier as NSString), anchor.window != nil {
+        let id = context.uniqueIdentifier
+        openPopups[id] = action
+        if let old = popupObservers.removeValue(forKey: id) {
+            NotificationCenter.default.removeObserver(old)
+        }
+        popupObservers[id] = NotificationCenter.default.addObserver(
+            forName: NSPopover.didCloseNotification, object: popover, queue: .main
+        ) { [weak self] _ in
+            self?.openPopups.removeValue(forKey: id)
+            if let obs = self?.popupObservers.removeValue(forKey: id) {
+                NotificationCenter.default.removeObserver(obs)
+            }
+        }
+        if let anchor = anchors.object(forKey: id as NSString), anchor.window != nil {
             popover.show(relativeTo: anchor.bounds, of: anchor, preferredEdge: .minY)
         } else if let content = browser.window?.contentView {
             let rect = NSRect(x: 24, y: content.bounds.maxY - 60, width: 1, height: 1)

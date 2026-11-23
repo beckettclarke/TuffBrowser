@@ -147,7 +147,7 @@ enum Hawk {
 
 // MARK: - Sign-in keys
 
-/// The one-off key pair a sign-in asks for the account's keys with (`keys_jwe`), and opening
+/// The one-off key pair a sign-in asks for the account's keys with (`keys_jwk`), and opening
 /// the JWE they come back in (ECDH-ES with A256GCM, RFC 7516 / 7518).
 struct ScopedKeysRequest {
     let privateKey = P256.KeyAgreement.PrivateKey()

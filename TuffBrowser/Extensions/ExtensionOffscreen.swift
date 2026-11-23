@@ -32,6 +32,9 @@ final class ExtensionOffscreen {
         finish(nil)
     }
 
+    /// The open offscreen document's address, if the extension has one.
+    func url(id: String) -> URL? { documents[id]?.url }
+
     func has(id: String, finish: @escaping (Any?) -> Void) {
         finish(documents[id] != nil)
     }
@@ -55,7 +58,7 @@ final class ExtensionOffscreen {
 /// being throttled, and reloaded if its content process dies, so it stays available to the worker.
 private final class OffscreenDocument: NSObject, WKNavigationDelegate {
     private var webView: WKWebView?
-    private let url: URL
+    let url: URL
 
     init(configuration: WKWebViewConfiguration?, url: URL) {
         self.url = url

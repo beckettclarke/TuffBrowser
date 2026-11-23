@@ -1126,60 +1126,74 @@ extension DownloadManager: WKDownloadDelegate {
         completionHandler: @escaping (URL?) -> Void
     ) {
         let item = item(for: download)
-        let destination = Self.preferredDestination(for: item, suggested: suggestedFilename)
-        let accept: (URL) -> Void = { url in
-            guard Self.prepareDestination(url) else {
-                item?.state = .failed("Couldn’t create the destination folder")
+        let proceed: () -> Void = {
+            let destination = Self.preferredDestination(for: item, suggested: suggestedFilename)
+            let accept: (URL) -> Void = { url in
+                guard Self.prepareDestination(url) else {
+                    item?.state = .failed("Couldn’t create the destination folder")
+                    if let item { ExtensionDownloads.shared.changed(item) }
+                    completionHandler(nil)
+                    return
+                }
+                item?.filename = url.lastPathComponent
+                item?.destination = url
+                // Time spent in the save panel isn't download time.
+                item?.startedAt = Date()
                 if let item { ExtensionDownloads.shared.changed(item) }
-                completionHandler(nil)
+                // Big files from servers that take ranges go to the multi-connection engine instead.
+                if let item, self.takeOver(download, item: item, response: response, destination: url) {
+                    completionHandler(nil)
+                    return
+                }
+                // Replacing a file (the save panel asked first): WebKit won't overwrite one, so the
+                // download goes to a temporary name beside it and replaces it only once it has
+                // finished. A download that fails or is cancelled leaves the old file as it was.
+                if FileManager.default.fileExists(atPath: url.path) {
+                    let temp = url.deletingLastPathComponent()
+                        .appendingPathComponent(".\(url.lastPathComponent).\(UUID().uuidString.prefix(8)).download")
+                    item?.partialFile = temp
+                    completionHandler(temp)
+                } else {
+                    completionHandler(url)
+                }
+            }
+            guard Self.shouldAsk(for: item, destination: destination) else {
+                accept(destination)
                 return
             }
-            item?.filename = url.lastPathComponent
-            item?.destination = url
-            // Time spent in the save panel isn't download time.
-            item?.startedAt = Date()
-            if let item { ExtensionDownloads.shared.changed(item) }
-            // Big files from servers that take ranges go to the multi-connection engine instead.
-            if let item, self.takeOver(download, item: item, response: response, destination: url) {
-                completionHandler(nil)
-                return
+            Self.prepareDestination(destination)
+            let panel = NSSavePanel()
+            panel.directoryURL = destination.deletingLastPathComponent()
+            panel.nameFieldStringValue = destination.lastPathComponent
+            panel.canCreateDirectories = true
+            let finish: (NSApplication.ModalResponse) -> Void = { response in
+                if response == .OK, let url = panel.url {
+                    accept(url)
+                } else {
+                    item?.state = .failed("Cancelled")
+                    item?.download = nil
+                    item?.observation = nil
+                    if let item { ExtensionDownloads.shared.changed(item) }
+                    completionHandler(nil)
+                }
             }
-            // Replacing a file (the save panel asked first): WebKit won't overwrite one, so the
-            // download goes to a temporary name beside it and replaces it only once it has
-            // finished. A download that fails or is cancelled leaves the old file as it was.
-            if FileManager.default.fileExists(atPath: url.path) {
-                let temp = url.deletingLastPathComponent()
-                    .appendingPathComponent(".\(url.lastPathComponent).\(UUID().uuidString.prefix(8)).download")
-                item?.partialFile = temp
-                completionHandler(temp)
+            if let window = BrowserState.active.window {
+                panel.beginSheetModal(for: window, completionHandler: finish)
             } else {
-                completionHandler(url)
+                finish(panel.runModal())
             }
         }
-        guard Self.shouldAsk(for: item, destination: destination) else {
-            accept(destination)
-            return
-        }
-        Self.prepareDestination(destination)
-        let panel = NSSavePanel()
-        panel.directoryURL = destination.deletingLastPathComponent()
-        panel.nameFieldStringValue = destination.lastPathComponent
-        panel.canCreateDirectories = true
-        let finish: (NSApplication.ModalResponse) -> Void = { response in
-            if response == .OK, let url = panel.url {
-                accept(url)
-            } else {
-                item?.state = .failed("Cancelled")
-                item?.download = nil
-                item?.observation = nil
-                if let item { ExtensionDownloads.shared.changed(item) }
-                completionHandler(nil)
+
+        if let item, !item.isPrivate, ExtensionEventPush.shared.isListening(to: ["downloads.onDeterminingFilename"]) {
+            ExtensionDownloads.shared.determineFilename(
+                for: item, suggestedFilename: suggestedFilename, mimeType: response.mimeType
+            ) { suggested, conflict in
+                if let suggested { item.requestedFilename = suggested }
+                if let conflict { item.conflictAction = conflict }
+                proceed()
             }
-        }
-        if let window = BrowserState.active.window {
-            panel.beginSheetModal(for: window, completionHandler: finish)
         } else {
-            finish(panel.runModal())
+            proceed()
         }
     }
 

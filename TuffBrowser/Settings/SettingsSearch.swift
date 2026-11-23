@@ -163,6 +163,11 @@ enum SettingsSearch {
         .group("Browser", .importData, named: "Import from another browser",
                "migrate switch move bookmarks history favourites pinned spaces safari chrome arc zen firefox edge brave dia vivaldi opera"),
 
+        // Backup & Restore
+        .group("Back up", .backup, named: "Back up Tuff",
+               "backup export everything file save tabs spaces profiles bookmarks history passwords cookies extensions settings protect password encrypt"),
+        .group("Restore", .backup, named: "Restore from a backup", "restore import file move computer migrate tuffbackup"),
+
         // Theme
         .group("Background", .appearance, named: "Background style", "glass vibrancy solid seamless window material"),
         .row("Transparency", .appearance, in: "Window", "opacity see-through translucent glass"),
@@ -235,7 +240,7 @@ enum SettingsSearch {
 
         // Sync
         .row("Sign in to sync", .sync, in: "Mozilla account", "sync mozilla firefox zen account sign in cloud"),
-        .group("What to sync", .sync, named: "What to sync", "sync bookmarks history passwords open tabs devices"),
+        .group("What to sync", .sync, named: "What to sync", "sync bookmarks history passwords open tabs devices spaces sidebar pinned favorites essentials workspaces zen"),
         .group("Google account", .sync, named: "Google account", "chrome google sync account"),
 
         // Passwords
@@ -249,6 +254,7 @@ enum SettingsSearch {
         .group("Sites", .websites, named: "Settings for each site",
                "site permissions camera microphone location notifications ask allow deny block reset per site"),
         .row("Remember my choice by default", .websites, in: "Site permissions", "permissions remember camera microphone"),
+        .row("Block location requests", .websites, in: "Site permissions", "location geolocation gps deny automatically"),
         .row("Block pop-ups", .websites, in: "Content", "popup popups windows new tabs"),
         .row("Allow JavaScript", .websites, in: "Content", "js scripts disable"),
         .row("Autoplay video and audio", .websites, in: "Content", "media sound video mute"),
@@ -278,6 +284,7 @@ enum SettingsSearch {
         .row("Identify as", .advanced, in: "User agent", named: "User agent", "safari chrome firefox browser identify custom"),
         .row("Back up or move your settings", .advanced, in: "Backup & reset", named: "Export or import settings",
              "backup export import json file move"),
+        .row("Back up everything", .advanced, in: "Backup & reset", "full backup export tabs spaces profiles extensions cookies"),
         .row("Reset all settings", .advanced, in: "Backup & reset", "defaults factory restore"),
 
         // About

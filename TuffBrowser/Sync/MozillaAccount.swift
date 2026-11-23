@@ -14,12 +14,18 @@ struct MozillaAccountState: Codable, Equatable {
     var keyID: String
     /// This browser in the account's device list, when registering it worked.
     var deviceID: String?
+    /// The key pair other devices send tabs to (`SendTab`), and whether the device list has it.
+    var sendTab: SendTab.Keys?
+    var sendTabListed: Bool?
+    /// The last device command (sent tab) handled.
+    var commandIndex: Int?
 }
 
 /// Signing in to a Mozilla account the way Firefox for iOS and Android do: Mozilla's own sign-in
 /// pages in a tab (passwords, two-step codes, passkeys and all), an OAuth code back through a
 /// redirect Tuff catches (`SyncManager.handleRedirect`), and the account's sync key sent
-/// encrypted to a key pair made for this sign-in (`keys_jwe`), so it never travels in the clear.
+/// encrypted to a key pair made for this sign-in (its public half goes out as `keys_jwk`, the key
+/// comes back as `keys_jwe`), so it never travels in the clear.
 ///
 /// Mozilla doesn't register OAuth clients for other browsers, so this uses the Firefox for iOS
 /// client, as Firefox-based browsers use Firefox's: the account's settings list Tuff under that
@@ -65,7 +71,7 @@ enum MozillaAccount {
                 .init(name: "code_challenge_method", value: "S256"),
                 .init(name: "code_challenge", value: pkce.challenge),
                 .init(name: "access_type", value: "offline"),
-                .init(name: "keys_jwe", value: keys.jwkParameter),
+                .init(name: "keys_jwk", value: keys.jwkParameter),
                 .init(name: "redirect_uri", value: redirectURI),
             ]
             return parts.url!
@@ -93,16 +99,25 @@ enum MozillaAccount {
             "code_verifier": signIn.pkce.verifier,
         ])
         guard let refreshToken = tokens["refresh_token"] as? String,
-              let accessToken = tokens["access_token"] as? String,
-              let jwe = tokens["keys_jwe"] as? String else {
-            throw SyncError.signInFailed("Mozilla didn’t send the keys sync needs. Try signing in again.")
+              let accessToken = tokens["access_token"] as? String else {
+            throw SyncError.signInFailed("Mozilla didn’t finish the sign-in. Try signing in again.")
         }
-        let keysData = try signIn.keys.decrypt(jwe)
-        guard let keys = try JSONSerialization.jsonObject(with: keysData) as? [String: Any],
-              let scoped = keys[syncScope] as? [String: Any],
-              let k = scoped["k"] as? String, let kid = scoped["kid"] as? String,
-              Data(base64URL: k)?.count == 64 else {
-            throw SyncError.signInFailed("The account’s sync key couldn’t be read.")
+        let k: String, kid: String
+        do {
+            guard let jwe = tokens["keys_jwe"] as? String else {
+                throw SyncError.signInFailed("Mozilla didn’t send the keys sync needs. Try signing in again.")
+            }
+            guard let keys = try JSONSerialization.jsonObject(with: try signIn.keys.decrypt(jwe)) as? [String: Any],
+                  let scoped = keys[syncScope] as? [String: Any],
+                  let key = scoped["k"] as? String, let id = scoped["kid"] as? String,
+                  Data(base64URL: key)?.count == 64 else {
+                throw SyncError.signInFailed("The account’s sync key couldn’t be read.")
+            }
+            (k, kid) = (key, id)
+        } catch {
+            // Don't leave a half-finished sign-in in the account's connected services.
+            _ = try? await post(oauthServer + "/destroy", ["refresh_token": refreshToken])
+            throw error
         }
 
         var account = MozillaAccountState(email: "", refreshToken: refreshToken, syncKey: k, keyID: kid)
@@ -154,6 +169,37 @@ enum MozillaAccount {
         }
     }
 
+    /// Lists this browser's Send Tab key in the account's device list (registering the device
+    /// if that didn't happen at sign-in). Returns the device's ID.
+    static func listSendTab(_ account: MozillaAccountState, commandData: String) async throws -> String? {
+        var body: [String: Any] = ["name": deviceName, "type": "desktop", "availableCommands": [SendTab.command: commandData]]
+        if let id = account.deviceID { body["id"] = id }
+        return try await post(authServer + "/account/device", body, bearer: account.refreshToken)["id"] as? String ?? account.deviceID
+    }
+
+    /// The account's devices, as the device list has them.
+    static func devices(refreshToken: String) async throws -> [[String: Any]] {
+        var request = URLRequest(url: URL(string: authServer + "/account/devices")!)
+        request.setValue("Bearer " + refreshToken, forHTTPHeaderField: "Authorization")
+        return try await sendAny(request) as? [[String: Any]] ?? []
+    }
+
+    /// Commands other devices sent this one after `index`, and the index to remember.
+    static func commands(refreshToken: String, after index: Int?) async throws -> (messages: [[String: Any]], index: Int?) {
+        var parts = URLComponents(string: authServer + "/account/device/commands")!
+        parts.queryItems = [.init(name: "index", value: String((index ?? -1) + 1)), .init(name: "limit", value: "50")]
+        var request = URLRequest(url: parts.url!)
+        request.setValue("Bearer " + refreshToken, forHTTPHeaderField: "Authorization")
+        let answer = try await send(request)
+        let messages = answer["messages"] as? [[String: Any]] ?? []
+        let last = messages.compactMap { ($0["index"] as? NSNumber)?.intValue }.max()
+        return (messages, last ?? index)
+    }
+
+    static func invoke(refreshToken: String, target: String, payload: [String: Any]) async throws {
+        _ = try await post(authServer + "/account/devices/invoke_command", ["command": SendTab.command, "target": target, "payload": payload], bearer: refreshToken)
+    }
+
     /// Takes this browser off the account and revokes its token. Best effort: signing out of
     /// Tuff happens either way.
     static func signOut(_ account: MozillaAccountState) async {
@@ -181,6 +227,10 @@ enum MozillaAccount {
     }
 
     private static func send(_ request: URLRequest) async throws -> [String: Any] {
+        try await sendAny(request) as? [String: Any] ?? [:]
+    }
+
+    private static func sendAny(_ request: URLRequest) async throws -> Any {
         var request = request
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         request.timeoutInterval = 30
@@ -191,10 +241,10 @@ enum MozillaAccount {
             throw SyncError.network(error.localizedDescription)
         }
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-        let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
+        let object = try? JSONSerialization.jsonObject(with: data)
         guard (200..<300).contains(status) else {
-            throw SyncError.server(status, object["message"] as? String ?? "")
+            throw SyncError.server(status, (object as? [String: Any])?["message"] as? String ?? "")
         }
-        return object
+        return object ?? [String: Any]()
     }
 }

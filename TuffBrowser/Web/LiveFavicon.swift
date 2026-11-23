@@ -6,11 +6,11 @@ import WebKit
 /// `FaviconStore.fetchIcon` looks for the page's icon once, when it finishes loading. Pages
 /// that change it later — an unread count, a build status, a game drawn into the favicon with
 /// a canvas — swap the `href` of their `<link rel=icon>` (or replace the link), which that never
-/// sees. A script in the main frame (in its own content world) watches for those changes and
+/// sees. A script in the main frame (in Tuff's content world) watches for those changes and
 /// reports the icon that changed last.
 enum LiveFavicon {
     static let handlerName = "tuffFavicon"
-    static let world = WKContentWorld.world(name: "TuffFavicon")
+    static let world = WebEngine.scriptWorld
     private static let handler = LiveFaviconMessageHandler()
 
     static func install(into controller: WKUserContentController) {
@@ -60,7 +60,7 @@ enum LiveFavicon {
         if (loaded && !timer) timer = setTimeout(flush, 100);
       }
 
-      new MutationObserver(function (records) {
+      var observer = new MutationObserver(function (records) {
         for (var i = 0; i < records.length; i++) {
           var r = records[i];
           if (r.type === 'attributes') { changed(r.target); continue; }
@@ -74,7 +74,19 @@ enum LiveFavicon {
             }
           }
         }
-      }).observe(document, { childList: true, subtree: true, attributes: true, attributeFilter: ['href', 'rel'] });
+      });
+      // An observer of the whole document would hear of every node the page adds or removes
+      // (a busy app makes thousands of changes a second) to find the odd <link>. While the page
+      // loads, only icon attributes changed by script matter; once the <head> is there, only it
+      // is watched, for links being swapped as well.
+      observer.observe(document, { subtree: true, attributes: true, attributeFilter: ['href', 'rel'] });
+      document.addEventListener('DOMContentLoaded', function () {
+        var head = document.head;
+        if (!head) return;
+        observer.takeRecords().forEach(function (r) { if (r.type === 'attributes') changed(r.target); });
+        observer.disconnect();
+        observer.observe(head, { childList: true, subtree: true, attributes: true, attributeFilter: ['href', 'rel'] });
+      });
 
       window.addEventListener('load', function () {
         loaded = true;

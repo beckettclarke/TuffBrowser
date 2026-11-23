@@ -9,11 +9,13 @@ final class Folder: Identifiable {
     let id: UUID
     var name: String
     var isOpen: Bool
+    var color: String?
     var tabs: [Tab] = []
 
-    init(id: UUID = UUID(), name: String, isOpen: Bool = true) {
+    init(id: UUID = UUID(), name: String, isOpen: Bool = true, color: String? = nil) {
         self.id = id
         self.name = name
         self.isOpen = isOpen
+        self.color = color
     }
 }

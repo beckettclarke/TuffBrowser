@@ -16,10 +16,20 @@ final class ExtensionEventPush {
     private var subscriptions: [String: Set<String>] = [:]
     /// extension id -> its relay page.
     private var relays: [String: EventRelay] = [:]
+    /// extension id -> events waiting for it to listen (see `emitWhenListening`).
+    private var held: [String: [(event: String, args: [Any])]] = [:]
 
     func subscribe(extensionID: String, event: String, context: WKWebExtensionContext) {
         subscriptions[extensionID, default: []].insert(event)
         if event == "idle.onStateChanged" { ExtensionSystem.shared.startIdleMonitoring() }
+        if event.hasPrefix("system.storage.") { ExtensionSystem.shared.startVolumeMonitoring() }
+        if event == "system.display.onDisplayChanged" { ExtensionSystem.shared.startDisplayMonitoring() }
+        if event.hasPrefix("captivePortal.") { ExtensionCaptivePortal.shared.startMonitoring() }
+        if event == "notifications.onPermissionLevelChanged" { ExtensionNotifications.shared.startPermissionMonitoring() }
+        if event == "menus.onShown" { ExtensionMenus.shared.startMonitoring() }
+        if event == "storage.managed.onChanged" {
+            ExtensionManagedStorage.shared.startMonitoring(extensionID: extensionID, manifest: context.webExtension.manifest)
+        }
         // Bookmark events compare the tree before and after each change, from here on.
         if event.hasPrefix("bookmarks.") { _ = ExtensionBookmarks.shared }
         if relays[extensionID] == nil {
@@ -27,6 +37,10 @@ final class ExtensionEventPush {
             relays[extensionID] = EventRelay(configuration: context.webViewConfiguration, url: url)
         }
         if event == ExtensionDeclarativeContent.applyEvent { ExtensionDeclarativeContent.shared.listenerAdded(extensionID: extensionID) }
+        if let waiting = held[extensionID]?.filter({ $0.event == event }), !waiting.isEmpty {
+            held[extensionID]?.removeAll { $0.event == event }
+            for item in waiting where allows(extensionID, event) { relays[extensionID]?.send(event: event, args: item.args) }
+        }
     }
 
     func unsubscribe(extensionID: String, event: String) {
@@ -36,6 +50,18 @@ final class ExtensionEventPush {
     /// Whether any extension listens for one of `events`, so the work of producing them can be skipped.
     func isListening(to events: Set<String>) -> Bool {
         subscriptions.values.contains { !$0.isDisjoint(with: events) }
+    }
+
+    func isListening(extensionID: String, to event: String) -> Bool {
+        subscriptions[extensionID]?.contains(event) == true
+    }
+
+    func listeners(for event: String) -> Set<String> {
+        var matched = Set<String>()
+        for (id, events) in subscriptions where events.contains(event) && allows(id, event) {
+            matched.insert(id)
+        }
+        return matched
     }
 
     /// Sends an event to every extension listening for it. `extra` asks the shim to fill
@@ -96,7 +122,19 @@ final class ExtensionEventPush {
         relays[extensionID]?.send(event: event, args: args, extra: extra)
     }
 
+    /// Sends an event to one extension once it listens: straight away if it already does, or when
+    /// it adds its first listener. For an event that belongs to the extension's start
+    /// (`runtime.onInstalled`), which comes before its worker has run.
+    func emitWhenListening(_ event: String, args: [Any], to extensionID: String) {
+        if subscriptions[extensionID]?.contains(event) == true {
+            emit(event, args: args, to: extensionID)
+        } else {
+            held[extensionID, default: []].append((event, args))
+        }
+    }
+
     func extensionUnloaded(_ id: String) {
+        held.removeValue(forKey: id)
         subscriptions.removeValue(forKey: id)
         relays.removeValue(forKey: id)?.stop()
     }

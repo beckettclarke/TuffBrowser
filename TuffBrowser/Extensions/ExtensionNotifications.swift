@@ -7,6 +7,8 @@ final class ExtensionNotifications: NSObject {
 
     private let center = UNUserNotificationCenter.current()
     private var owners: [String: String] = [:]
+    private var lastPermissionLevel: String?
+    private var monitoringPermission = false
     private static let storagePrefix = "tuff.extension."
 
     static func storageID(_ id: String, extensionID: String) -> String {
@@ -35,11 +37,41 @@ final class ExtensionNotifications: NSObject {
     private func ensureAuthorized() async -> Bool {
         let settings = await center.notificationSettings()
         switch settings.authorizationStatus {
-        case .authorized, .provisional, .ephemeral: return true
+        case .authorized, .provisional, .ephemeral:
+            updatePermissionLevel("granted")
+            return true
         case .notDetermined:
-            return (try? await center.requestAuthorization(options: [.alert, .sound])) ?? false
+            let granted = (try? await center.requestAuthorization(options: [.alert, .sound])) ?? false
+            updatePermissionLevel(granted ? "granted" : "denied")
+            return granted
         default:
+            updatePermissionLevel("denied")
             return false
+        }
+    }
+
+    /// Starts watching for changes to macOS's notification authorization (e.g. toggled in System Settings).
+    func startPermissionMonitoring() {
+        guard !monitoringPermission else { return }
+        monitoringPermission = true
+        checkPermissionLevel()
+        NotificationCenter.default.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
+            self?.checkPermissionLevel()
+        }
+    }
+
+    private func checkPermissionLevel() {
+        Task { @MainActor in
+            let settings = await self.center.notificationSettings()
+            self.updatePermissionLevel(settings.authorizationStatus == .denied ? "denied" : "granted")
+        }
+    }
+
+    private func updatePermissionLevel(_ level: String) {
+        let previous = lastPermissionLevel
+        lastPermissionLevel = level
+        if let previous, previous != level {
+            ExtensionEventPush.shared.emit("notifications.onPermissionLevelChanged", args: [level])
         }
     }
 

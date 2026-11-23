@@ -231,35 +231,58 @@ final class ExtensionSettings {
     }
 
     private func registerProxy() {
-        if let config = proxyConfig,
-           (config["mode"] as? String == "direct" || config["proxyType"] as? String == "none") {
-            saved.values["proxy.settings"] = nil
-            saved.controllers["proxy.settings"] = nil
-            saved.originals["proxy.settings"] = nil
-            save()
-        }
-        // Chrome's ProxyConfig ({mode, rules}) or Firefox's ({proxyType, http, ssl, socks, …}).
+        // Chrome's ProxyConfig ({mode, rules, pacScript}) or Firefox's ({proxyType, http, ssl, socks, autoConfigUrl, …}).
         register("proxy.settings", get: { self.proxyConfig ?? ["mode": "system", "proxyType": "system"] }) { value in
             guard let config = value as? [String: Any], config["mode"] is String || config["proxyType"] is String else {
                 throw Failure("A proxy config with a mode is required.")
             }
-            let proxies = try Self.proxyConfigurations(for: config)  // refuse what Tuff can't do before keeping it
-            self.saved.values["proxy.settings"] = proxies == nil ? nil : Self.encode(config)
+            let plan = try Self.validateAndPlanProxy(config)
+            self.saved.values["proxy.settings"] = plan.isSystem ? nil : Self.encode(config)
             self.save()
-            self.applyProxy(to: DataStores.all)
+            self.activateProxyPlan(plan, stores: DataStores.all)
+        }
+        if let existing = proxyConfig, let plan = try? Self.validateAndPlanProxy(existing), !plan.isSystem {
+            activateProxyPlan(plan, stores: [])
         }
     }
 
-    /// Network's proxy configurations for a Chrome `ProxyConfig`, or nil for the system's.
-    /// Built with Network's C API: the Swift `ProxyConfiguration.excludedDomains` doesn't keep
-    /// (or report) its domains in this SDK.
-    static func proxyConfigurations(for config: [String: Any]) throws -> [nw_proxy_config_t]? {
-        if let type = config["proxyType"] as? String { return try firefoxProxyConfigurations(type: type, config: config) }
+    enum ProxyPlan {
+        case system
+        case native([nw_proxy_config_t])
+        case relay(ExtensionProxyRelay.RelayMode)
+        case fetchPAC(url: URL, mandatory: Bool)
+        case autoDetect
+
+        var isSystem: Bool {
+            if case .system = self { return true }
+            return false
+        }
+    }
+
+    /// Validates a Chrome or Firefox proxy config and determines whether it runs directly via
+    /// Network.framework (`nw_proxy_config_t`) or through Tuff's local loopback `ExtensionProxyRelay`.
+    static func validateAndPlanProxy(_ config: [String: Any]) throws -> ProxyPlan {
+        if let type = config["proxyType"] as? String {
+            return try firefoxProxyPlan(type: type, config: config)
+        }
         switch config["mode"] as? String {
         case "system", nil:
-            return nil
+            return .system
         case "direct":
-            throw Failure("Tuff can’t force direct connections while system proxies are configured.")
+            return .relay(.direct)
+        case "auto_detect":
+            return .autoDetect
+        case "pac_script":
+            let pac = config["pacScript"] as? [String: Any] ?? [:]
+            let mandatory = pac["mandatory"] as? Bool ?? false
+            if let data = pac["data"] as? String, !data.isEmpty {
+                let evaluator = try PACEvaluator(script: data)
+                return .relay(.pac(evaluator, mandatory: mandatory))
+            }
+            if let urlStr = pac["url"] as? String, let url = URL(string: urlStr), url.scheme != nil {
+                return .fetchPAC(url: url, mandatory: mandatory)
+            }
+            throw Failure("pac_script requires pacScript.data or pacScript.url.")
         case "fixed_servers":
             let rules = config["rules"] as? [String: Any] ?? [:]
             let server = (rules["singleProxy"] ?? rules["proxyForHttps"] ?? rules["proxyForHttp"] ?? rules["fallbackProxy"]) as? [String: Any]
@@ -270,32 +293,42 @@ final class ExtensionSettings {
             let defaultPort = scheme.hasPrefix("socks") ? 1080 : scheme == "https" ? 443 : 80
             let port = server["port"] as? Int ?? defaultPort
             guard (1...65535).contains(port) else { throw Failure("Invalid proxy port.") }
+            let bypass = rules["bypassList"] as? [String] ?? []
+            if scheme == "socks4" {
+                return .relay(.staticRoutes([.socks4(host: host, port: port)], bypassList: bypass))
+            }
             let endpoint = nw_endpoint_create_host(host, String(port))
             let proxy: nw_proxy_config_t
             switch scheme {
             case "http": proxy = nw_proxy_config_create_http_connect(endpoint, nil)
             case "https": proxy = nw_proxy_config_create_http_connect(endpoint, nw_tls_create_options())
             case "socks5": proxy = nw_proxy_config_create_socksv5(endpoint)
-            default: throw Failure("Tuff can’t use \(scheme) proxies (HTTP, HTTPS and SOCKS5 work).")
+            default: throw Failure("Tuff can’t use \(scheme) proxies (HTTP, HTTPS, SOCKS4 and SOCKS5 work).")
             }
-            for domain in rules["bypassList"] as? [String] ?? [] {
+            for domain in bypass {
                 let trimmed = domain.trimmingCharacters(in: .whitespaces)
                 guard !trimmed.isEmpty, trimmed != "<local>" else { continue }
                 nw_proxy_config_add_excluded_domain(proxy, trimmed.hasPrefix("*.") ? String(trimmed.dropFirst(2)) : trimmed)
             }
-            return [proxy]
+            return .native([proxy])
         case let mode?:
-            throw Failure("Tuff can’t use the proxy mode “\(mode)” (fixed_servers and system work).")
+            throw Failure("Tuff can’t use the proxy mode “\(mode)”.")
         }
     }
 
-    /// Firefox's `proxy.settings` value: `manual` with "host:port" servers.
-    private static func firefoxProxyConfigurations(type: String, config: [String: Any]) throws -> [nw_proxy_config_t]? {
+    private static func firefoxProxyPlan(type: String, config: [String: Any]) throws -> ProxyPlan {
         switch type {
         case "system":
-            return nil
+            return .system
         case "none":
-            throw Failure("Tuff can’t force direct connections while system proxies are configured.")
+            return .relay(.direct)
+        case "autoDetect":
+            return .autoDetect
+        case "autoConfig":
+            guard let urlStr = config["autoConfigUrl"] as? String, let url = URL(string: urlStr), url.scheme != nil else {
+                throw Failure("autoConfig requires autoConfigUrl.")
+            }
+            return .fetchPAC(url: url, mandatory: false)
         case "manual":
             func server(_ key: String) -> (host: String, port: Int?)? {
                 guard var text = config[key] as? String, !text.trimmingCharacters(in: .whitespaces).isEmpty else { return nil }
@@ -306,8 +339,9 @@ final class ExtensionSettings {
             }
             var rules: [String: Any] = [:]
             if let socks = server("socks") {
-                guard (config["socksVersion"] as? Int ?? 5) == 5 else { throw Failure("Tuff can’t use SOCKS4 proxies.") }
-                rules["singleProxy"] = ["scheme": "socks5", "host": socks.host, "port": socks.port ?? 1080] as [String: Any]
+                let version = config["socksVersion"] as? Int ?? 5
+                let scheme = version == 4 ? "socks4" : "socks5"
+                rules["singleProxy"] = ["scheme": scheme, "host": socks.host, "port": socks.port ?? 1080] as [String: Any]
             } else if let web = server("ssl") ?? server("http") {
                 rules["singleProxy"] = ["scheme": "http", "host": web.host, "port": web.port ?? 80] as [String: Any]
             } else {
@@ -315,24 +349,79 @@ final class ExtensionSettings {
             }
             let passthrough = (config["passthrough"] as? String ?? "").split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
             rules["bypassList"] = passthrough
-            return try proxyConfigurations(for: ["mode": "fixed_servers", "rules": rules])
+            return try validateAndPlanProxy(["mode": "fixed_servers", "rules": rules])
         default:
-            throw Failure("Tuff can’t use the proxy type “\(type)” (manual and system work).")
+            throw Failure("Tuff can’t use the proxy type “\(type)”.")
+        }
+    }
+
+    /// Backwards-compatible helper returning native `nw_proxy_config_t` configurations for a proxy config.
+    static func proxyConfigurations(for config: [String: Any]) throws -> [nw_proxy_config_t]? {
+        switch try validateAndPlanProxy(config) {
+        case .system: return nil
+        case .native(let list): return list
+        case .relay, .fetchPAC, .autoDetect:
+            if let relayConfig = ExtensionProxyRelay.shared.proxyConfiguration() { return [relayConfig] }
+            return []
+        }
+    }
+
+    private func activateProxyPlan(_ plan: ProxyPlan, stores: [WKWebsiteDataStore]) {
+        switch plan {
+        case .system, .native:
+            ExtensionProxyRelay.shared.setMode(.none)
+            applyProxy(to: stores)
+        case .relay(let relayMode):
+            ExtensionProxyRelay.shared.setMode(relayMode)
+            applyProxy(to: stores)
+        case .fetchPAC(let url, let mandatory):
+            ExtensionProxyRelay.shared.setMode(.direct)
+            applyProxy(to: stores)
+            Task {
+                do {
+                    let (data, _) = try await URLSession.shared.data(from: url)
+                    guard let js = String(data: data, encoding: .utf8) else {
+                        throw Failure("Could not decode PAC script from \(url.absoluteString).")
+                    }
+                    let evaluator = try PACEvaluator(script: js)
+                    ExtensionProxyRelay.shared.setMode(.pac(evaluator, mandatory: mandatory))
+                    await MainActor.run { self.applyProxy(to: DataStores.all) }
+                } catch {
+                    ExtensionProxyRelay.shared.emitError(error.localizedDescription, fatal: mandatory)
+                }
+            }
+        case .autoDetect:
+            ExtensionProxyRelay.shared.setMode(.direct)
+            applyProxy(to: stores)
+            Task {
+                if let js = await ExtensionProxyRelay.loadAutoDetectScript(),
+                   let evaluator = try? PACEvaluator(script: js) {
+                    ExtensionProxyRelay.shared.setMode(.pac(evaluator, mandatory: false))
+                    await MainActor.run { self.applyProxy(to: DataStores.all) }
+                }
+            }
         }
     }
 
     /// Puts the extension-set proxy (or none) on website data stores; new ones get it as their
     /// first web view is configured.
     func applyProxy(to stores: [WKWebsiteDataStore]) {
-        let configurations = proxyConfig.flatMap { try? Self.proxyConfigurations(for: $0) } ?? []
+        let configurations: [nw_proxy_config_t]
+        if let relayConfig = ExtensionProxyRelay.shared.proxyConfiguration() {
+            configurations = [relayConfig]
+        } else if let config = proxyConfig, case .native(let list) = (try? Self.validateAndPlanProxy(config)) {
+            configurations = list
+        } else {
+            configurations = []
+        }
         for store in stores {
             if configurations.isEmpty, (store.__proxyConfigurations ?? []).isEmpty { continue }
             store.__proxyConfigurations = configurations
         }
     }
 
-    /// Whether an extension has set a proxy (so the common case does nothing per web view).
-    var hasProxy: Bool { saved.values["proxy.settings"] != nil }
+    /// Whether an extension has set a proxy or `proxy.onRequest` listener (so the common case does nothing per web view).
+    var hasProxy: Bool { saved.values["proxy.settings"] != nil || ExtensionProxyRelay.shared.needsRelay }
 
     // MARK: Fonts (chrome.fontSettings)
 

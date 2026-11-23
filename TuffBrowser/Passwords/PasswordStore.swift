@@ -112,6 +112,21 @@ final class PasswordStore {
         persist()
     }
 
+    /// Removes saved logins matching the browsingData filter (optional `since` date, `origins` or `excludeOrigins`).
+    func remove(since: Date? = nil, origins: Set<String>? = nil, excludeOrigins: Set<String>? = nil) {
+        let before = logins.count
+        let normalizedOrigins = origins.map { Set($0.map { $0.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "/")) }) }
+        let normalizedExcluded = excludeOrigins.map { Set($0.map { $0.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "/")) }) }
+        logins.removeAll { login in
+            if let since, login.created < since { return false }
+            let origin = login.origin.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+            if let normalizedOrigins, !normalizedOrigins.contains(origin) { return false }
+            if let normalizedExcluded, normalizedExcluded.contains(origin) { return false }
+            return true
+        }
+        if logins.count != before { persist() }
+    }
+
     func neverSave(_ origin: String) {
         guard !never.contains(origin) else { return }
         never.append(origin)

@@ -188,7 +188,7 @@ enum DebugHooks {
             }
             return
         case "snapall":
-            for (i, window) in NSApp.windows.enumerated() where window.isVisible {
+            for (i, window) in NSApp.windows.enumerated() where window.isVisible && !(window is DebuggerBackingWindow) {
                 snapshot(window: window, to: "\(argument)-\(i).png")
             }
         case "newtab":
@@ -490,9 +490,10 @@ enum DebugHooks {
                 log("passwords \(PasswordStore.shared.logins.map { "\($0.origin) \($0.username) \($0.password)" })")
             }
         case "sync":
-            // sync signin|fake|now|status|dump — Settings → Sync's sign-in tab, signing in to
-            // scripts/fake-sync-server.py (TUFF_SYNC_SERVER), a sync, where sync is at, or this
-            // profile's bookmarks as a tree.
+            // sync signin|fake|now|status|dump|sidebar|opentabs — Settings → Sync's sign-in tab,
+            // signing in to scripts/fake-sync-server.py (TUFF_SYNC_SERVER), a sync, where sync is
+            // at, this profile's bookmarks as a tree, the spaces / favourites, or turning on
+            // sidebar sync's open tabs.
             MainActor.assumeIsolated {
                 let sync = SyncManager.shared
                 switch argument {
@@ -505,8 +506,53 @@ enum DebugHooks {
                     let profile = sync.profileID ?? state.profiles.first?.id
                     log("bookmarks " + lines(profile.map { BookmarkStore.shared.items(for: $0) } ?? [], 0).joined(separator: " | "))
                 case "now": sync.syncNow()
+                case "opentabs": sync.includesOpenTabs = true
+                case "sidebar":
+                    func tab(_ t: Tab) -> String { (t.customTitle ?? t.homeURL?.host() ?? t.url?.host() ?? "?") }
+                    for profile in state.profiles {
+                        log("profile \(profile.name) favorites=\(profile.favorites.map(tab))")
+                    }
+                    for space in state.spaces {
+                        let profile = state.profiles.first { $0.id == space.profileID }?.name ?? "?"
+                        let pinned = space.pinnedItems.map { item in
+                            switch item {
+                            case .tab(let t): tab(t)
+                            case .folder(let f): "[\(f.name): \(f.tabs.map(tab).joined(separator: ", "))]"
+                            }
+                        }
+                        log("space \(space.name) (\(profile), \(space.icon), \(space.colorHex)) pinned=\(pinned) tabs=\(space.tabs.map(tab))")
+                    }
                 default:
                     log("sync signedIn=\(sync.isSignedIn) status=\(sync.status) last=\(sync.lastSynced.map { "\($0)" } ?? "-") devices=\(sync.devices.map { "\($0.name):\($0.tabs.count)" })")
+                }
+            }
+        case "backup":
+            // backup <path> [password] — writes a backup of everything; "restore <path> [password]"
+            // stages one for the next launch and quits (a relaunch would lose TUFF_DATA_DIR).
+            let words = argument.split(separator: " ").map(String.init)
+            guard let path = words.first else { break }
+            let password = words.dropFirst().first
+            Task { @MainActor in
+                do {
+                    try await BackupBuilder.create(items: Set(BackupItem.allCases), to: URL(fileURLWithPath: path), password: password)
+                    log("backup written \(path)")
+                } catch {
+                    log("backup failed \(error.localizedDescription)")
+                }
+            }
+        case "restore":
+            let words = argument.split(separator: " ").map(String.init)
+            guard let path = words.first else { break }
+            let password = words.dropFirst().first
+            Task { @MainActor in
+                do {
+                    let backup = try await BackupReader.open(URL(fileURLWithPath: path), password: password)
+                    log("restore opened \(backup.manifest.items.map(\.rawValue)) \(backup.manifest.summaries)")
+                    try BackupRestore.stage(backup, items: Set(backup.manifest.items))
+                    backup.discard()
+                    AppDelegate.shared?.quitWithoutAsking()
+                } catch {
+                    log("restore failed \(error.localizedDescription)")
                 }
             }
         case "prompt":
@@ -550,6 +596,18 @@ enum DebugHooks {
             ExtensionManager.shared.install(.archive(URL(fileURLWithPath: argument)), confirm: false)
         case "installdir":
             ExtensionManager.shared.install(.folder(URL(fileURLWithPath: argument, isDirectory: true)), confirm: false)
+        case "offerupdate":
+            // offerupdate <version> — offers the first extension an update (runtime.onUpdateAvailable).
+            MainActor.assumeIsolated {
+                if let record = ExtensionManager.shared.records.first {
+                    log("offerupdate waits=\(ExtensionManager.shared.offerUpdate(record, version: argument))")
+                }
+            }
+        case "exticon":
+            // exticon <path> — writes the first extension action's icon for the selected tab as a PNG.
+            let icon = ExtensionManager.shared.actions(for: state.selectedTab).first?.icon
+            if let png = icon?.pngData { try? png.write(to: URL(fileURLWithPath: argument)) }
+            log("exticon \(icon.map { "\($0.size)" } ?? "nil") -> \(argument)")
         case "extaction":
             let actions = ExtensionManager.shared.actions(for: state.selectedTab)
             log("actions: \(actions.map { "\($0.name) badge=\($0.badge) icon=\($0.icon != nil)" })")

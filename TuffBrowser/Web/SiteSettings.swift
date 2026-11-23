@@ -59,8 +59,19 @@ final class SiteSettings {
         var javaScript: Bool?
         var popups: Bool?
         var autoplay: AutoplayPolicy?
+        var sound: Bool?
+        var images: Bool?
+        /// `"allow"`, `"block"`, or `"session_only"`.
+        var cookies: String?
+        /// `"allow"`, `"block"`, or `"ask"`.
+        var automaticDownloads: String?
+        /// `"allow"`, `"block"`, or `"ask"`.
+        var clipboard: String?
 
-        var isEmpty: Bool { javaScript == nil && popups == nil && autoplay == nil }
+        var isEmpty: Bool {
+            javaScript == nil && popups == nil && autoplay == nil && sound == nil
+                && images == nil && cookies == nil && automaticDownloads == nil && clipboard == nil
+        }
     }
 
     static let shared = SiteSettings()
@@ -68,19 +79,277 @@ final class SiteSettings {
     private(set) var sites: [String: Entry] = [:]
     /// Storage Access answers, "embedded|top-level" → allowed.
     private(set) var storageAccess: [String: Bool] = [:]
+    /// Default sound setting when a site has no entry of its own (nil = allow).
+    var defaultSound: Bool? {
+        didSet { save() }
+    }
+    /// Default images setting when a site has no entry of its own (nil = allow).
+    var defaultImages: Bool? {
+        didSet { save(); rebuildContentRules() }
+    }
+    /// Default cookies setting (`"allow"`, `"block"`, `"session_only"`; nil = `"allow"`).
+    var defaultCookies: String? {
+        didSet { save(); rebuildContentRules() }
+    }
+    /// Default automatic downloads setting (`"allow"`, `"block"`, `"ask"`; nil = `"ask"`).
+    var defaultAutomaticDownloads: String? {
+        didSet { save() }
+    }
+    /// Default clipboard read setting (`"allow"`, `"block"`, `"ask"`; nil = `"ask"`).
+    var defaultClipboard: String? {
+        didSet { save(); rebuildClipboardScript() }
+    }
     @ObservationIgnored private var incognitoSites: [String: Entry] = [:]
     @ObservationIgnored private var incognitoStorageAccess: [String: Bool] = [:]
     @ObservationIgnored private let file = Paths.appSupport.appendingPathComponent("site-settings.json")
+    @ObservationIgnored private let controllers = NSHashTable<WKUserContentController>.weakObjects()
+    @ObservationIgnored private var activeContentRules: WKContentRuleList?
+    @ObservationIgnored private var activeClipboardScript: WKUserScript?
+    @ObservationIgnored private var rulesGeneration = 0
 
     private struct Saved: Codable {
         var sites: [String: Entry]
         var storageAccess: [String: Bool]?
+        var defaultSound: Bool?
+        var defaultImages: Bool?
+        var defaultCookies: String?
+        var defaultAutomaticDownloads: String?
+        var defaultClipboard: String?
     }
 
     private init() {
         if let data = try? Data(contentsOf: file), let saved = try? JSONDecoder().decode(Saved.self, from: data) {
             sites = saved.sites
             storageAccess = saved.storageAccess ?? [:]
+            defaultSound = saved.defaultSound
+            defaultImages = saved.defaultImages
+            defaultCookies = saved.defaultCookies
+            defaultAutomaticDownloads = saved.defaultAutomaticDownloads
+            defaultClipboard = saved.defaultClipboard
+        }
+    }
+
+    func soundAllowed(for url: URL?, incognito: Bool) -> Bool {
+        entry(for: url, incognito: incognito).sound ?? defaultSound ?? true
+    }
+
+    func imagesAllowed(for url: URL?, incognito: Bool) -> Bool {
+        entry(for: url, incognito: incognito).images ?? defaultImages ?? true
+    }
+
+    func cookiesSetting(for url: URL?, incognito: Bool) -> String {
+        entry(for: url, incognito: incognito).cookies ?? defaultCookies ?? "allow"
+    }
+
+    func automaticDownloadsSetting(for url: URL?, incognito: Bool) -> String {
+        entry(for: url, incognito: incognito).automaticDownloads ?? defaultAutomaticDownloads ?? "ask"
+    }
+
+    func clipboardSetting(for url: URL?, incognito: Bool) -> String {
+        entry(for: url, incognito: incognito).clipboard ?? defaultClipboard ?? "ask"
+    }
+
+    func attachContentRules(to controller: WKUserContentController) {
+        controllers.add(controller)
+        if let activeContentRules {
+            controller.add(activeContentRules)
+        } else if !contentRulesJSON().isEmpty {
+            rebuildContentRules()
+        }
+        if let activeClipboardScript {
+            controller.addUserScript(activeClipboardScript)
+        } else if hasBlockedClipboardRule {
+            rebuildClipboardScript()
+        }
+    }
+
+    private var hasBlockedClipboardRule: Bool {
+        if defaultClipboard == "block" { return true }
+        return sites.values.contains { $0.clipboard == "block" }
+            || incognitoSites.values.contains { $0.clipboard == "block" }
+    }
+
+    /// Installs or removes a lightweight `.atDocumentStart` script enforcing `contentSettings.clipboard`
+    /// `"block"` rules. Does nothing (zero page overhead) when no clipboard block rules exist.
+    func rebuildClipboardScript() {
+        let removeSel = NSSelectorFromString("_removeUserScript:")
+        if let old = activeClipboardScript {
+            for controller in controllers.allObjects where controller.responds(to: removeSel) {
+                controller.perform(removeSel, with: old)
+            }
+            activeClipboardScript = nil
+        }
+        guard hasBlockedClipboardRule else { return }
+
+        let allSites = sites.merging(incognitoSites) { _, overlay in overlay }
+        func matchPatterns(for key: String) -> [String] {
+            if let p = ContentSettingPattern(pattern: key) {
+                let schemes = p.scheme == "*" ? ["http", "https"] : [p.scheme]
+                return schemes.map { "\($0)://\(p.host)/*" }
+            }
+            return ["http://\(key)/*", "https://\(key)/*", "http://*.\(key)/*", "https://*.\(key)/*"]
+        }
+
+        let include: [String]
+        let exclude: [String]
+        if defaultClipboard == "block" {
+            include = ["http://*/*", "https://*/*"]
+            exclude = allSites.compactMap { $0.value.clipboard == "allow" || $0.value.clipboard == "ask" ? $0.key : nil }
+                .flatMap(matchPatterns(for:))
+        } else {
+            include = allSites.compactMap { $0.value.clipboard == "block" ? $0.key : nil }
+                .flatMap(matchPatterns(for:))
+            exclude = []
+        }
+        guard !include.isEmpty else { return }
+
+        let source = #"""
+        (() => {
+          const deny = () => Promise.reject(new DOMException('Clipboard read blocked by site setting.', 'NotAllowedError'));
+          try {
+            if (navigator.clipboard) {
+              Object.defineProperty(navigator.clipboard, 'read', { value: deny, configurable: true });
+              Object.defineProperty(navigator.clipboard, 'readText', { value: deny, configurable: true });
+            }
+          } catch (e) {}
+          try {
+            const orig = Document.prototype.execCommand;
+            if (typeof orig === 'function') {
+              Document.prototype.execCommand = function (cmd) {
+                if (String(cmd || '').toLowerCase() === 'paste') return false;
+                return orig.apply(this, arguments);
+              };
+            }
+          } catch (e) {}
+        })();
+        """#
+        let script = ExtensionContentScripts.makeScript(
+            source: source, time: .atDocumentStart, mainFrameOnly: false,
+            include: include, exclude: exclude, world: .page
+        )
+        activeClipboardScript = script
+        for controller in controllers.allObjects {
+            controller.addUserScript(script)
+        }
+    }
+
+    /// Builds the `WKContentRuleList` rules enforcing per-site / global image and cookie blocking.
+    /// Empty when nothing blocks images or cookies (so zero cost on pages).
+    func contentRulesJSON() -> [[String: Any]] {
+        var rules: [[String: Any]] = []
+
+        func topURLRegex(for key: String) -> String? {
+            if let pattern = ContentSettingPattern(pattern: key) {
+                let scheme = pattern.scheme == "*" ? "https?" : NSRegularExpression.escapedPattern(for: pattern.scheme)
+                let host: String
+                if pattern.host == "*" {
+                    host = "[^/]+"
+                } else if pattern.host.hasPrefix("*.") {
+                    let bare = NSRegularExpression.escapedPattern(for: String(pattern.host.dropFirst(2)))
+                    host = "(?:[^/]+\\.)?" + bare
+                } else {
+                    host = NSRegularExpression.escapedPattern(for: pattern.host)
+                }
+                let port = (pattern.port != nil && pattern.port != "*") ? ":" + NSRegularExpression.escapedPattern(for: pattern.port!) : "(?::[0-9]+)?"
+                return "^\(scheme)://\(host)\(port)(?:/|$)"
+            }
+            let escaped = NSRegularExpression.escapedPattern(for: key)
+            return "^https?://(?:www\\.)?\(escaped)(?::[0-9]+)?(?:/|$)"
+        }
+
+        // Images rules.
+        let allSites = sites.merging(incognitoSites) { _, overlay in overlay }
+        let blockedImageURLs = allSites.compactMap { key, entry -> String? in
+            entry.images == false ? topURLRegex(for: key) : nil
+        }
+        let allowedImageURLs = allSites.compactMap { key, entry -> String? in
+            entry.images == true ? topURLRegex(for: key) : nil
+        }
+        if defaultImages == false {
+            var trigger: [String: Any] = ["url-filter": ".*", "resource-type": ["image"]]
+            if !allowedImageURLs.isEmpty { trigger["unless-top-url"] = allowedImageURLs }
+            rules.append(["trigger": trigger, "action": ["type": "block"]])
+        } else if !blockedImageURLs.isEmpty {
+            rules.append([
+                "trigger": ["url-filter": ".*", "resource-type": ["image"], "if-top-url": blockedImageURLs],
+                "action": ["type": "block"],
+            ])
+        }
+
+        // Cookies rules.
+        let blockedCookieURLs = allSites.compactMap { key, entry -> String? in
+            entry.cookies == "block" ? topURLRegex(for: key) : nil
+        }
+        let allowedCookieURLs = allSites.compactMap { key, entry -> String? in
+            (entry.cookies == "allow" || entry.cookies == "session_only") ? topURLRegex(for: key) : nil
+        }
+        if defaultCookies == "block" {
+            var trigger: [String: Any] = ["url-filter": ".*"]
+            if !allowedCookieURLs.isEmpty { trigger["unless-top-url"] = allowedCookieURLs }
+            rules.append(["trigger": trigger, "action": ["type": "block-cookies"]])
+        } else if !blockedCookieURLs.isEmpty {
+            rules.append([
+                "trigger": ["url-filter": ".*", "if-top-url": blockedCookieURLs],
+                "action": ["type": "block-cookies"],
+            ])
+        }
+
+        return rules
+    }
+
+    func rebuildContentRules() {
+        rulesGeneration += 1
+        let generation = rulesGeneration
+        let rules = contentRulesJSON()
+        guard !rules.isEmpty else {
+            if let old = activeContentRules {
+                for controller in controllers.allObjects { controller.remove(old) }
+                activeContentRules = nil
+            }
+            return
+        }
+        guard let data = try? JSONSerialization.data(withJSONObject: rules),
+              let json = String(data: data, encoding: .utf8) else { return }
+        WKContentRuleListStore.default()?.compileContentRuleList(forIdentifier: "tuff-content-settings", encodedContentRuleList: json) { [weak self] list, _ in
+            DispatchQueue.main.async {
+                guard let self, self.rulesGeneration == generation, let list else { return }
+                let old = self.activeContentRules
+                self.activeContentRules = list
+                for controller in self.controllers.allObjects {
+                    if let old { controller.remove(old) }
+                    controller.add(list)
+                }
+            }
+        }
+    }
+
+    /// Clears cookies belonging to sites configured as `session_only` (called on quit).
+    func clearSessionOnlyCookies() {
+        let globalSessionOnly = defaultCookies == "session_only"
+        let sessionOnlyPatterns: [ContentSettingPattern] = sites.compactMap { key, entry in
+            guard entry.cookies == "session_only" else { return nil }
+            return ContentSettingPattern(pattern: key) ?? ContentSettingPattern(pattern: "*://*.\(key)/*")
+        }
+        let allowedPatterns: [ContentSettingPattern] = sites.compactMap { key, entry in
+            guard entry.cookies == "allow" else { return nil }
+            return ContentSettingPattern(pattern: key) ?? ContentSettingPattern(pattern: "*://*.\(key)/*")
+        }
+        guard globalSessionOnly || !sessionOnlyPatterns.isEmpty else { return }
+        for store in DataStores.all {
+            let cookieStore = store.httpCookieStore
+            cookieStore.getAllCookies { cookies in
+                for cookie in cookies {
+                    let host = cookie.domain.hasPrefix(".") ? String(cookie.domain.dropFirst()) : cookie.domain
+                    let probe = URL(string: "https://\(host)/")
+                    let shouldClear: Bool
+                    if globalSessionOnly {
+                        shouldClear = !allowedPatterns.contains { $0.matches(probe) }
+                    } else {
+                        shouldClear = sessionOnlyPatterns.contains { $0.matches(probe) }
+                    }
+                    if shouldClear { cookieStore.delete(cookie) }
+                }
+            }
         }
     }
 
@@ -185,7 +454,13 @@ final class SiteSettings {
     }
 
     private func save() {
-        guard let data = try? JSONEncoder().encode(Saved(sites: sites, storageAccess: storageAccess)) else { return }
+        let payload = Saved(
+            sites: sites, storageAccess: storageAccess,
+            defaultSound: defaultSound, defaultImages: defaultImages,
+            defaultCookies: defaultCookies, defaultAutomaticDownloads: defaultAutomaticDownloads,
+            defaultClipboard: defaultClipboard
+        )
+        guard let data = try? JSONEncoder().encode(payload) else { return }
         try? data.write(to: file, options: .atomic)
     }
 
@@ -471,7 +746,12 @@ enum EmbeddedSignIn {
     """
 
     static func install(into controller: WKUserContentController) {
-        controller.addUserScript(WKUserScript(source: script, injectionTime: .atDocumentEnd, forMainFrameOnly: false, in: world))
+        // Only into those hosts' frames: a script in a world of its own costs every other frame a
+        // second JavaScript global object for nothing.
+        controller.addUserScript(ExtensionContentScripts.makeScript(
+            source: script, time: .atDocumentEnd, mainFrameOnly: false,
+            include: hosts.sorted().map { "https://\($0)/*" }, exclude: [], world: world
+        ))
         controller.add(MessageHandler(), contentWorld: world, name: handlerName)
     }
 

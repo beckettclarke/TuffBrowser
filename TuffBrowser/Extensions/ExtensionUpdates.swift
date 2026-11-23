@@ -34,10 +34,56 @@ extension ExtensionManager {
         var updated: [String] = []
         for record in records where record.storeID != nil && record.source != .unpacked {
             guard let latest = await Self.latestVersion(of: record),
-                  Self.isVersion(latest, newerThan: record.version) else { continue }
+                  Self.isVersion(latest, newerThan: record.version) else {
+                Self.forgetAnnouncedUpdate(record.id)
+                continue
+            }
+            if offerUpdate(record, version: latest) { continue }
             if await updateNow(record) { updated.append(record.name) }
         }
         return updated
+    }
+
+    // MARK: runtime.onUpdateAvailable
+
+    private static let announcedKey = "ExtensionsAnnouncedUpdates"
+    /// extension id -> the version it was told about this run, which waits for `runtime.reload()`.
+    private static var waitingUpdates: [String: String] = [:]
+
+    /// Chrome lets an extension that listens for `runtime.onUpdateAvailable` choose its moment: it
+    /// is told about the new version, which is installed when it calls `runtime.reload()` or when
+    /// the browser next starts. Returns whether the update waits.
+    @MainActor
+    func offerUpdate(_ record: ExtensionRecord, version: String) -> Bool {
+        if Self.waitingUpdates[record.id] != nil { return true }
+        var announced = UserDefaults.standard.dictionary(forKey: Self.announcedKey) as? [String: String] ?? [:]
+        // Told before Tuff last quit: this is the restart it was waiting for.
+        if announced[record.id] != nil {
+            Self.forgetAnnouncedUpdate(record.id)
+            return false
+        }
+        guard ExtensionEventPush.shared.isListening(extensionID: record.id, to: "runtime.onUpdateAvailable") else { return false }
+        Self.waitingUpdates[record.id] = version
+        announced[record.id] = version
+        UserDefaults.standard.set(announced, forKey: Self.announcedKey)
+        ExtensionEventPush.shared.emit("runtime.onUpdateAvailable", args: [["version": version]], to: record.id)
+        return true
+    }
+
+    /// An extension with an update waiting reloaded itself (`runtime.reload()`): installs the
+    /// update, which reloads it again on the new version. Returns whether there was one.
+    func installWaitingUpdate(id: String) -> Bool {
+        guard Self.waitingUpdates.removeValue(forKey: id) != nil,
+              let record = records.first(where: { $0.id == id }) else { return false }
+        Self.forgetAnnouncedUpdate(id)
+        Task { @MainActor in await updateNow(record) }
+        return true
+    }
+
+    private static func forgetAnnouncedUpdate(_ id: String) {
+        guard var announced = UserDefaults.standard.dictionary(forKey: announcedKey) as? [String: String],
+              announced.removeValue(forKey: id) != nil else { return }
+        UserDefaults.standard.set(announced, forKey: announcedKey)
     }
 
     /// The menu's "Check for Update": installs a newer version if the store has one, and says
@@ -59,7 +105,7 @@ extension ExtensionManager {
         }
     }
 
-    @MainActor
+    @MainActor @discardableResult
     private func updateNow(_ record: ExtensionRecord) async -> Bool {
         guard let storeID = record.storeID else { return false }
         switch record.source {

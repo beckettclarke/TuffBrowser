@@ -1,4 +1,5 @@
 import AppKit
+import JavaScriptCore
 import Network
 import WebKit
 import XCTest
@@ -342,8 +343,8 @@ final class ExtensionAPITests: XCTestCase {
 
     func testProxyConfigs() throws {
         XCTAssertNil(try ExtensionSettings.proxyConfigurations(for: ["mode": "system"]))
-        XCTAssertThrowsError(try ExtensionSettings.proxyConfigurations(for: ["mode": "direct"]))
-        XCTAssertThrowsError(try ExtensionSettings.proxyConfigurations(for: ["proxyType": "none"]))
+        XCTAssertNotNil(try ExtensionSettings.proxyConfigurations(for: ["mode": "direct"]))
+        XCTAssertNotNil(try ExtensionSettings.proxyConfigurations(for: ["proxyType": "none"]))
         let chrome = try ExtensionSettings.proxyConfigurations(for: [
             "mode": "fixed_servers",
             "rules": ["singleProxy": ["scheme": "socks5", "host": "127.0.0.1", "port": 1080], "bypassList": ["*.local", "<local>", "example.com"]],
@@ -355,8 +356,10 @@ final class ExtensionAPITests: XCTestCase {
         XCTAssertEqual(try ExtensionSettings.proxyConfigurations(for: ["proxyType": "manual", "http": "proxy.test:3128"])?.count, 1)
         XCTAssertNil(try ExtensionSettings.proxyConfigurations(for: ["proxyType": "system"]))
         XCTAssertThrowsError(try ExtensionSettings.proxyConfigurations(for: ["mode": "pac_script"]))
-        XCTAssertThrowsError(try ExtensionSettings.proxyConfigurations(for: ["mode": "fixed_servers", "rules": ["singleProxy": ["scheme": "socks4", "host": "x"]]]))
-        XCTAssertThrowsError(try ExtensionSettings.proxyConfigurations(for: ["proxyType": "manual", "socks": "x:1", "socksVersion": 4]))
+        XCTAssertNotNil(try ExtensionSettings.proxyConfigurations(for: ["mode": "fixed_servers", "rules": ["singleProxy": ["scheme": "socks4", "host": "x"]]]))
+        XCTAssertNotNil(try ExtensionSettings.proxyConfigurations(for: ["proxyType": "manual", "socks": "x:1", "socksVersion": 4]))
+        XCTAssertThrowsError(try ExtensionSettings.proxyConfigurations(for: ["mode": "fixed_servers", "rules": ["singleProxy": ["scheme": "quic", "host": "x"]]]))
+        XCTAssertThrowsError(try ExtensionSettings.proxyConfigurations(for: ["mode": "bogus"]))
     }
 
     func testDeclarativeContentURLFilters() {
@@ -593,7 +596,7 @@ final class BrowserRegressionTests: XCTestCase {
         }
         func dirty() async -> Bool {
             await withCheckedContinuation { continuation in
-                view.evaluateJavaScript(Tab.unsavedInputScript, in: nil, in: .defaultClient) { result in
+                view.evaluateJavaScript(Tab.unsavedInputScript, in: nil, in: WebEngine.scriptWorld) { result in
                     if case .success(let value) = result { continuation.resume(returning: (value as? Bool) ?? false) }
                     else { continuation.resume(returning: false) }
                 }
@@ -631,10 +634,20 @@ final class BrowserRegressionTests: XCTestCase {
 
 
 final class ContentBlockerFilterTests: XCTestCase {
-    private func rules(_ filters: String) throws -> [[String: Any]] {
+    private func lists(_ filters: String) throws -> [[[String: Any]]] {
         let result = FilterListParser.parse([filters], validSelectors: { Set($0) })
-        let source = try XCTUnwrap(result.lists.first)
-        return try XCTUnwrap(JSONSerialization.jsonObject(with: Data(source.utf8)) as? [[String: Any]])
+        return try result.lists.map { source in
+            try XCTUnwrap(JSONSerialization.jsonObject(with: Data(source.utf8)) as? [[String: Any]])
+        }
+    }
+
+    /// Every list's rules, in order.
+    private func rules(_ filters: String) throws -> [[String: Any]] {
+        try lists(filters).flatMap { $0 }
+    }
+
+    private func type(_ rule: [String: Any]) -> String? {
+        (rule["action"] as? [String: Any])?["type"] as? String
     }
 
     private func trigger(_ rule: [String: Any]) -> [String: Any]? {
@@ -683,6 +696,26 @@ final class ContentBlockerFilterTests: XCTestCase {
         XCTAssertEqual(trigger(restored)?["if-domain"] as? [String], ["*allowed.a.example"])
     }
 
+    /// Site-bound hiding fires on document loads only: as `url-filter: .*` rules on every load,
+    /// each subresource a page fetched ran through all of them (Speedometer NewsSite, 3.5×).
+    func testSiteBoundHidingOnlyTriggersOnDocumentLoads() throws {
+        let rules = try rules("""
+        news.example##.advert
+        a.example,~allowed.a.example##.banner
+        ##.sponsor
+        b.example#@#.sponsor
+        ##.plain
+        """)
+        let hiding = rules.filter { type($0) == "css-display-none" && trigger($0)?.count ?? 0 > 1 }
+        XCTAssertEqual(hiding.count, 3)
+        for rule in hiding {
+            XCTAssertEqual(trigger(rule)?["resource-type"] as? [String], ["document"])
+        }
+        // Unconditional generic hiding stays untouched (one shared style sheet per process).
+        let generic = try XCTUnwrap(rules.first { type($0) == "css-display-none" && trigger($0)?.count == 1 })
+        XCTAssertNil(trigger(generic)?["resource-type"])
+    }
+
     func testUnsupportedEntityDomainCannotWidenRuleToEverySite() throws {
         let networkRules = try rules("*$script,1p,domain=~kat.ai|kat.*|kickass.*")
         XCTAssertTrue(networkRules.isEmpty)
@@ -695,18 +728,113 @@ final class ContentBlockerFilterTests: XCTestCase {
         ||ads.example.test^$script,domain=news.example|~allowed.news.example
         a.example,~allowed.a.example##.advert
         ##.advert
+        ##.banner
         a.example,~allowed.a.example#@#.advert
+        @@||quiet.example^$generichide
         """], validSelectors: { Set($0) })
-        let source = try XCTUnwrap(result.lists.first)
+        XCTAssertEqual(result.lists.count, 2)
         let store = try XCTUnwrap(WKContentRuleListStore.default())
-        let id = "test.\(UUID().uuidString)"
-        let compiled = expectation(description: "content rules compiled")
-        store.compileContentRuleList(forIdentifier: id, encodedContentRuleList: source) { list, error in
-            XCTAssertNil(error)
-            XCTAssertNotNil(list)
-            store.removeContentRuleList(forIdentifier: id) { _ in compiled.fulfill() }
+        for source in result.lists {
+            let id = "test.\(UUID().uuidString)"
+            let compiled = expectation(description: "content rules compiled")
+            store.compileContentRuleList(forIdentifier: id, encodedContentRuleList: source) { list, error in
+                XCTAssertNil(error)
+                XCTAssertNotNil(list)
+                store.removeContentRuleList(forIdentifier: id) { _ in compiled.fulfill() }
+            }
+            wait(for: [compiled], timeout: 10)
         }
-        wait(for: [compiled], timeout: 10)
+    }
+
+    /// Generic hiding stays free of conditions (so WebKit makes it one shared style sheet), in a
+    /// list of its own where `$generichide` can switch it off without touching network blocking.
+    func testGenericHidingIsUnconditionalInAListOfItsOwn() throws {
+        let lists = try lists("""
+        ##.banner
+        ||ads.example^
+        @@||quiet.example^$generichide
+        """)
+        let generic = try XCTUnwrap(lists.first { list in list.contains { type($0) == "css-display-none" } })
+        let hiding = try XCTUnwrap(generic.first { type($0) == "css-display-none" })
+        XCTAssertEqual(trigger(hiding)?.count, 1)
+        XCTAssertEqual(trigger(hiding)?["url-filter"] as? String, ".*")
+        let off = try XCTUnwrap(generic.last)
+        XCTAssertEqual(type(off), "ignore-previous-rules")
+        XCTAssertEqual(trigger(off)?["if-domain"] as? [String], ["*quiet.example"])
+        XCTAssertFalse(generic.contains { type($0) == "block" })
+        XCTAssertTrue(lists.contains { list in list.contains { type($0) == "block" } })
+    }
+
+    func testGenericSelectorsReadingStyleAboveTheSubjectAreLeftOut() throws {
+        for selector in [
+            "html[lang] > body:not([style]) > div.captchaBody",
+            ".wp-singular > div[data-sm][style*=\"2147483647\"] > iframe",
+            "[STYLE] ~ div",
+            "div:has([style])",
+            ":not(.a [style]) .b",
+        ] {
+            XCTAssertTrue(FilterListParser.readsStyleAttributeAboveSubject(selector), selector)
+        }
+        for selector in [
+            "div[style=\"position: fixed; inset: 0px; z-index: 2147483647;\"]",
+            "[class^=\"div-gpt-ad\"]:not([style^=\"width: 1px; height: 1px; position: absolute;\"])",
+            "#kt_player > div[style$=\"display: block;\"][style*=\"inset: 0px;\"]",
+            ".ad > .banner",
+            "a[href*=\"style\"] > img",
+        ] {
+            XCTAssertFalse(FilterListParser.readsStyleAttributeAboveSubject(selector), selector)
+        }
+        let rules = try rules("""
+        ##body:not([style]) > .gate
+        ##.banner
+        """)
+        let selectors = rules.compactMap { ($0["action"] as? [String: Any])?["selector"] as? String }
+        XCTAssertEqual(selectors, [".banner"])
+    }
+
+    /// In WebKit itself: generic hiding applies to an ordinary page and not to a `$generichide` one.
+    func testGenericHidingAppliesExceptOnGenerichideSites() throws {
+        let result = FilterListParser.parse(["""
+        ##.banner
+        @@||quiet.example^$generichide
+        """], validSelectors: { Set($0) })
+        let store = try XCTUnwrap(WKContentRuleListStore.default())
+        var compiled: [(id: String, list: WKContentRuleList)] = []
+        for source in result.lists {
+            let id = "test.\(UUID().uuidString)"
+            let done = expectation(description: "compiled")
+            store.compileContentRuleList(forIdentifier: id, encodedContentRuleList: source) { list, error in
+                XCTAssertNil(error)
+                if let list { compiled.append((id, list)) }
+                done.fulfill()
+            }
+            wait(for: [done], timeout: 10)
+        }
+        defer {
+            for entry in compiled { store.removeContentRuleList(forIdentifier: entry.id) { _ in } }
+        }
+        func display(on host: String) -> String? {
+            let configuration = WKWebViewConfiguration()
+            configuration.websiteDataStore = .nonPersistent()
+            for entry in compiled { configuration.userContentController.add(entry.list) }
+            let view = WKWebView(frame: NSRect(x: 0, y: 0, width: 400, height: 300), configuration: configuration)
+            let loaded = expectation(description: "loaded \(host)")
+            let waiter = PageWaiter(loaded)
+            view.navigationDelegate = waiter
+            view.loadHTMLString("<div class='banner'>ad</div>", baseURL: URL(string: "https://\(host)/")!)
+            wait(for: [loaded], timeout: 10)
+            var value: String?
+            let read = expectation(description: "read \(host)")
+            view.evaluateJavaScript("getComputedStyle(document.querySelector('.banner')).display") { result, _ in
+                value = result as? String
+                read.fulfill()
+            }
+            wait(for: [read], timeout: 10)
+            view.navigationDelegate = nil
+            return value
+        }
+        XCTAssertEqual(display(on: "news.example"), "none")
+        XCTAssertEqual(display(on: "www.quiet.example"), "block")
     }
 
     func testProceduralRulesKeepTheirExceptionsWhenReindexed() throws {
@@ -722,6 +850,65 @@ final class ContentBlockerFilterTests: XCTestCase {
         let object = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(output.utf8)) as? [String: Any])
         XCTAssertEqual(object["selectors"] as? [String], ["{\"selector\":\".one\"}", "{\"selector\":\".two\"}"])
         XCTAssertEqual(object["selectorLists"] as? [String], ["0,-1", "1", ""])
+    }
+
+    /// The scriptlet bundles' data arrays become `JSON.parse` of a string, with the same values.
+    func testScriptletDataLiteralsBecomeJSONParseWithTheSameValues() throws {
+        let hosts = (0..<400).map { "host\($0).example" } + ["quote\"d", "back\\slash", "slash/"]
+        let hostsJSON = String(data: try JSONSerialization.data(withJSONObject: hosts, options: [.withoutEscapingSlashes]), encoding: .utf8)!
+        let source = """
+        (function () {
+        const scriptletHostnames = /* \(hosts.count) */ \(hostsJSON);
+        const functionRefs = /* 2 */ [Math.min, Math.max];
+        self.result = scriptletHostnames;
+        })();
+        """
+        let compacted = AdvancedContentBlocker.compactingDataLiterals(source)
+        XCTAssertTrue(compacted.contains("const scriptletHostnames = /* \(hosts.count) */ JSON.parse(\""))
+        XCTAssertTrue(compacted.contains("const functionRefs = /* 2 */ [Math.min, Math.max];"))
+        let context = try XCTUnwrap(JSContext())
+        context.evaluateScript("var self = this;")
+        context.evaluateScript(compacted)
+        XCTAssertNil(context.exception)
+        XCTAssertEqual(context.objectForKeyedSubscript("result").toArray() as? [String], hosts)
+    }
+
+    /// The cosmetic script finds a host's procedural filters (minus its exceptions), and doesn't
+    /// load uBO's engine at all for a host that has none.
+    func testCosmeticScriptAppliesOnlyTheFramesHostsFilters() throws {
+        let one = #"{\"selector\":\".one\"}"#, two = #"{\"selector\":\".two\"}"#, three = #"{\"selector\":\".three\"}"#
+        let dataSet = """
+        {"selectors":["\(one)","\(two)","\(three)"],"selectorLists":["0,1","-2","2"],"selectorListRefs":[0,1,2],
+         "hostnames":["a.example","sub.a.example","shop.*"],"regexes":[],"hasEntities":true}
+        """
+        let api = """
+        self.apiLoaded = true;
+        self.ProceduralFiltererAPI = class {
+          addDeclaratives(list) { self.applied = (self.applied || []).concat(list.map(f => f.selector)); }
+          addProcedurals(list) { self.applied = (self.applied || []).concat(list.map(f => f.selector)); }
+        };
+        """
+        let script = AdvancedContentBlocker.cosmeticScript(api: api, dataSets: [dataSet])
+        func run(on host: String) throws -> (loaded: Bool, applied: [String]) {
+            let context = try XCTUnwrap(JSContext())
+            context.evaluateScript("""
+            var self = this;
+            var location = { hostname: '\(host)' };
+            var document = { adoptedStyleSheets: [] };
+            """)
+            context.evaluateScript(script)
+            XCTAssertNil(context.exception, host)
+            let loaded = context.objectForKeyedSubscript("apiLoaded").toBool()
+            let applied = (context.objectForKeyedSubscript("applied").toArray() as? [String]) ?? []
+            return (loaded, applied.sorted())
+        }
+        XCTAssertEqual(try run(on: "a.example").applied, [".one", ".two"])
+        // The subdomain's exception takes `.two` away again.
+        XCTAssertEqual(try run(on: "www.sub.a.example").applied, [".one"])
+        XCTAssertEqual(try run(on: "shop.co.uk").applied, [".three"])
+        let elsewhere = try run(on: "other.example")
+        XCTAssertFalse(elsewhere.loaded)
+        XCTAssertEqual(elsewhere.applied, [])
     }
 
     @MainActor
@@ -748,5 +935,384 @@ final class ContentBlockerFilterTests: XCTestCase {
         AppSettings.shared.privacy = privacy
         blocker.settingsChanged()
         XCTAssertEqual(controller.userScripts.count, 0)
+    }
+}
+
+/// `pageCapture.saveAsMHTML`: a Web Archive repacked as MHTML.
+final class PageCaptureTests: XCTestCase {
+    func testWebArchiveBecomesMHTML() throws {
+        let archive: [String: Any] = [
+            "WebMainResource": [
+                "WebResourceURL": "https://example.com/", "WebResourceMIMEType": "text/html",
+                "WebResourceTextEncodingName": "UTF-8", "WebResourceData": Data("<p>hi</p>".utf8),
+            ],
+            "WebSubresources": [
+                ["WebResourceURL": "https://example.com/a.png", "WebResourceMIMEType": "image/png", "WebResourceData": Data([1, 2, 3])],
+            ],
+            "WebSubframeArchives": [[
+                "WebMainResource": [
+                    "WebResourceURL": "https://frame.example/", "WebResourceMIMEType": "text/html", "WebResourceData": Data("<b>f</b>".utf8),
+                ],
+                // Already in the parent: listed once.
+                "WebSubresources": [
+                    ["WebResourceURL": "https://example.com/a.png", "WebResourceMIMEType": "image/png", "WebResourceData": Data([1, 2, 3])],
+                ],
+            ]],
+        ]
+        let mhtml = try XCTUnwrap(ExtensionPageCapture.mhtml(from: archive, title: "Café"))
+        XCTAssertTrue(mhtml.hasPrefix("From: <Saved by Tuff>\r\nSnapshot-Content-Location: https://example.com/\r\n"))
+        XCTAssertTrue(mhtml.contains("Subject: =?utf-8?B?\(Data("Café".utf8).base64EncodedString())?="))
+        XCTAssertTrue(mhtml.contains("Content-Type: text/html; charset=UTF-8\r\nContent-Transfer-Encoding: base64\r\nContent-Location: https://example.com/\r\n\r\n\(Data("<p>hi</p>".utf8).base64EncodedString())"))
+        XCTAssertEqual(mhtml.components(separatedBy: "Content-Location: https://example.com/a.png").count, 2)
+        XCTAssertTrue(mhtml.contains("Content-Location: https://frame.example/"))
+        let boundary = try XCTUnwrap(mhtml.range(of: "boundary=\"").map { mhtml[$0.upperBound...].prefix { $0 != "\"" } })
+        XCTAssertEqual(mhtml.components(separatedBy: "--\(boundary)\r\n").count, 4)
+        XCTAssertTrue(mhtml.hasSuffix("--\(boundary)--\r\n"))
+    }
+}
+
+final class CommandShortcutTests: XCTestCase {
+    func testFirefoxShortcutsBecomeWebKitKeys() throws {
+        typealias Keys = ExtensionCommands.Keys
+        XCTAssertEqual(try ExtensionCommands.parse("Ctrl+Shift+U"), Keys(key: "u", modifiers: [.command, .shift]))
+        XCTAssertEqual(try ExtensionCommands.parse("MacCtrl+Alt+Comma"), Keys(key: ",", modifiers: [.control, .option]))
+        XCTAssertEqual(try ExtensionCommands.parse("Command+Up"), Keys(key: String(Character(UnicodeScalar(NSUpArrowFunctionKey)!)), modifiers: [.command]))
+        XCTAssertEqual(try ExtensionCommands.parse("F5"), Keys(key: String(Character(UnicodeScalar(NSF5FunctionKey)!)), modifiers: []))
+        XCTAssertEqual(try ExtensionCommands.parse(""), Keys(key: nil, modifiers: []))
+        // Shift alone isn't enough, and unknown keys or modifiers are refused.
+        XCTAssertThrowsError(try ExtensionCommands.parse("Shift+K"))
+        XCTAssertThrowsError(try ExtensionCommands.parse("Ctrl+Escape"))
+        XCTAssertThrowsError(try ExtensionCommands.parse("Hyper+K"))
+    }
+}
+
+final class DebuggerKeyTests: XCTestCase {
+    /// CDP key events name keys as the DOM does; AppKit wants Mac key codes and characters.
+    func testDOMKeysBecomeAppKitKeys() {
+        XCTAssertEqual(CDPKeys.code(forKey: "a"), "KeyA")
+        XCTAssertEqual(CDPKeys.code(forKey: "7"), "Digit7")
+        XCTAssertEqual(CDPKeys.code(forKey: "?"), "Slash")
+        XCTAssertEqual(CDPKeys.code(forKey: "Enter"), "Enter")
+        XCTAssertEqual(CDPKeys.macKeyCodes["KeyA"], 0x00)
+        XCTAssertEqual(CDPKeys.macKeyCodes["Enter"], 0x24)
+        XCTAssertEqual(CDPKeys.macKeyCodes["ArrowLeft"], 0x7B)
+        XCTAssertEqual(CDPKeys.characters(forKey: "Enter"), "\r")
+        XCTAssertEqual(CDPKeys.characters(forKey: "Backspace"), "\u{7F}")
+        XCTAssertEqual(CDPKeys.characters(forKey: "ArrowUp"), String(Character(UnicodeScalar(NSUpArrowFunctionKey)!)))
+        XCTAssertEqual(CDPKeys.characters(forKey: "x"), "x")
+        // CDP's bits: Alt 1, Ctrl 2, Meta 4, Shift 8.
+        XCTAssertEqual(CDPKeys.modifierFlags(4 | 8), [.command, .shift])
+        XCTAssertEqual(CDPKeys.modifierFlags(1 | 2), [.option, .control])
+    }
+}
+
+final class DebuggerBackgroundTabTests: XCTestCase {
+    @MainActor
+    private func loadHTML(_ html: String, in tab: Tab) async {
+        let loaded = expectation(description: "tab loaded")
+        let waiter = PageWaiter(loaded)
+        let webView = tab.wake()
+        let previousDelegate = webView.navigationDelegate
+        webView.navigationDelegate = waiter
+        webView.loadHTMLString(html, baseURL: URL(string: "https://example.test/"))
+        await fulfillment(of: [loaded], timeout: 5)
+        webView.navigationDelegate = previousDelegate
+    }
+
+    @MainActor
+    private func cdp(_ method: String, _ params: [String: Any] = [:], tabID: Int, extID: String = "bg-test") async throws -> Any? {
+        try await withCheckedThrowingContinuation { continuation in
+            do {
+                try ExtensionDebugger.shared.sendCommandForTesting(
+                    tabID: tabID, extensionID: extID, method: method, params: params,
+                    finish: { continuation.resume(returning: $0) },
+                    fail: { continuation.resume(throwing: $0) }
+                )
+            } catch {
+                continuation.resume(throwing: error)
+            }
+        }
+    }
+
+    @MainActor
+    private func eval(_ expression: String, tabID: Int, extID: String = "bg-test") async throws -> Any? {
+        let response = try await cdp("Runtime.evaluate", ["expression": expression], tabID: tabID, extID: extID) as? [String: Any]
+        return (response?["result"] as? [String: Any])?["value"]
+    }
+
+    @MainActor
+    func testBackgroundTabTrustedInputFocusEmulationScreenshotsAndTeardown() async throws {
+        let browser = BrowserState.makeIncognito()
+        let viewport = NSSize(width: 820, height: 610)
+        let mainWindow = NSWindow(
+            contentRect: NSRect(origin: NSPoint(x: 120, y: 120), size: viewport),
+            styleMask: [.titled, .closable], backing: .buffered, defer: false
+        )
+        mainWindow.isReleasedWhenClosed = false
+        let stack = WebStackView(frame: NSRect(origin: .zero, size: viewport))
+        mainWindow.contentView?.addSubview(stack)
+        browser.window = mainWindow
+        mainWindow.orderFront(nil)
+
+        let tabA = browser.newTab(url: nil, select: true)
+        let tabB = browser.newTab(url: nil, select: false)
+        let tabID = 4242
+        let extID = "bg-test-\(UUID().uuidString)"
+        defer {
+            try? ExtensionDebugger.shared.detachForTesting(tabID: tabID, extensionID: extID)
+            tabA.tearDown()
+            tabB.tearDown()
+            mainWindow.orderOut(nil)
+            mainWindow.close()
+        }
+
+        let htmlA = """
+        <!doctype html><html><body style="margin:0;height:2000px;background:#fff">
+        <button id="btn" style="position:fixed;left:20px;top:20px;width:120px;height:40px;border:0;background:#0f0">Go</button>
+        <input id="inp" style="position:fixed;left:20px;top:80px;width:220px;height:30px">
+        <canvas id="cv" width="100" height="100" style="position:fixed;left:20px;top:130px;background:#00ff00"></canvas>
+        <div id="scroller" style="position:fixed;left:260px;top:130px;width:200px;height:150px;overflow:auto">
+          <div style="height:1000px">Scrollable</div>
+        </div>
+        <div id="drop" style="position:fixed;left:260px;top:20px;width:160px;height:80px;background:#eee">Drop</div>
+        <script>
+        window.log = [];
+        window.raf = 0;
+        function tick() { window.raf++; requestAnimationFrame(tick); }
+        requestAnimationFrame(tick);
+        const btn = document.getElementById('btn');
+        btn.addEventListener('mousemove', e => window.log.push('move:' + e.isTrusted + ':' + Math.round(e.clientX) + ',' + Math.round(e.clientY)));
+        btn.addEventListener('click', e => {
+          window.log.push('click:' + e.isTrusted + ':' + Math.round(e.clientX) + ',' + Math.round(e.clientY));
+          const ctx = document.getElementById('cv').getContext('2d');
+          ctx.fillStyle = '#ff0000';
+          ctx.fillRect(0, 0, 100, 100);
+        });
+        const inp = document.getElementById('inp');
+        inp.addEventListener('keydown', e => window.log.push('kd:' + e.isTrusted + ':' + e.key));
+        inp.addEventListener('keyup', e => window.log.push('ku:' + e.isTrusted + ':' + e.key));
+        inp.addEventListener('input', e => window.log.push('in:' + e.isTrusted + ':' + inp.value));
+        document.getElementById('scroller').addEventListener('wheel', e => {
+          window.log.push('wheel:' + e.isTrusted + ':' + Math.round(e.clientX) + ',' + Math.round(e.clientY));
+        });
+        const drop = document.getElementById('drop');
+        drop.addEventListener('dragover', e => { e.preventDefault(); window.log.push('dragover:' + e.isTrusted); });
+        drop.addEventListener('drop', e => { e.preventDefault(); window.log.push('drop:' + e.isTrusted + ':' + e.dataTransfer.getData('text/plain')); });
+        </script>
+        </body></html>
+        """
+        await loadHTML(htmlA, in: tabA)
+        await loadHTML("<!doctype html><html><body><input id='b'></body></html>", in: tabB)
+        let webA = try XCTUnwrap(tabA.webView)
+        let webB = try XCTUnwrap(tabB.webView)
+
+        // Show Tab A on screen first, attach debugger, enable focus emulation.
+        stack.show(webA, animated: false)
+        mainWindow.makeFirstResponder(webA)
+        try ExtensionDebugger.shared.attachForTesting(tab: tabA, tabID: tabID, extensionID: extID)
+        _ = try await cdp("Emulation.setFocusEmulationEnabled", ["enabled": true], tabID: tabID, extID: extID)
+        XCTAssertTrue(tabA.isBusy)
+
+        // Switch user to Tab B in the same window.
+        browser.select(tabB)
+        stack.show(webB, animated: false)
+        mainWindow.makeFirstResponder(webB)
+
+        // Tab A moved seamlessly to its off-screen backing window; Tab B stays active in mainWindow.
+        XCTAssertTrue(browser.selectedTab === tabB)
+        XCTAssertTrue(webB.window === mainWindow)
+        XCTAssertTrue(mainWindow.firstResponder === webB)
+        XCTAssertTrue(webA.window is DebuggerBackingWindow)
+        XCTAssertEqual(ExtensionDebugger.shared.backingWindowCount, 1)
+
+        // Focus emulation keeps background Tab A visible, focused, sized to viewport, and ticking rAF.
+        let rafBefore = (try await eval("window.raf", tabID: tabID, extID: extID) as? NSNumber)?.intValue ?? 0
+        try await Task.sleep(nanoseconds: 120_000_000)
+        let rawState = try await eval("[document.visibilityState, document.hasFocus(), innerWidth, innerHeight, window.raf]", tabID: tabID, extID: extID)
+        let state = try XCTUnwrap(rawState as? [Any])
+        XCTAssertEqual(state[0] as? String, "visible")
+        XCTAssertEqual((state[1] as? NSNumber)?.boolValue, true)
+        XCTAssertEqual((state[2] as? NSNumber)?.intValue, Int(viewport.width))
+        XCTAssertEqual((state[3] as? NSNumber)?.intValue, Int(viewport.height))
+        XCTAssertGreaterThan((state[4] as? NSNumber)?.intValue ?? 0, rafBefore)
+
+        // Trusted mouseMoved + mousePressed + mouseReleased on button (CSS 60, 40).
+        _ = try await cdp("Input.dispatchMouseEvent", ["type": "mouseMoved", "x": 60, "y": 40], tabID: tabID, extID: extID)
+        _ = try await cdp("Input.dispatchMouseEvent", ["type": "mousePressed", "x": 60, "y": 40, "button": "left", "clickCount": 1], tabID: tabID, extID: extID)
+        _ = try await cdp("Input.dispatchMouseEvent", ["type": "mouseReleased", "x": 60, "y": 40, "button": "left", "clickCount": 1], tabID: tabID, extID: extID)
+
+        // Trusted mouseWheel inside #scroller (CSS 320, 180).
+        _ = try await cdp("Input.dispatchMouseEvent", ["type": "mouseWheel", "x": 320, "y": 180, "deltaX": 0, "deltaY": 90], tabID: tabID, extID: extID)
+
+        // Click #inp (CSS 80, 95), type 'a' via dispatchKeyEvent, then insertText 'bc', then ⌘A selectAll + replace.
+        _ = try await cdp("Input.dispatchMouseEvent", ["type": "mousePressed", "x": 80, "y": 95, "button": "left", "clickCount": 1], tabID: tabID, extID: extID)
+        _ = try await cdp("Input.dispatchMouseEvent", ["type": "mouseReleased", "x": 80, "y": 95, "button": "left", "clickCount": 1], tabID: tabID, extID: extID)
+        _ = try await cdp("Input.dispatchKeyEvent", ["type": "keyDown", "key": "a", "text": "a"], tabID: tabID, extID: extID)
+        _ = try await cdp("Input.dispatchKeyEvent", ["type": "keyUp", "key": "a"], tabID: tabID, extID: extID)
+        _ = try await cdp("Input.insertText", ["text": "bc"], tabID: tabID, extID: extID)
+        let typedValue = try await eval("document.getElementById('inp').value", tabID: tabID, extID: extID) as? String
+        XCTAssertEqual(typedValue, "abc")
+        _ = try await cdp("Input.dispatchKeyEvent", ["type": "rawKeyDown", "key": "a", "code": "KeyA", "modifiers": 4, "commands": ["selectAll"]], tabID: tabID, extID: extID)
+        _ = try await cdp("Input.dispatchKeyEvent", ["type": "keyUp", "key": "a", "code": "KeyA", "modifiers": 4], tabID: tabID, extID: extID)
+        _ = try await cdp("Input.insertText", ["text": "done"], tabID: tabID, extID: extID)
+        let replacedValue = try await eval("document.getElementById('inp').value", tabID: tabID, extID: extID) as? String
+        XCTAssertEqual(replacedValue, "done")
+
+        // Trusted drag & drop onto #drop (CSS 320, 50).
+        let dragData: [String: Any] = ["items": [["mimeType": "text/plain", "data": "payload"]], "dragOperationsMask": 1]
+        _ = try await cdp("Input.dispatchDragEvent", ["type": "dragEnter", "x": 320, "y": 50, "data": dragData], tabID: tabID, extID: extID)
+        _ = try await cdp("Input.dispatchDragEvent", ["type": "dragOver", "x": 320, "y": 50, "data": dragData], tabID: tabID, extID: extID)
+        _ = try await cdp("Input.dispatchDragEvent", ["type": "drop", "x": 320, "y": 50, "data": dragData], tabID: tabID, extID: extID)
+
+        // Verify all events were trusted and hit the exact coordinates, and Tab B never lost focus.
+        let rawEvents = try await eval("window.log", tabID: tabID, extID: extID)
+        let events = try XCTUnwrap(rawEvents as? [String])
+        XCTAssertTrue(events.contains("move:true:60,40"), "Expected trusted mousemove, got \(events)")
+        XCTAssertTrue(events.contains("click:true:60,40"), "Expected trusted click, got \(events)")
+        XCTAssertTrue(events.contains("wheel:true:320,180"), "Expected trusted wheel, got \(events)")
+        XCTAssertTrue(events.contains("kd:true:a"), "Expected trusted keydown, got \(events)")
+        XCTAssertTrue(events.contains("ku:true:a"), "Expected trusted keyup, got \(events)")
+        XCTAssertTrue(events.contains("in:true:abc"), "Expected trusted input, got \(events)")
+        XCTAssertTrue(events.contains("dragover:true"), "Expected trusted dragover, got \(events)")
+        XCTAssertTrue(events.contains("drop:true:payload"), "Expected trusted drop, got \(events)")
+        let scrollTop = (try await eval("document.getElementById('scroller').scrollTop", tabID: tabID, extID: extID) as? NSNumber)?.doubleValue ?? 0
+        XCTAssertGreaterThan(scrollTop, 0)
+        XCTAssertTrue(browser.selectedTab === tabB)
+        XCTAssertTrue(mainWindow.firstResponder === webB)
+
+        // Screenshot captures the live red canvas updated by the background click without switching tabs.
+        let rawShot = try await cdp("Page.captureScreenshot", ["format": "png"], tabID: tabID, extID: extID)
+        let shot = try XCTUnwrap(rawShot as? [String: Any])
+        let pngData = try XCTUnwrap(Data(base64Encoded: try XCTUnwrap(shot["data"] as? String)))
+        let rep = try XCTUnwrap(NSBitmapImageRep(data: pngData))
+        let scale = Double(rep.pixelsWide) / Double(viewport.width)
+        let pixel = try XCTUnwrap(rep.colorAt(x: Int(60 * scale), y: Int(170 * scale)))
+        XCTAssertGreaterThan(pixel.redComponent, 0.9)
+        XCTAssertLessThan(pixel.greenComponent, 0.1)
+        XCTAssertTrue(browser.selectedTab === tabB)
+
+        // Disabling focus emulation sets document.hasFocus() back to false in background.
+        _ = try await cdp("Emulation.setFocusEmulationEnabled", ["enabled": false], tabID: tabID, extID: extID)
+        let focusedAfterDisable = (try await eval("document.hasFocus()", tabID: tabID, extID: extID) as? NSNumber)?.boolValue
+        XCTAssertEqual(focusedAfterDisable, false)
+
+        // Switching back to Tab A seamlessly reparents it into mainWindow and closes the backing window.
+        browser.select(tabA)
+        stack.show(webA, animated: false)
+        mainWindow.makeFirstResponder(webA)
+        XCTAssertTrue(webA.window === mainWindow)
+        XCTAssertEqual(ExtensionDebugger.shared.backingWindowCount, 0)
+        let preservedValue = try await eval("document.getElementById('inp').value", tabID: tabID, extID: extID) as? String
+        XCTAssertEqual(preservedValue, "done")
+
+        // Switch away again, then detach: backing window is cleaned up and normal hidden state returns.
+        browser.select(tabB)
+        stack.show(webB, animated: false)
+        XCTAssertEqual(ExtensionDebugger.shared.backingWindowCount, 1)
+        try ExtensionDebugger.shared.detachForTesting(tabID: tabID, extensionID: extID)
+        XCTAssertEqual(ExtensionDebugger.shared.backingWindowCount, 0)
+        XCTAssertNil(webA.window)
+        XCTAssertFalse(tabA.isBusy)
+
+        // Wait for WebKit to flush its post-detach activity-state update to the web process.
+        try await Task.sleep(nanoseconds: 150_000_000)
+        let hiddenState: [Any] = await withCheckedContinuation { continuation in
+            webA.evaluateJavaScript("[document.visibilityState, document.hasFocus()]") { result, _ in
+                continuation.resume(returning: (result as? [Any]) ?? [])
+            }
+        }
+        XCTAssertEqual(hiddenState.first as? String, "hidden")
+        XCTAssertEqual((hiddenState.last as? NSNumber)?.boolValue, false)
+    }
+
+    @MainActor
+    func testTabCloseCleansUpBackgroundDebuggerBackingWindow() async throws {
+        let browser = BrowserState.makeIncognito()
+        let tabA = browser.newTab(url: nil, select: true)
+        let tabB = browser.newTab(url: nil, select: false)
+        let tabID = 4243
+        let extID = "bg-close-\(UUID().uuidString)"
+        defer {
+            tabA.tearDown()
+            tabB.tearDown()
+        }
+
+        await loadHTML("<!doctype html><html><body>hi</body></html>", in: tabA)
+        browser.select(tabB)
+        try ExtensionDebugger.shared.attachForTesting(tab: tabA, tabID: tabID, extensionID: extID)
+        XCTAssertEqual(ExtensionDebugger.shared.backingWindowCount, 1)
+
+        ExtensionDebugger.shared.tabClosed(tabA)
+        XCTAssertEqual(ExtensionDebugger.shared.backingWindowCount, 0)
+        XCTAssertNil(tabA.webView?.window)
+    }
+}
+
+final class SidePanelDownloadTests: XCTestCase {
+    @MainActor
+    func testBlobAnchorDownloadSavesFileInsteadOfNavigatingPanel() async throws {
+        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("tuff-sidepanel-dl-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        let savedDownloads = AppSettings.shared.downloads
+        AppSettings.shared.downloads.folderPath = tempDir.path
+        AppSettings.shared.downloads.askWhereToSave = false
+        AppSettings.shared.downloads.openSafeFiles = false
+        AppSettings.shared.downloads.showPanelOnStart = false
+
+        let manager = DownloadManager.shared
+        let existingIDs = Set(manager.items.map(\.id))
+        let host = SidePanelHost(extensionID: "test-panel", configuration: WKWebViewConfiguration(), url: URL(string: "about:blank")!)
+
+        defer {
+            host.tearDown()
+            for item in manager.items where !existingIDs.contains(item.id) {
+                manager.remove(item, deleteFile: true)
+            }
+            AppSettings.shared.downloads = savedDownloads
+            try? FileManager.default.removeItem(at: tempDir)
+        }
+
+        host.webView.loadHTMLString("<!doctype html><html><body><div id='panel'>sidebar</div></body></html>", baseURL: nil)
+        let deadline = Date().addingTimeInterval(5)
+        while Date() < deadline {
+            let text = try? await host.webView.evaluateJavaScript("document.getElementById('panel')?.textContent") as? String
+            if text == "sidebar" { break }
+            try await Task.sleep(nanoseconds: 25_000_000)
+        }
+
+        _ = try await host.webView.evaluateJavaScript("""
+            (() => {
+              const blob = new Blob([JSON.stringify({ app: 'TuffAgent', ok: true })], { type: 'application/json' });
+              const url = URL.createObjectURL(blob);
+              const a = document.createElement('a');
+              a.href = url;
+              a.download = 'tuffagent-log.json';
+              document.body.appendChild(a);
+              a.click();
+              a.remove();
+              return true;
+            })()
+        """)
+
+        var downloaded: DownloadItem?
+        let dlDeadline = Date().addingTimeInterval(5)
+        while Date() < dlDeadline {
+            if let item = manager.items.first(where: { !existingIDs.contains($0.id) && $0.state == .finished }) {
+                downloaded = item
+                break
+            }
+            try await Task.sleep(nanoseconds: 25_000_000)
+        }
+
+        let item = try XCTUnwrap(downloaded, "Expected side panel blob anchor to complete a download")
+        XCTAssertEqual(item.filename, "tuffagent-log.json")
+        let destination = try XCTUnwrap(item.destination)
+        XCTAssertEqual(destination.deletingLastPathComponent().standardizedFileURL, tempDir.standardizedFileURL)
+        let contents = try String(contentsOf: destination, encoding: .utf8)
+        XCTAssertEqual(contents, #"{"app":"TuffAgent","ok":true}"#)
+
+        // The side panel must stay on its own page rather than replacing itself with the JSON text.
+        let panelText = try await host.webView.evaluateJavaScript("document.getElementById('panel')?.textContent") as? String
+        XCTAssertEqual(panelText, "sidebar")
     }
 }

@@ -4,7 +4,7 @@ import UniformTypeIdentifiers
 import WebKit
 
 enum SettingsTab: String, CaseIterable, Identifiable {
-    case general, sync, importData, appearance, layout, tabs, spaces, search, downloads, privacy, passwords, websites, extensions, mods, shortcuts, advanced, about
+    case general, sync, importData, backup, appearance, layout, tabs, spaces, search, downloads, privacy, passwords, websites, extensions, mods, shortcuts, advanced, about
     var id: String { rawValue }
 
     var label: String {
@@ -12,6 +12,7 @@ enum SettingsTab: String, CaseIterable, Identifiable {
         case .general: "General"
         case .sync: "Sync"
         case .importData: "Import"
+        case .backup: "Backup & Restore"
         case .appearance: "Theme"
         case .layout: "Layout"
         case .tabs: "Tabs"
@@ -34,6 +35,7 @@ enum SettingsTab: String, CaseIterable, Identifiable {
         case .general: "gearshape.fill"
         case .sync: "arrow.triangle.2.circlepath"
         case .importData: "square.and.arrow.down.fill"
+        case .backup: "externaldrive.fill"
         case .appearance: "paintpalette.fill"
         case .layout: "rectangle.split.3x1.fill"
         case .tabs: "square.on.square"
@@ -58,6 +60,7 @@ enum SettingsTab: String, CaseIterable, Identifiable {
         case .general: "startup quit default browser"
         case .sync: "cloud mozilla firefox zen account sign in google chrome devices"
         case .importData: "migrate switch from another browser"
+        case .backup: "export import save everything file restore"
         case .appearance: "appearance look colour"
         case .layout: "sidebar tab position"
         case .tabs: ""
@@ -77,7 +80,7 @@ enum SettingsTab: String, CaseIterable, Identifiable {
 
     /// Sidebar groups, separated by a little space; a group with a title gets a heading.
     static let groups: [(title: String?, tabs: [SettingsTab])] = [
-        (nil, [.general, .sync, .importData]),
+        (nil, [.general, .sync, .importData, .backup]),
         ("Appearance", [.appearance, .layout]),
         ("Browsing", [.tabs, .spaces, .search, .downloads]),
         ("Privacy", [.privacy, .passwords, .websites]),
@@ -238,6 +241,7 @@ struct SettingsView: View {
         case .general: GeneralPage()
         case .sync: SyncPage()
         case .importData: ImportPage()
+        case .backup: BackupPage()
         case .appearance: AppearancePage()
         case .layout: LayoutPage()
         case .tabs: TabsPage()
@@ -1206,6 +1210,11 @@ struct WebsitesPage: View {
                     detail: "Starts the “Remember for this site” switch on when a site asks.",
                     isOn: $settings.privacy.rememberMediaPermissions
                 )
+                SwitchRow(
+                    title: "Block location requests",
+                    detail: "Sites asking for your location are refused without a prompt. A site you've set to Allow still gets it.",
+                    isOn: $settings.privacy.blockLocationRequests
+                )
             }
 
             SiteListGroup()
@@ -1349,6 +1358,9 @@ struct AdvancedPage: View {
                 SettingsRow(title: "Back up or move your settings") {
                     Button("Import…", action: importSettings).buttonStyle(TuffButtonStyle())
                     Button("Export…", action: exportSettings).buttonStyle(TuffButtonStyle())
+                }
+                SettingsRow(title: "Back up everything", detail: "Tabs, spaces, profiles, bookmarks, passwords, extensions and more, in one file.") {
+                    SettingsLink(title: "Backup & Restore", tab: .backup)
                 }
                 SettingsRow(title: "Reset all settings", detail: "Spaces, tabs and extensions are kept.") {
                     ConfirmButton(title: "Reset…", confirmTitle: "Reset everything?") {

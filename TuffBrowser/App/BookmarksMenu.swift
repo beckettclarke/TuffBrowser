@@ -31,6 +31,7 @@ final class BookmarksMenuFiller: NSObject, NSMenuDelegate {
     }
 
     private func makeItem(_ bookmark: Bookmark) -> NSMenuItem {
+        if bookmark.isSeparator { return .separator() }
         guard bookmark.isFolder else {
             let item = NSMenuItem(title: Self.title(bookmark.displayTitle), action: #selector(openPage(_:)), keyEquivalent: "")
             item.target = self

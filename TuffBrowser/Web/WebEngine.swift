@@ -4,6 +4,15 @@ import WebKit
 /// The web view used for every tab.
 final class TuffWebView: WKWebView {
     weak var tab: Tab?
+    /// "Save Image As…" / "Save Linked File As…" was just picked from the page's context menu:
+    /// the download WebKit creates next asks where to save.
+    var contextSaveAsRequested: Date?
+
+    func takeContextSaveAsRequest() -> Bool {
+        let asks = contextSaveAsRequested.map { Date().timeIntervalSince($0) < 10 } ?? false
+        contextSaveAsRequested = nil
+        return asks
+    }
 
     /// While Tuff's PDF viewer covers the page, the keyboard belongs to it, not to the empty
     /// placeholder page underneath (WebKit takes focus on its own when a page comes back from
@@ -14,18 +23,27 @@ final class TuffWebView: WKWebView {
     }
 
     // A click in the other side of a split makes it the selected tab (see `pageWasClicked`).
+    // Synthetic clicks from `chrome.debugger` never switch the active tab or steal focus.
     override func mouseDown(with event: NSEvent) {
-        if let tab { tab.browser?.pageWasClicked(tab) }
+        if !ExtensionDebugger.isSynthetic(event), let tab { tab.browser?.pageWasClicked(tab) }
         super.mouseDown(with: event)
     }
 
     override func rightMouseDown(with event: NSEvent) {
-        if let tab { tab.browser?.pageWasClicked(tab) }
+        if !ExtensionDebugger.isSynthetic(event), let tab { tab.browser?.pageWasClicked(tab) }
         super.rightMouseDown(with: event)
     }
 
+    // A drag begun by an extension's synthetic mouse is the extension's to play back.
+    override func beginDraggingSession(with items: [NSDraggingItem], event: NSEvent, source: NSDraggingSource) -> NSDraggingSession {
+        if ExtensionDebugger.isSynthetic(event), let tab {
+            return ExtensionDebugger.shared.syntheticDragBegan(in: tab, webView: self, event: event, source: source)
+        }
+        return super.beginDraggingSession(with: items, event: event, source: source)
+    }
+
     override func otherMouseDown(with event: NSEvent) {
-        if let tab { tab.browser?.pageWasClicked(tab) }
+        if !ExtensionDebugger.isSynthetic(event), let tab { tab.browser?.pageWasClicked(tab) }
         super.otherMouseDown(with: event)
     }
 
@@ -37,6 +55,12 @@ final class TuffWebView: WKWebView {
 
     override func willOpenMenu(_ menu: NSMenu, with event: NSEvent) {
         super.willOpenMenu(menu, with: event)
+        // An extension's right-click (chrome.debugger) gets the page's contextmenu event, not a
+        // menu that would wait on screen for the user.
+        if ExtensionDebugger.takesContextMenu() {
+            DispatchQueue.main.async { menu.cancelTrackingWithoutAnimation() }
+            return
+        }
         // "New Window" requests land in `createWebViewWith`, which opens a tab — so say so.
         for item in menu.items {
             switch item.identifier?.rawValue {
@@ -59,16 +83,24 @@ final class TuffWebView: WKWebView {
             saveAs.representedObject = menu.items[index]
             menu.insertItem(saveAs, at: index + 1)
         }
+        var extensionItems: [(extensionID: String, items: [NSMenuItem])] = []
         if let tab {
-            let extra = ExtensionManager.shared.contextMenuItems(for: tab)
+            extensionItems = ExtensionManager.shared.contextMenuItemsByExtension(for: tab)
+            let extra = extensionItems.flatMap(\.items)
             if !extra.isEmpty {
                 menu.addItem(.separator())
                 extra.forEach { menu.addItem($0) }
             }
         }
+        ExtensionMenus.shared.menuWillOpen(menu, in: self, tab: tab, extensionItems: extensionItems)
         #if DEBUG
         DebugHooks.pickFromContextMenu(menu)
         #endif
+    }
+
+    override func didCloseMenu(_ menu: NSMenu, with event: NSEvent?) {
+        super.didCloseMenu(menu, with: event)
+        ExtensionMenus.shared.menuDidClose()
     }
 
     /// Runs WebKit's own Download Image / Download Linked File (which handles blob: and data:
@@ -76,7 +108,7 @@ final class TuffWebView: WKWebView {
     /// (`Tab.webView(_:contextMenuDidCreateDownload:)`).
     @objc private func saveContextDownloadAs(_ sender: NSMenuItem) {
         guard let original = sender.representedObject as? NSMenuItem, let action = original.action else { return }
-        tab?.contextSaveAsRequested = Date()
+        contextSaveAsRequested = Date()
         NSApp.sendAction(action, to: original.target, from: original)
     }
 }
@@ -117,6 +149,12 @@ enum WebEngine {
     }()
 
     // MARK: Web views
+
+    /// The content world Tuff's own page scripts share (picture in picture, passwords, the live
+    /// favicon, translation, unsaved-input tracking). Pages can't see into it. Each world is a
+    /// whole JavaScript global object of its own in every frame a script runs in, so they share
+    /// one rather than having a world each; every script keeps to its own `__tuff…` global.
+    static let scriptWorld = WKContentWorld.world(name: "Tuff")
 
     static func makeConfiguration(dataStore: WKWebsiteDataStore = DataStores.website) -> WKWebViewConfiguration {
         let settings = AppSettings.shared
@@ -167,7 +205,12 @@ enum WebEngine {
         EmbeddedSignIn.install(into: config.userContentController)
         Tab.installUnsavedInputTracking(into: config.userContentController)
         // Scripts extensions register at run time; Incognito windows don't run extensions.
-        if dataStore.isPersistent { ExtensionContentScripts.shared.attach(config.userContentController) }
+        if dataStore.isPersistent {
+            ExtensionContentScripts.shared.attach(config.userContentController)
+            ExtensionWebAuthn.shared.attach(config.userContentController)
+            ExtensionMenus.shared.attach(config.userContentController)
+        }
+        SiteSettings.shared.attachContentRules(to: config.userContentController)
         ContentBlocker.shared.attach(config.userContentController)
         InternalPageHandler.shared.install(into: config)
         config.userContentController.add(CertificateErrorHandler.shared, contentWorld: .page, name: CertificateErrorHandler.name)

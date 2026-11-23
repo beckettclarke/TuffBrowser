@@ -11,7 +11,7 @@ import Foundation
 /// filters and scriptlets are handled separately by `AdvancedContentBlocker`.
 struct FilterListParser {
     /// Bump when the output changes, so cached compiled lists are rebuilt.
-    static let version = 6
+    static let version = 8
 
     struct Result {
         /// Content rule lists as JSON, each under WebKit's 150,000-rule limit.
@@ -442,8 +442,71 @@ struct FilterListParser {
         return variants
     }
 
+    /// Whether a selector tests the `style` attribute anywhere but its subject (`[style] > img`,
+    /// `body:not([style]) .x`, `div:has([style])`). One such selector anywhere on a page makes
+    /// WebKit give up its lazy inline styles: every `element.style.x = …` is serialized back
+    /// into the attribute straight away and run through attribute invalidation, so the page can
+    /// re-check the selector. Animations and frameworks that set inline styles pay for that on
+    /// every change, on every site, so generic filters like these (a handful, for a few odd
+    /// sites) are left out.
+    static func readsStyleAttributeAboveSubject(_ selector: String) -> Bool {
+        let lowered = selector.lowercased()
+        guard lowered.contains("[style") else { return false }
+        return styleAttributeAboveSubject(in: lowered[...], nested: false)
+    }
+
+    /// Looks at one level of a selector list: brackets and quotes are skipped, each parenthesised
+    /// argument is looked at on its own. Inside a pseudo-class (`nested`), a combinator anywhere
+    /// near `[style` counts, as does any `[style` inside `:has(…)`.
+    private static func styleAttributeAboveSubject(in text: Substring, nested: Bool) -> Bool {
+        var depth = 0
+        var inBracket = false
+        var quote: Character?
+        var selectorStart = text.startIndex
+        var argumentStart = text.startIndex
+        var index = text.startIndex
+        while index < text.endIndex {
+            let ch = text[index]
+            if let q = quote {
+                if ch == q { quote = nil }
+            } else if ch == "\"" || ch == "'" {
+                quote = ch
+            } else if inBracket {
+                if ch == "]" { inBracket = false }
+            } else if ch == "[" {
+                inBracket = true
+            } else if ch == "(" {
+                if depth == 0 { argumentStart = text.index(after: index) }
+                depth += 1
+            } else if ch == ")" {
+                depth -= 1
+                if depth == 0 {
+                    let argument = text[argumentStart..<index]
+                    let isHas = text[text.startIndex..<argumentStart].hasSuffix(":has(")
+                    if isHas, argument.contains("[style") { return true }
+                    if styleAttributeAboveSubject(in: argument, nested: true) { return true }
+                }
+            } else if depth == 0 {
+                if ch == "," {
+                    selectorStart = text.index(after: index)
+                } else if " >+~".contains(ch) {
+                    // A combinator: what came before it in this selector is above the subject.
+                    let scope = nested ? text[selectorStart...] : text[selectorStart..<index]
+                    if scope.contains("[style") { return true }
+                }
+            }
+            index = text.index(after: index)
+        }
+        return false
+    }
+
+    /// The trigger of a hiding rule bound to sites. It fires on document loads only, which is
+    /// where WebKit adds a rule's selectors to the page. Without `resource-type`, every image,
+    /// script and fetch the page makes runs through each of these rules (~11,000 of them, all
+    /// `url-filter: .*`) just to find out the page has them already. That was 40 ms per
+    /// Speedometer NewsSite navigation, on a site none of the rules are for.
     private static func domainTrigger(_ variant: DomainVariant, generic: Bool) -> [String: Any] {
-        var trigger: [String: Any] = ["url-filter": ".*"]
+        var trigger: [String: Any] = ["url-filter": ".*", "resource-type": ["document"]]
         if !variant.excluded.isEmpty, variant.included != "*" {
             // A host-bound url-filter leaves the one domain-condition slot available for exclusions.
             trigger["url-filter"] = urlRegexes("||\(variant.included)^")?.first ?? ".*"
@@ -460,7 +523,8 @@ struct FilterListParser {
     private static let selectorsPerRule = 100
 
     private mutating func finish(validSelectors: ([String]) -> Set<String>) -> Result {
-        // Element hiding, first in each list so later exceptions can't cancel it for subresources.
+        // Element hiding, first in each list so later exceptions can't cancel it. Site-bound
+        // hiding fires on document loads only (`domainTrigger`).
         var allSelectors = Set(genericSelectors)
         for entry in specificSelectors.values { allSelectors.formUnion(entry.selectors) }
         let valid = validSelectors(Array(allSelectors))
@@ -470,6 +534,7 @@ struct FilterListParser {
         var complexGeneric: [String: (variant: DomainVariant, selectors: [String])] = [:]
         var seen = Set<String>()
         for selector in genericSelectors where valid.contains(selector) && seen.insert(selector).inserted {
+            if Self.readsStyleAttributeAboveSubject(selector) { stats.skipped += 1; continue }
             let exceptions = genericSelectorExceptions[selector] ?? []
             let exclusions = genericExclusions[selector] ?? []
             if exceptions.isEmpty && exclusions.isEmpty {
@@ -482,11 +547,21 @@ struct FilterListParser {
                 complexGeneric[key, default: (variant, [])].selectors.append(selector)
             }
         }
+        // Generic hiding gets a list of its own, with no conditions at all. WebKit then builds it
+        // into a single style sheet once per web content process and hands every document that
+        // one sheet. Any condition (an `unless-domain` for the `$generichide` sites, say) makes
+        // WebKit evaluate each rule on every load instead, and add its ~14,000 selectors to each
+        // page and frame one rule at a time, parsing them afresh. `$generichide` sites are
+        // switched off by an `ignore-previous-rules` after them, which only reaches rules in its
+        // own list (as AdGuard's Safari converter does it).
+        var genericList: [Rule] = []
         for batch in stride(from: 0, to: plainGeneric.count, by: Self.selectorsPerRule) {
             let selectors = plainGeneric[batch..<min(batch + Self.selectorsPerRule, plainGeneric.count)]
-            var trigger: [String: Any] = ["url-filter": ".*"]
-            if !hideOff.isEmpty { trigger["unless-domain"] = hideOff.sorted().map { "*" + $0 } }
-            cosmetic.append(["trigger": trigger, "action": ["type": "css-display-none", "selector": selectors.joined(separator: ", ")]])
+            genericList.append(["trigger": ["url-filter": ".*"], "action": ["type": "css-display-none", "selector": selectors.joined(separator: ", ")]])
+        }
+        if !genericList.isEmpty, !hideOff.isEmpty {
+            genericList.append(["trigger": ["url-filter": ".*", "if-domain": hideOff.sorted().map { "*" + $0 }],
+                                "action": ["type": "ignore-previous-rules"]])
         }
         for entry in complexGeneric.values {
             for batch in stride(from: 0, to: entry.selectors.count, by: Self.selectorsPerRule) {
@@ -524,11 +599,20 @@ struct FilterListParser {
         let shared = cosmetic + blocks
         var lists: [String] = []
         var total = 0
+        if !genericList.isEmpty {
+            // Pages with a `$document` exception get no hiding either.
+            let list = genericList + pageExceptions
+            if let data = try? JSONSerialization.data(withJSONObject: list), let json = String(data: data, encoding: .utf8) {
+                lists.append(json)
+                total += list.count
+            }
+        }
         var start = 0
         repeat {
             let chunk = shared[start..<min(start + room, shared.count)]
             let list = Array(chunk) + exceptions + important + pageExceptions
-            if let data = try? JSONSerialization.data(withJSONObject: list), let json = String(data: data, encoding: .utf8) {
+            // WebKit refuses an empty list (only generic hiding, which has its own, was given).
+            if !list.isEmpty, let data = try? JSONSerialization.data(withJSONObject: list), let json = String(data: data, encoding: .utf8) {
                 lists.append(json)
                 total += list.count
             }

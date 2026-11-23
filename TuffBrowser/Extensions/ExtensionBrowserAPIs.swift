@@ -28,6 +28,8 @@ final class ExtensionContentSettings {
         var incognito: Bool
         /// The global setting's value before (only for key "*").
         var previous: Bool?
+        /// The global string setting's value before (only for key "*" on string-typed settings).
+        var previousString: String?
     }
 
     private var changes: [String: [Change]] = [:]
@@ -49,8 +51,8 @@ final class ExtensionContentSettings {
     ]
     /// What Tuff does for the types it has no per-site setting for.
     private static let fixedSettings: [String: String] = [
-        "cookies": "allow", "images": "allow", "plugins": "block", "unsandboxedPlugins": "block",
-        "automaticDownloads": "ask", "autoVerify": "allow", "clipboard": "ask", "sound": "allow",
+        "plugins": "block", "unsandboxedPlugins": "block",
+        "autoVerify": "allow",
     ]
 
     func get(type: String, args: [String: Any]) throws -> [String: Any] {
@@ -66,6 +68,18 @@ final class ExtensionContentSettings {
         case "popups":
             let allowed = SiteSettings.shared.entry(for: url, incognito: incognito).popups ?? !privacy.blockPopups
             return ["setting": allowed ? "allow" : "block"]
+        case "sound":
+            let allowed = SiteSettings.shared.soundAllowed(for: url, incognito: incognito)
+            return ["setting": allowed ? "allow" : "block"]
+        case "images":
+            let allowed = SiteSettings.shared.imagesAllowed(for: url, incognito: incognito)
+            return ["setting": allowed ? "allow" : "block"]
+        case "cookies":
+            return ["setting": SiteSettings.shared.cookiesSetting(for: url, incognito: incognito)]
+        case "automaticDownloads":
+            return ["setting": SiteSettings.shared.automaticDownloadsSetting(for: url, incognito: incognito)]
+        case "clipboard":
+            return ["setting": SiteSettings.shared.clipboardSetting(for: url, incognito: incognito)]
         default:
             if let kind = Self.permissionKinds[type] {
                 let answer = Self.origin(of: url).flatMap { SitePermissions.shared.decision(origin: $0, kind: kind, incognito: incognito) }
@@ -83,21 +97,84 @@ final class ExtensionContentSettings {
         let site = try Self.parse(pattern)
 
         switch type {
-        case "javascript", "popups":
+        case "javascript", "popups", "sound", "images":
             guard setting == "allow" || setting == "block" else { throw Failure("Tuff can’t use “\(setting)” for \(type).") }
             let allow = setting == "allow"
             if site == nil {
                 guard !incognito else { throw Failure("Every-site settings can’t be limited to Incognito.") }
-                var privacy = AppSettings.shared.privacy
-                let previous = type == "javascript" ? privacy.javaScript : !privacy.blockPopups
-                if type == "javascript" { privacy.javaScript = allow } else { privacy.blockPopups = !allow }
-                AppSettings.shared.privacy = privacy
-                record(Change(type: type, key: "*", incognito: false, previous: previous), extensionID: extensionID)
+                if type == "sound" {
+                    let previous = SiteSettings.shared.defaultSound ?? true
+                    SiteSettings.shared.defaultSound = allow
+                    record(Change(type: type, key: "*", incognito: false, previous: previous), extensionID: extensionID)
+                    Self.applySoundToOpenTabs()
+                } else if type == "images" {
+                    let previous = SiteSettings.shared.defaultImages ?? true
+                    SiteSettings.shared.defaultImages = allow
+                    record(Change(type: type, key: "*", incognito: false, previous: previous), extensionID: extensionID)
+                } else {
+                    var privacy = AppSettings.shared.privacy
+                    let previous = type == "javascript" ? privacy.javaScript : !privacy.blockPopups
+                    if type == "javascript" { privacy.javaScript = allow } else { privacy.blockPopups = !allow }
+                    AppSettings.shared.privacy = privacy
+                    record(Change(type: type, key: "*", incognito: false, previous: previous), extensionID: extensionID)
+                }
             } else if let site {
                 SiteSettings.shared.update(key: site.key, incognito: incognito) { entry in
-                    if type == "javascript" { entry.javaScript = allow } else { entry.popups = allow }
+                    if type == "javascript" { entry.javaScript = allow }
+                    else if type == "popups" { entry.popups = allow }
+                    else if type == "sound" { entry.sound = allow }
+                    else { entry.images = allow }
                 }
                 record(Change(type: type, key: site.key, incognito: incognito), extensionID: extensionID)
+                if type == "sound" { Self.applySoundToOpenTabs() }
+                if type == "images" { SiteSettings.shared.rebuildContentRules() }
+            }
+        case "cookies":
+            guard ["allow", "block", "session_only"].contains(setting) else {
+                throw Failure("Tuff can’t use “\(setting)” for cookies.")
+            }
+            if site == nil {
+                guard !incognito else { throw Failure("Every-site settings can’t be limited to Incognito.") }
+                let previous = SiteSettings.shared.defaultCookies ?? "allow"
+                SiteSettings.shared.defaultCookies = setting
+                record(Change(type: type, key: "*", incognito: false, previousString: previous), extensionID: extensionID)
+            } else if let site {
+                SiteSettings.shared.update(key: site.key, incognito: incognito) { entry in
+                    entry.cookies = setting
+                }
+                record(Change(type: type, key: site.key, incognito: incognito), extensionID: extensionID)
+                SiteSettings.shared.rebuildContentRules()
+            }
+        case "automaticDownloads":
+            guard ["allow", "block", "ask"].contains(setting) else {
+                throw Failure("Tuff can’t use “\(setting)” for automaticDownloads.")
+            }
+            if site == nil {
+                guard !incognito else { throw Failure("Every-site settings can’t be limited to Incognito.") }
+                let previous = SiteSettings.shared.defaultAutomaticDownloads ?? "ask"
+                SiteSettings.shared.defaultAutomaticDownloads = setting
+                record(Change(type: type, key: "*", incognito: false, previousString: previous), extensionID: extensionID)
+            } else if let site {
+                SiteSettings.shared.update(key: site.key, incognito: incognito) { entry in
+                    entry.automaticDownloads = setting
+                }
+                record(Change(type: type, key: site.key, incognito: incognito), extensionID: extensionID)
+            }
+        case "clipboard":
+            guard ["allow", "block", "ask"].contains(setting) else {
+                throw Failure("Tuff can’t use “\(setting)” for clipboard.")
+            }
+            if site == nil {
+                guard !incognito else { throw Failure("Every-site settings can’t be limited to Incognito.") }
+                let previous = SiteSettings.shared.defaultClipboard ?? "ask"
+                SiteSettings.shared.defaultClipboard = setting
+                record(Change(type: type, key: "*", incognito: false, previousString: previous), extensionID: extensionID)
+            } else if let site {
+                SiteSettings.shared.update(key: site.key, incognito: incognito) { entry in
+                    entry.clipboard = setting
+                }
+                record(Change(type: type, key: site.key, incognito: incognito), extensionID: extensionID)
+                SiteSettings.shared.rebuildClipboardScript()
             }
         default:
             guard let kind = Self.permissionKinds[type] else {
@@ -144,20 +221,59 @@ final class ExtensionContentSettings {
 
     private func undo(_ change: Change) {
         switch change.type {
-        case "javascript", "popups":
+        case "javascript", "popups", "sound", "images":
             if change.key == "*" {
                 guard let previous = change.previous else { return }
-                var privacy = AppSettings.shared.privacy
-                if change.type == "javascript" { privacy.javaScript = previous } else { privacy.blockPopups = !previous }
-                AppSettings.shared.privacy = privacy
+                if change.type == "sound" {
+                    SiteSettings.shared.defaultSound = previous ? nil : false
+                    Self.applySoundToOpenTabs()
+                } else if change.type == "images" {
+                    SiteSettings.shared.defaultImages = previous ? nil : false
+                } else {
+                    var privacy = AppSettings.shared.privacy
+                    if change.type == "javascript" { privacy.javaScript = previous } else { privacy.blockPopups = !previous }
+                    AppSettings.shared.privacy = privacy
+                }
             } else {
                 SiteSettings.shared.update(key: change.key, incognito: change.incognito) { entry in
-                    if change.type == "javascript" { entry.javaScript = nil } else { entry.popups = nil }
+                    if change.type == "javascript" { entry.javaScript = nil }
+                    else if change.type == "popups" { entry.popups = nil }
+                    else if change.type == "sound" { entry.sound = nil }
+                    else { entry.images = nil }
                 }
+                if change.type == "sound" { Self.applySoundToOpenTabs() }
+                if change.type == "images" { SiteSettings.shared.rebuildContentRules() }
+            }
+        case "cookies":
+            if change.key == "*" {
+                let prev = change.previousString ?? "allow"
+                SiteSettings.shared.defaultCookies = prev == "allow" ? nil : prev
+            } else {
+                SiteSettings.shared.update(key: change.key, incognito: change.incognito) { $0.cookies = nil }
+                SiteSettings.shared.rebuildContentRules()
+            }
+        case "automaticDownloads":
+            if change.key == "*" {
+                let prev = change.previousString ?? "ask"
+                SiteSettings.shared.defaultAutomaticDownloads = prev == "ask" ? nil : prev
+            } else {
+                SiteSettings.shared.update(key: change.key, incognito: change.incognito) { $0.automaticDownloads = nil }
+            }
+        case "clipboard":
+            if change.key == "*" {
+                let prev = change.previousString ?? "ask"
+                SiteSettings.shared.defaultClipboard = prev == "ask" ? nil : prev
+            } else {
+                SiteSettings.shared.update(key: change.key, incognito: change.incognito) { $0.clipboard = nil }
+                SiteSettings.shared.rebuildClipboardScript()
             }
         default:
             if let kind = Self.permissionKinds[change.type] { forget(origin: change.key, kind: kind, incognito: change.incognito) }
         }
+    }
+
+    private static func applySoundToOpenTabs() {
+        for tab in BrowserState.shared.allTabs { tab.applySiteSound() }
     }
 
     private func forget(origin: String, kind: SitePermissionKind, incognito: Bool = false) {
@@ -186,15 +302,28 @@ final class ExtensionContentSettings {
 
 // MARK: - Firefox browser.theme
 
-/// Firefox's `browser.theme` on Tuff's window tint: an extension's theme colours the window
-/// (its `frame` colour) over the user's own tint and space colours, until it resets it or is
-/// turned off. Other theme keys are kept so `getCurrent` reads back what was set.
+/// Firefox's `browser.theme` on Tuff's window chrome: an extension's theme colours, background
+/// images (`theme_frame`, `headerURL`, `additional_backgrounds`), and layout properties
+/// (`additional_backgrounds_alignment`, `additional_backgrounds_tiling`, `color_scheme`) apply
+/// over the user's own tint and space colours until reset or disabled.
 @Observable
 final class ExtensionTheme {
     static let shared = ExtensionTheme()
 
+    struct BackgroundLayer: Equatable {
+        let image: NSImage
+        let alignment: String
+        let tiling: String
+    }
+
     /// The tint an extension's theme sets, if any.
     private(set) var tint: NSColor?
+    /// Header / frame background image (`images.theme_frame` / `images.headerURL`).
+    private(set) var headerImage: NSImage?
+    /// Additional layered background images with alignment & tiling properties.
+    private(set) var additionalLayers: [BackgroundLayer] = []
+    /// Preferred color scheme (`"light"`, `"dark"`, `"system"`), if set in `properties.color_scheme`.
+    private(set) var colorScheme: String?
     @ObservationIgnored private var owner: String?
     @ObservationIgnored private var theme: [String: Any]?
 
@@ -218,14 +347,46 @@ final class ExtensionTheme {
         ]
     }
 
-    func update(_ theme: [String: Any], extensionID: String) throws {
+    func update(_ theme: [String: Any], extensionID: String, resources: URL? = nil) throws {
         let colors = theme["colors"] as? [String: Any] ?? [:]
-        let value = colors["frame"] ?? colors["accentcolor"] ?? colors["toolbar"]
-        guard let value else { throw Failure("A theme needs a frame colour for Tuff to use.") }
-        guard let color = Self.color(value) else { throw Failure("Tuff can’t read the colour \(value).") }
+        let images = theme["images"] as? [String: Any] ?? [:]
+        let properties = theme["properties"] as? [String: Any] ?? [:]
+
+        let colorValue = colors["frame"] ?? colors["accentcolor"] ?? colors["toolbar"]
+        var parsedTint: NSColor?
+        if let colorValue {
+            guard let parsed = Self.color(colorValue) else {
+                throw Failure("Tuff can’t read the colour \(colorValue).")
+            }
+            parsedTint = parsed
+        }
+
+        let resDir = resources ?? ExtensionManager.shared.resourcesDirectory(forID: extensionID)
+        let headerSpec = (images["theme_frame"] as? String) ?? (images["headerURL"] as? String)
+        let parsedHeader = headerSpec.flatMap { Self.loadImage($0, resources: resDir) }
+
+        let addSpecs = images["additional_backgrounds"] as? [String] ?? []
+        let alignments = properties["additional_backgrounds_alignment"] as? [String] ?? []
+        let tilings = properties["additional_backgrounds_tiling"] as? [String] ?? []
+        var layers: [BackgroundLayer] = []
+        for (idx, spec) in addSpecs.enumerated() {
+            guard let img = Self.loadImage(spec, resources: resDir) else { continue }
+            let align = idx < alignments.count ? alignments[idx] : (alignments.last ?? "right top")
+            let tile = idx < tilings.count ? tilings[idx] : (tilings.last ?? "no-repeat")
+            layers.append(BackgroundLayer(image: img, alignment: align, tiling: tile))
+        }
+
+        let scheme = (properties["color_scheme"] as? String)?.lowercased()
+        guard parsedTint != nil || parsedHeader != nil || !layers.isEmpty || scheme != nil else {
+            throw Failure("A theme needs colours, images, or properties for Tuff to use.")
+        }
+
         owner = extensionID
         self.theme = theme
-        tint = color
+        tint = parsedTint
+        headerImage = parsedHeader
+        additionalLayers = layers
+        colorScheme = scheme
         ExtensionEventPush.shared.emit("theme.onUpdated", args: [["theme": theme]], extra: ["themeWindow": true])
     }
 
@@ -234,7 +395,32 @@ final class ExtensionTheme {
         owner = nil
         theme = nil
         tint = nil
+        headerImage = nil
+        additionalLayers = []
+        colorScheme = nil
         ExtensionEventPush.shared.emit("theme.onUpdated", args: [["theme": current()]], extra: ["themeWindow": true])
+    }
+
+    static func loadImage(_ spec: String, resources: URL?) -> NSImage? {
+        let trimmed = spec.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        if trimmed.hasPrefix("data:") {
+            guard let comma = trimmed.firstIndex(of: ",") else { return nil }
+            let meta = trimmed[..<comma]
+            let body = String(trimmed[trimmed.index(after: comma)...])
+            let data: Data?
+            if meta.contains(";base64") {
+                data = Data(base64Encoded: body, options: .ignoreUnknownCharacters)
+            } else {
+                data = body.removingPercentEncoding?.data(using: .utf8)
+            }
+            return data.flatMap(NSImage.init(data:))
+        }
+        guard let resources else { return nil }
+        let relative = trimmed.hasPrefix("/") ? String(trimmed.dropFirst()) : trimmed
+        let target = resources.appendingPathComponent(relative).standardizedFileURL
+        guard target.path.hasPrefix(resources.standardizedFileURL.path + "/") else { return nil }
+        return NSImage(contentsOf: target)
     }
 
     /// A Firefox theme colour: `#rgb`, `#rrggbb`, `rgb()` / `rgba()`, `[r, g, b]`, or a few names.

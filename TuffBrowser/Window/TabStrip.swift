@@ -83,7 +83,7 @@ private struct RegularStripTabs: View {
 
     var body: some View {
         GeometryReader { geo in
-            let tabs = space.tabs
+            let tabs = space.tabs.filter { !$0.isHidden }
             let plus = TabStrip.height + TabStrip.gap
             let room = geo.size.width - plus
             let count = CGFloat(max(tabs.count, 1))

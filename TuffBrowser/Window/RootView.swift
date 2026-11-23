@@ -366,6 +366,26 @@ struct WindowBackground: View {
                 VisualEffect(material: .underWindowBackground, blending: .behindWindow)
             }
             tint.opacity(theme.style.isOpaqueFill ? 1 : theme.tintOpacity)
+            if let header = ExtensionTheme.shared.headerImage {
+                Image(nsImage: header)
+                    .resizable()
+                    .scaledToFill()
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
+                    .clipped()
+                    .allowsHitTesting(false)
+            }
+            ForEach(Array(ExtensionTheme.shared.additionalLayers.enumerated()), id: \.offset) { _, layer in
+                if layer.tiling == "repeat" || layer.tiling == "repeat-x" || layer.tiling == "repeat-y" {
+                    Image(nsImage: layer.image)
+                        .resizable(resizingMode: .tile)
+                        .allowsHitTesting(false)
+                } else {
+                    Image(nsImage: layer.image)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: Self.themeAlignment(layer.alignment))
+                        .clipped()
+                        .allowsHitTesting(false)
+                }
+            }
             if theme.sheen > 0, theme.style != .seamless {
                 LinearGradient(
                     stops: [
@@ -385,6 +405,13 @@ struct WindowBackground: View {
             }
         }
         .ignoresSafeArea()
+    }
+
+    private static func themeAlignment(_ raw: String) -> Alignment {
+        let lower = raw.lowercased()
+        let horizontal: HorizontalAlignment = lower.contains("left") ? .leading : (lower.contains("center") ? .center : .trailing)
+        let vertical: VerticalAlignment = lower.contains("bottom") ? .bottom : (lower.contains("center") && !lower.contains("top") ? .center : .top)
+        return Alignment(horizontal: horizontal, vertical: vertical)
     }
 }
 
@@ -500,7 +527,7 @@ struct WebCard: View {
             )
             .opacity(tab == nil ? 0 : 1)
 
-            // A PDF: Tuff's own viewer, over the (empty) page WebKit holds for it.
+            // A PDF or office document: Tuff's own viewer, over the (empty) page WebKit holds for it.
             if let tab, let pdf = tab.pdf {
                 PDFViewerView(viewer: pdf)
                     .id(ObjectIdentifier(pdf))
@@ -519,7 +546,8 @@ struct WebCard: View {
                 TranslationHost(tab: tab)
             }
 
-            if state.findVisible, focused, let tab {
+            // An office document has nothing to search (Quick Look draws it).
+            if state.findVisible, focused, let tab, tab.pdf.map({ $0.format.isPDF }) ?? true {
                 Group {
                     if let pdf = tab.pdf, pdf.isReady {
                         PDFFindBar(viewer: pdf)
@@ -606,6 +634,16 @@ final class WebStackView: NSView {
     private weak var current: WKWebView?
     var focus: () -> Void = {}
 
+    /// The content viewport size of the main browser's live page host (when not split).
+    static func viewportSize(for browser: BrowserState?) -> NSSize? {
+        guard let browser, browser.visibleSplit == nil, let window = browser.window else { return nil }
+        for host in all.allObjects where host.window === window {
+            let size = host.bounds.size
+            if size.width > 0, size.height > 0 { return size }
+        }
+        return nil
+    }
+
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         wantsLayer = true
@@ -616,16 +654,26 @@ final class WebStackView: NSView {
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
+    override func setFrameSize(_ newSize: NSSize) {
+        super.setFrameSize(newSize)
+        guard window === BrowserState.shared.window, newSize.width > 0, newSize.height > 0,
+              BrowserState.shared.visibleSplit == nil else { return }
+        ExtensionDebugger.shared.updateViewportSize(newSize)
+    }
+
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         guard window == nil, let webView = current, webView.superview === self else { return }
         // Leaving with the page: hand it to a host that is still meant to show it (one that
         // stood back for this one, see `takenBySibling`). After the removal has finished.
         DispatchQueue.main.async { [weak webView] in
-            guard let webView, webView.window == nil,
-                  let host = Self.all.allObjects.first(where: { $0.window != nil && $0.current === webView }) else { return }
-            host.current = nil
-            host.show(webView, animated: false)
+            guard let webView, webView.window == nil else { return }
+            if let host = Self.all.allObjects.first(where: { $0.window != nil && $0.current === webView }) {
+                host.current = nil
+                host.show(webView, animated: false)
+            } else if ExtensionDebugger.shared.needsBackgroundHost(webView) {
+                ExtensionDebugger.shared.hostInBackground(webView)
+            }
         }
     }
 
@@ -640,15 +688,23 @@ final class WebStackView: NSView {
         current = webView
 
         guard let webView else {
-            old?.removeFromSuperview()
+            if let old { detachOutgoing(old) }
             return
         }
-        webView.frame = bounds
-        webView.autoresizingMask = [.width, .height]
-        webView.appearance = NSApp.effectiveAppearance
-        let fade = animated && old != nil && window != nil
-        webView.alphaValue = fade ? 0 : 1
-        addSubview(webView, positioned: .above, relativeTo: nil)
+        // A debugger-attached tab leaving the screen moves straight to its off-screen backing
+        // window so it never blurs or races with incoming CDP input during a cross-fade.
+        let outgoingNeedsHost = subviews.contains { sub in
+            sub !== webView && (sub as? WKWebView).map { ExtensionDebugger.shared.needsBackgroundHost($0) } == true
+        }
+        let fade = animated && old != nil && window != nil && !outgoingNeedsHost
+        ExtensionDebugger.shared.returningToScreen(webView) {
+            webView.frame = bounds
+            webView.autoresizingMask = [.width, .height]
+            webView.appearance = NSApp.effectiveAppearance
+            webView.isHidden = false
+            webView.alphaValue = fade ? 0 : 1
+            addSubview(webView, positioned: .above, relativeTo: nil)
+        }
 
         if fade {
             NSAnimationContext.runAnimationGroup { context in
@@ -658,13 +714,21 @@ final class WebStackView: NSView {
             } completionHandler: { [weak self] in
                 guard let self else { return }
                 // Remove everything except what is showing now (the selection may have moved on).
-                for sub in self.subviews where sub !== self.current { sub.removeFromSuperview() }
+                for sub in self.subviews where sub !== self.current { self.detachOutgoing(sub) }
                 self.current?.alphaValue = 1
             }
         } else {
-            for sub in subviews where sub !== webView { sub.removeFromSuperview() }
+            for sub in subviews where sub !== webView { detachOutgoing(sub) }
         }
         focus()
+    }
+
+    private func detachOutgoing(_ view: NSView) {
+        if let webView = view as? WKWebView, ExtensionDebugger.shared.needsBackgroundHost(webView) {
+            ExtensionDebugger.shared.hostInBackground(webView, viewportSize: bounds.size)
+        } else {
+            view.removeFromSuperview()
+        }
     }
 }
 

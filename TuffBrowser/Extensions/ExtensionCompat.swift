@@ -434,13 +434,12 @@ enum ExtensionCompat {
           MAX_NUMBER_OF_REGEX_RULES: constant(1000),
           MAX_NUMBER_OF_STATIC_RULESETS: constant(100),
           MAX_NUMBER_OF_ENABLED_STATIC_RULESETS: constant(50),
+          MAX_NUMBER_OF_DISABLED_STATIC_RULES: constant(5000),
           GUARANTEED_MINIMUM_STATIC_RULES: constant(30000),
           GETMATCHEDRULES_QUOTA_INTERVAL: constant(10),
           MAX_GETMATCHEDRULES_CALLS_PER_INTERVAL: constant(20),
           DYNAMIC_RULESET_ID: constant('_dynamic'),
           SESSION_RULESET_ID: constant('_session'),
-          // Rule testers call this; WebKit can't say which rules would match, so: none.
-          testMatchOutcome: () => answer({ matchedRules: [] }),
         },
         // Legacy (MV2) and synchronous: the extension's own open pages. Never more than none
         // that the caller could script directly in WebKit, so an empty list.
@@ -537,6 +536,87 @@ enum ExtensionCompat {
           return sendMessage(...args);
         });
         pins.push(tabs);
+      }
+
+      // Chrome's first messaging API (Manifest V2, long deprecated, still used by old extensions):
+      // extension.sendRequest / onRequest and tabs.sendRequest. They are runtime messages kept
+      // apart from onMessage's, so requests travel wrapped and only onRequest listeners unwrap them.
+      // Content scripts use them too, so this isn't limited to extension pages.
+      for (const { root } of roots) {
+        let runtime;
+        try { runtime = root.runtime; } catch (e) { continue; }
+        if (!runtime || typeof runtime.sendMessage !== 'function' || !runtime.onMessage) continue;
+        let extension;
+        try { extension = root.extension; } catch (e) {}
+        if (!extension || typeof extension !== 'object') {
+          extension = {};
+          add(root, 'extension', extension);
+        }
+        const isRequest = (message) => !!message && typeof message === 'object' && Object.prototype.hasOwnProperty.call(message, '__tuffRequest');
+        // The callback gets the response, or nothing when there's no listener.
+        const answered = (promise, callback) => {
+          const settle = (value) => { if (typeof callback === 'function') { try { callback(value); } catch (e) {} } };
+          promise.then(settle, () => settle(undefined));
+        };
+        const requestEvent = (source) => {
+          const wrappers = new Map();
+          return {
+            addListener: (fn) => {
+              if (typeof fn !== 'function' || wrappers.has(fn) || !source) return;
+              // Old listeners could answer whenever they liked, so one that takes sendResponse keeps
+              // the channel open.
+              const wrapper = (message, sender, sendResponse) => {
+                if (!isRequest(message)) return undefined;
+                return fn(message.__tuffRequest, sender, sendResponse) === true || fn.length >= 3;
+              };
+              wrappers.set(fn, wrapper);
+              source.addListener(wrapper);
+            },
+            removeListener: (fn) => {
+              const wrapper = wrappers.get(fn);
+              if (!wrapper) return;
+              wrappers.delete(fn);
+              source.removeListener(wrapper);
+            },
+            hasListener: (fn) => wrappers.has(fn),
+            hasListeners: () => wrappers.size > 0,
+          };
+        };
+        if (absent(extension, 'sendRequest')) {
+          add(extension, 'sendRequest', (...args) => {
+            const callback = args.length && typeof args[args.length - 1] === 'function' ? args.pop() : undefined;
+            // sendRequest(extensionId, request) is meant for another extension's onRequestExternal (WebKit refuses such messages for now).
+            const promise = args.length >= 2 && typeof args[0] === 'string'
+              ? runtime.sendMessage(args[0], { __tuffRequest: args[1] })
+              : runtime.sendMessage({ __tuffRequest: args[0] });
+            answered(Promise.resolve(promise), callback);
+          });
+        }
+        if (absent(extension, 'onRequest')) add(extension, 'onRequest', requestEvent(runtime.onMessage));
+        let external;
+        try { external = runtime.onMessageExternal; } catch (e) {}
+        if (external && typeof external.addListener === 'function' && absent(extension, 'onRequestExternal')) {
+          add(extension, 'onRequestExternal', requestEvent(external));
+        }
+        let tabs;
+        try { tabs = root.tabs; } catch (e) {}
+        if (tabs && typeof tabs.sendMessage === 'function' && !embedded) {
+          if (absent(tabs, 'sendRequest')) {
+            add(tabs, 'sendRequest', (tabId, request, callback) => answered(Promise.resolve(tabs.sendMessage(tabId, { __tuffRequest: request })), callback));
+          }
+          if (absent(tabs, 'getAllInWindow')) {
+            add(tabs, 'getAllInWindow', (windowId, callback) => {
+              if (typeof windowId === 'function') { callback = windowId; windowId = undefined; }
+              const query = typeof windowId === 'number' && windowId >= 0 ? { windowId: windowId } : { currentWindow: true };
+              const promise = Promise.resolve(tabs.query(query));
+              if (typeof callback !== 'function') return promise;
+              promise.then((list) => { try { callback(list); } catch (e) {} }, () => { try { callback([]); } catch (e) {} });
+              return undefined;
+            });
+          }
+          pins.push(tabs);
+        }
+        pins.push(extension, runtime);
       }
 
       // WebKit's webRequest reports every document load as `main_frame`, iframes included (an
@@ -859,10 +939,10 @@ enum ExtensionCompat {
       if (privileged && !embedded) {
         const nativePermissionNames = new Set([
           'topSites', 'history', 'browsingData', 'management', 'sessions', 'notifications', 'offscreen',
-          'identity', 'downloads', 'system.cpu', 'system.memory', 'system.storage', 'power', 'idle', 'tts',
+          'identity', 'downloads', 'system.cpu', 'system.memory', 'system.storage', 'power', 'idle', 'tts', 'ttsEngine',
           'search', 'userScripts', 'tabGroups', 'contextualIdentities', 'contentSettings', 'find', 'omnibox',
-          'theme', 'privacy', 'proxy', 'fontSettings', 'browserSettings', 'bookmarks', 'declarativeContent',
-          'system.display',
+          'theme', 'privacy', 'proxy', 'fontSettings', 'browserSettings', 'bookmarks', 'readingList', 'declarativeContent',
+          'captivePortal', 'system.display', 'dns', 'pageCapture', 'debugger', 'webAuthenticationProxy', 'tabHide',
         ]);
         for (const { root, label } of roots) {
           let tabs;
@@ -991,6 +1071,39 @@ enum ExtensionCompat {
               const request = msg.suggest;
               args.push((results) => { call('omnibox', 'suggest', { request, suggestions: results || [] }).catch(() => {}); });
             }
+            // ttsEngine.onSpeak: the listener's sendTtsEvent(event) callback.
+            if (msg.ttsRequestId !== undefined) {
+              const requestId = msg.ttsRequestId;
+              args.push((ev) => { call('ttsEngine', 'sendTtsEvent', { requestId, event: ev || {} }).catch(() => {}); });
+            }
+            // User script messaging: resolve sender.tab from tab index.
+            if (typeof msg.senderTabIndex === 'number') {
+              const sender = msg.__tuffEvent === 'runtime.__userScriptConnect' ? args[2] : args[1];
+              if (sender && typeof sender === 'object') {
+                try {
+                  const all = await root.tabs.query({});
+                  const tab = all.find((t) => t.index === msg.senderTabIndex);
+                  if (tab) sender.tab = tab;
+                } catch (e) {}
+              }
+            }
+            if (msg.userScriptReply !== undefined) {
+              args.push(msg.userScriptReply);
+            }
+            if (msg.filenameRequest !== undefined) {
+              args.push(msg.filenameRequest);
+            }
+            if (msg.proxyRequestId !== undefined) {
+              args.push(msg.proxyRequestId);
+            }
+            if (typeof msg.menuTabIndex === 'number') {
+              let tab;
+              try {
+                const all = await root.tabs.query({});
+                tab = all.find((t) => t.index === msg.menuTabIndex);
+              } catch (e) {}
+              args.push(tab);
+            }
             return args;
           };
           const seenDeliveries = new Set();
@@ -1072,6 +1185,7 @@ enum ExtensionCompat {
             setEnabled: api((id, enabled) => call('management', 'setEnabled', { id: id, enabled: enabled })),
             uninstall: api((id) => call('management', 'uninstall', { id: id })),
             uninstallSelf: api((options) => call('management', 'uninstallSelf', options || {})),
+            install: api((options) => call('management', 'install', options || {})),
             onInstalled: event('management.onInstalled'),
             onUninstalled: event('management.onUninstalled'),
             onEnabled: event('management.onEnabled'),
@@ -1081,6 +1195,17 @@ enum ExtensionCompat {
             getRecentlyClosed: api((filter) => call('sessions', 'getRecentlyClosed', filter)),
             restore: api((sessionId) => call('sessions', 'restore', { sessionId: sessionId })),
             getDevices: api((filter) => call('sessions', 'getDevices', filter)),
+            forgetClosedTab: api((windowId, sessionId) => call('sessions', 'forgetClosedTab', { sessionId: sessionId })),
+            forgetClosedWindow: api((sessionId) => call('sessions', 'forgetClosedWindow', { sessionId: sessionId })),
+            // Firefox's values kept with a tab or the window (ExtensionSessionValues); stored as JSON.
+            getTabValue: api(async (tabId, key) => call('sessions', 'getValue', { tabIndex: await indexOf(tabId), key: key })),
+            setTabValue: api(async (tabId, key, value) =>
+              call('sessions', 'setValue', { tabIndex: await indexOf(tabId), key: key, value: JSON.parse(JSON.stringify(value === undefined ? null : value)) })),
+            removeTabValue: api(async (tabId, key) => call('sessions', 'removeValue', { tabIndex: await indexOf(tabId), key: key })),
+            getWindowValue: api((windowId, key) => call('sessions', 'getValue', { key: key })),
+            setWindowValue: api((windowId, key, value) =>
+              call('sessions', 'setValue', { key: key, value: JSON.parse(JSON.stringify(value === undefined ? null : value)) })),
+            removeWindowValue: api((windowId, key) => call('sessions', 'removeValue', { key: key })),
             onChanged: event('sessions.onChanged'),
             MAX_SESSION_RESULTS: 25,
           });
@@ -1122,6 +1247,58 @@ enum ExtensionCompat {
             launchWebAuthFlow: api((details) => call('identity', 'launchWebAuthFlow', details)),
             onSignInChanged: event('identity.onSignInChanged'),
           });
+          const determiningListeners = new Set();
+          const determiningSource = event('downloads.onDeterminingFilename');
+          const onDeterminingRaw = (item, requestId) => {
+            if (!determiningListeners.size) {
+              call('downloads', 'suggestFilename', { requestId }).catch(() => {});
+              return;
+            }
+            let suggestion = null;
+            let pendingAsync = 0;
+            let sent = false;
+            const flush = () => {
+              if (sent || pendingAsync > 0) return;
+              sent = true;
+              const payload = { requestId };
+              if (suggestion && typeof suggestion === 'object') {
+                if (typeof suggestion.filename === 'string') payload.filename = suggestion.filename;
+                if (typeof suggestion.conflictAction === 'string') payload.conflictAction = suggestion.conflictAction;
+              }
+              call('downloads', 'suggestFilename', payload).catch(() => {});
+            };
+            for (const fn of [...determiningListeners]) {
+              let called = false;
+              let isAsync = false;
+              const suggest = (s) => {
+                if (called) return;
+                called = true;
+                if (s && typeof s === 'object') suggestion = s;
+                if (isAsync) { pendingAsync = Math.max(0, pendingAsync - 1); flush(); }
+              };
+              try {
+                if (fn(item, suggest) === true && !called) {
+                  isAsync = true;
+                  pendingAsync += 1;
+                }
+              } catch (e) {}
+            }
+            flush();
+          };
+          const onDeterminingFilename = {
+            addListener: (fn) => {
+              if (typeof fn !== 'function') return;
+              const first = determiningListeners.size === 0;
+              determiningListeners.add(fn);
+              if (first) determiningSource.addListener(onDeterminingRaw);
+            },
+            removeListener: (fn) => {
+              determiningListeners.delete(fn);
+              if (determiningListeners.size === 0) determiningSource.removeListener(onDeterminingRaw);
+            },
+            hasListener: (fn) => determiningListeners.has(fn),
+            hasListeners: () => determiningListeners.size > 0,
+          };
           implement('downloads', {
             download: api((options) => call('downloads', 'download', options)),
             search: api((query) => call('downloads', 'search', query)),
@@ -1138,20 +1315,33 @@ enum ExtensionCompat {
             acceptDanger: api(() => undefined),
             setShelfEnabled: api(() => undefined),
             setUiOptions: api(() => undefined),
-            drag: () => undefined,
+            drag: (id) => { call('downloads', 'drag', { id: id }).catch(() => {}); return undefined; },
             onCreated: event('downloads.onCreated'),
             onChanged: event('downloads.onChanged'),
             onErased: event('downloads.onErased'),
+            onDeterminingFilename: onDeterminingFilename,
           });
           implement('system', {
             display: {
               getInfo: api(() => call('system.display', 'getInfo', {})),
-              getDisplayLayout: api(() => []),
-              onDisplayChanged: stub(label + '.system.display.onDisplayChanged', true),
+              getDisplayLayout: api(() => call('system.display', 'getDisplayLayout', {})),
+              onDisplayChanged: event('system.display.onDisplayChanged'),
             },
             cpu: { getInfo: api(() => call('system.cpu', 'getInfo', {})) },
             memory: { getInfo: api(() => call('system.memory', 'getInfo', {})) },
-            storage: { getInfo: api(() => call('system.storage', 'getInfo', {})) },
+            storage: {
+              getInfo: api(() => call('system.storage', 'getInfo', {})),
+              getAvailableCapacity: api((id) => call('system.storage', 'getAvailableCapacity', { id: String(id) })),
+              ejectDevice: api((id) => call('system.storage', 'ejectDevice', { id: String(id) })),
+              onAttached: event('system.storage.onAttached'),
+              onDetached: event('system.storage.onDetached'),
+            },
+          });
+          // Firefox browser.dns.
+          implement('dns', {
+            resolve: api((hostname, flags) => call('dns', 'resolve', {
+              hostname: String(hostname || ''), flags: Array.isArray(flags) ? flags : (flags ? [String(flags)] : []),
+            })),
           });
           implement('power', {
             requestKeepAwake: api((level) => call('power', 'requestKeepAwake', { level: level })),
@@ -1162,15 +1352,60 @@ enum ExtensionCompat {
             setDetectionInterval: api((interval) => call('idle', 'setDetectionInterval', { intervalInSeconds: interval })),
             onStateChanged: event('idle.onStateChanged'),
           });
+          const ttsOnEvent = event('tts.onEvent');
+          const ttsCallbacks = new Map();
+          let ttsListening = false;
+          const ensureTtsForwarder = () => {
+            if (ttsListening) return;
+            ttsListening = true;
+            ttsOnEvent.addListener((ev) => {
+              if (!ev || !ev.utteranceId) return;
+              const fn = ttsCallbacks.get(String(ev.utteranceId));
+              if (!fn) return;
+              if (ev.type === 'end' || ev.type === 'interrupted' || ev.type === 'cancelled' || ev.type === 'error') {
+                ttsCallbacks.delete(String(ev.utteranceId));
+              }
+              try { fn(ev); } catch (e) {}
+            });
+          };
           implement('tts', {
-            speak: api((utterance, options) => call('tts', 'speak', Object.assign({}, options, { utterance: utterance }))),
+            speak: api(async (utterance, options) => {
+              const opts = Object.assign({}, options, { utterance: utterance });
+              const onEvent = opts.onEvent;
+              delete opts.onEvent;
+              if (typeof onEvent === 'function') ensureTtsForwarder();
+              const id = await call('tts', 'speak', opts);
+              if (typeof onEvent === 'function' && id !== undefined) ttsCallbacks.set(String(id), onEvent);
+              return undefined;
+            }),
             stop: api(() => call('tts', 'stop', {})),
             pause: api(() => call('tts', 'pause', {})),
             resume: api(() => call('tts', 'resume', {})),
             isSpeaking: api(() => call('tts', 'isSpeaking', {})),
             getVoices: api(() => call('tts', 'getVoices', {})),
-            onEvent: event('tts.onEvent'),
-            onVoicesChanged: stub(label + '.tts.onVoicesChanged', true),
+            onEvent: ttsOnEvent,
+            onVoicesChanged: event('tts.onVoicesChanged'),
+          });
+          implement('ttsEngine', {
+            updateVoices: api((voices) => call('ttsEngine', 'updateVoices', { voices: Array.isArray(voices) ? voices : [] })),
+            sendTtsEvent: api((requestId, ev) => call('ttsEngine', 'sendTtsEvent', { requestId: requestId, event: ev || {} })),
+            onSpeak: event('ttsEngine.onSpeak'),
+            onStop: event('ttsEngine.onStop'),
+            onPause: event('ttsEngine.onPause'),
+            onResume: event('ttsEngine.onResume'),
+          });
+          // Firefox browser.captivePortal.
+          implement('captivePortal', {
+            getState: api(() => call('captivePortal', 'getState', {})),
+            getLastChecked: api(() => call('captivePortal', 'getLastChecked', {})),
+            onStateChanged: event('captivePortal.onStateChanged'),
+            onConnectivityAvailable: event('captivePortal.onConnectivityAvailable'),
+            canonicalURL: {
+              get: api(() => ({ value: 'http://captive.apple.com/hotspot-detect.html', levelOfControl: 'not_controllable' })),
+              set: api(() => { throw new Error('captivePortal.canonicalURL is read-only.'); }),
+              clear: api(() => { throw new Error('captivePortal.canonicalURL is read-only.'); }),
+              onChange: stub(label + '.captivePortal.canonicalURL.onChange', true),
+            },
           });
           implement('search', {
             query: api((query) => call('search', 'query', query)),
@@ -1193,6 +1428,10 @@ enum ExtensionCompat {
             const manifest = root.runtime.getManifest() || {};
             declared = [].concat(manifest.permissions || [], manifest.optional_permissions || []);
           } catch (e) {}
+          // Tuff's events reach every page of the extension, so what Tuff asks the extension itself
+          // to do is done by its background alone (the service worker, or a Manifest V2 page).
+          let isBackground = typeof ServiceWorkerGlobalScope !== 'undefined' && scope instanceof ServiceWorkerGlobalScope;
+          try { isBackground = isBackground || root.extension.getBackgroundPage() === scope; } catch (e) {}
           // An event made of several others, each listener's argument reshaped.
           const mappedEvent = (sources, transform) => {
             const wrappers = new Map();
@@ -1251,10 +1490,41 @@ enum ExtensionCompat {
               add(t, 'ungroup', api(async (tabIds) => call('tabs', 'ungroup', { tabs: await indexesOf(tabIds) })));
             }
             if (absent(t, 'TAB_ID_NONE')) add(t, 'TAB_ID_NONE', -1);
+            if (absent(t, 'hide')) {
+              add(t, 'hide', api(async (tabIds) => {
+                const list = Array.isArray(tabIds) ? tabIds : [tabIds];
+                const all = (await t.query({})) || [];
+                const idByIndex = new Map(all.map((tab) => [tab.index, tab.id]));
+                const indexes = list.map((id) => {
+                  const found = all.find((tab) => tab.id === id);
+                  return found ? found.index : -1;
+                }).filter((i) => i >= 0);
+                const hidden = (await call('tabs', 'hide', { tabs: indexes })) || [];
+                return hidden.map((idx) => idByIndex.get(idx)).filter((id) => typeof id === 'number');
+              }));
+            }
+            if (absent(t, 'show')) {
+              add(t, 'show', api(async (tabIds) => {
+                const indexes = await indexesOf(tabIds);
+                return call('tabs', 'show', { tabs: indexes });
+              }));
+            }
+            if (absent(t, 'moveInSuccession')) {
+              add(t, 'moveInSuccession', api(async (tabIds, tabId, options) => {
+                const indexes = await indexesOf(tabIds || []);
+                let targetIndex = null;
+                if (typeof tabId === 'number' && tabId >= 0) targetIndex = await indexOf(tabId);
+                const opts = options && typeof options === 'object' ? options : {};
+                return call('tabs', 'moveInSuccession', {
+                  tabs: indexes, targetIndex: targetIndex, append: !!opts.append, insert: !!opts.insert,
+                });
+              }));
+            }
             const wantsGroups = declared.includes('tabGroups');
             const wantsContainers = declared.includes('contextualIdentities');
+            const wantsHide = declared.includes('tabHide');
             const query = t.query, get = t.get, createTab = t.create;
-            if ((wantsGroups || wantsContainers) && typeof query === 'function' && typeof get === 'function') {
+            if ((wantsGroups || wantsContainers || wantsHide) && typeof query === 'function' && typeof get === 'function') {
               const decorate = async (list) => {
                 let extras = {};
                 try { extras = (await call('tabs', 'extras', {})) || {}; } catch (e) {}
@@ -1262,17 +1532,20 @@ enum ExtensionCompat {
                   if (!tab || typeof tab.index !== 'number') continue;
                   if (wantsGroups) { const g = (extras.groupIds || [])[tab.index]; tab.groupId = typeof g === 'number' ? g : -1; }
                   if (wantsContainers) tab.cookieStoreId = (extras.cookieStoreIds || [])[tab.index] || 'firefox-default';
+                  if (wantsHide) tab.hidden = !!(extras.hidden || [])[tab.index];
                 }
                 return list;
               };
               add(t, 'query', api(async (queryInfo) => {
                 const q = Object.assign({}, queryInfo);
-                const groupId = q.groupId, cookieStoreId = q.cookieStoreId;
+                const groupId = q.groupId, cookieStoreId = q.cookieStoreId, hidden = q.hidden;
                 delete q.groupId;
                 delete q.cookieStoreId;
+                delete q.hidden;
                 let list = await decorate((await query.call(t, q)) || []);
                 if (groupId !== undefined) list = list.filter((tab) => tab.groupId === groupId);
                 if (cookieStoreId !== undefined) list = list.filter((tab) => tab.cookieStoreId === cookieStoreId);
+                if (typeof hidden === 'boolean') list = list.filter((tab) => !!tab.hidden === hidden);
                 return list;
               }));
               add(t, 'get', api(async (tabId) => (await decorate([await get.call(t, tabId)]))[0]));
@@ -1300,7 +1573,7 @@ enum ExtensionCompat {
             create: api((details) => call('contextualIdentities', 'create', details || {})),
             update: api((cookieStoreId, details) => call('contextualIdentities', 'update', { cookieStoreId: cookieStoreId, details: details || {} })),
             remove: api((cookieStoreId) => call('contextualIdentities', 'remove', { cookieStoreId: cookieStoreId })),
-            move: api(() => undefined),
+            move: api((cookieStoreIds, position) => call('contextualIdentities', 'move', { cookieStoreIds: cookieStoreIds, position: position })),
             onCreated: event('contextualIdentities.onCreated'),
             onUpdated: event('contextualIdentities.onUpdated'),
             onRemoved: event('contextualIdentities.onRemoved'),
@@ -1332,12 +1605,80 @@ enum ExtensionCompat {
               DEFAULT_PUBLIC_INTERFACE_ONLY: 'default_public_interface_only', DISABLE_NON_PROXIED_UDP: 'disable_non_proxied_udp',
             },
           });
+          const proxyOnRequestListeners = new Map();
+          const proxyOnRequestSource = event('proxy.onRequest');
+          const handleProxyOnRequest = (details, requestId) => {
+            if (!proxyOnRequestListeners.size) {
+              call('proxy', 'replyOnRequest', { requestId, result: null }).catch(() => {});
+              return;
+            }
+            let settled = false;
+            const reply = (result, error) => {
+              if (settled) return;
+              settled = true;
+              const payload = { requestId };
+              if (error) payload.error = String(error);
+              else payload.result = result === undefined ? null : result;
+              call('proxy', 'replyOnRequest', payload).catch(() => {});
+            };
+            for (const [fn] of [...proxyOnRequestListeners]) {
+              try {
+                const out = fn(details);
+                if (out && typeof out.then === 'function') {
+                  out.then((v) => reply(v), (err) => reply(null, (err && err.message) || err));
+                  return;
+                }
+                if (out !== undefined) {
+                  reply(out);
+                  return;
+                }
+              } catch (err) {
+                reply(null, (err && err.message) || err);
+                return;
+              }
+            }
+            reply(null);
+          };
+          const syncProxyOnRequest = () => {
+            if (!proxyOnRequestListeners.size) {
+              proxyOnRequestSource.removeListener(handleProxyOnRequest);
+              call('proxy', 'unregisterOnRequest', {}).catch(() => {});
+              return;
+            }
+            const urls = [];
+            for (const filter of proxyOnRequestListeners.values()) {
+              if (filter && Array.isArray(filter.urls)) urls.push(...filter.urls);
+            }
+            proxyOnRequestSource.addListener(handleProxyOnRequest);
+            call('proxy', 'registerOnRequest', { urls }).catch(() => {});
+          };
+          const proxyOnRequest = {
+            addListener: (fn, filter) => {
+              if (typeof fn !== 'function') return;
+              proxyOnRequestListeners.set(fn, filter && typeof filter === 'object' ? filter : {});
+              syncProxyOnRequest();
+            },
+            removeListener: (fn) => {
+              if (!proxyOnRequestListeners.delete(fn)) return;
+              syncProxyOnRequest();
+            },
+            hasListener: (fn) => proxyOnRequestListeners.has(fn),
+            hasListeners: () => proxyOnRequestListeners.size > 0,
+          };
           implement('proxy', {
             settings: setting('proxy.settings'),
+            onRequest: proxyOnRequest,
             onProxyError: event('proxy.onProxyError'),
             onError: event('proxy.onError'),
             Mode: { DIRECT: 'direct', AUTO_DETECT: 'auto_detect', PAC_SCRIPT: 'pac_script', FIXED_SERVERS: 'fixed_servers', SYSTEM: 'system' },
             Scheme: { HTTP: 'http', HTTPS: 'https', QUIC: 'quic', SOCKS4: 'socks4', SOCKS5: 'socks5' },
+          });
+          // Firefox browser.pkcs11.
+          implement('pkcs11', {
+            installModule: api((name, flags) => call('pkcs11', 'installModule', { name: String(name || ''), flags: typeof flags === 'number' ? flags : 0 })),
+            uninstallModule: api((name) => call('pkcs11', 'uninstallModule', { name: String(name || '') })),
+            isModuleInstalled: api((name) => call('pkcs11', 'isModuleInstalled', { name: String(name || '') })),
+            getModuleSlots: api((name) => call('pkcs11', 'getModuleSlots', { name: String(name || '') })),
           });
           implement('browserSettings', settingsIn('browserSettings', ['allowPopupsForUserEvents', 'cacheEnabled',
             'closeTabsByDoubleClick', 'contextMenuShowEvent', 'ftpProtocolEnabled', 'homepageOverride', 'imageAnimationBehavior',
@@ -1414,6 +1755,57 @@ enum ExtensionCompat {
             setImageData: api((imageData, imageType) => call('clipboard', 'setImageData', { data: toBase64(imageData), imageType: imageType })),
           });
 
+          // chrome.pageCapture: Tuff builds the MHTML from the page's Web Archive (ExtensionPageCapture).
+          implement('pageCapture', {
+            saveAsMHTML: api(async (details) => {
+              const tabId = details && details.tabId;
+              if (typeof tabId !== 'number') throw new Error('pageCapture.saveAsMHTML needs a tabId.');
+              const text = await call('pageCapture', 'saveAsMHTML', { tabIndex: await indexOf(tabId) });
+              return new Blob([text], { type: 'multipart/related' });
+            }),
+          });
+
+          // chrome.debugger: Tuff answers the DevTools protocol commands extensions drive pages with
+          // (ExtensionDebugger). Tabs only. Tuff keeps sessions by the extension's tab id, which
+          // its events carry back.
+          const debuggee = async (target) => {
+            if (!target || typeof target !== 'object') throw new Error('A debuggee target is required.');
+            if (typeof target.tabId === 'number') return { tabId: target.tabId };
+            if (typeof target.targetId === 'string') {
+              const found = ((await call('debugger', 'getTargets', {})) || []).find((t) => t.id === target.targetId);
+              if (!found) throw new Error('No target with given id found');
+              const tab = ((await root.tabs.query({})) || []).find((t) => t.index === found.tabIndex);
+              if (tab) return { tabId: tab.id };
+            }
+            throw new Error('Tuff can only debug tabs.');
+          };
+          implement('debugger', {
+            attach: api(async (target, requiredVersion) => {
+              const t = await debuggee(target);
+              let tabIndex;
+              try { tabIndex = await indexOf(t.tabId); } catch (e) { throw new Error('No tab with given id ' + t.tabId + '.'); }
+              return call('debugger', 'attach', { tabId: t.tabId, tabIndex: tabIndex, version: requiredVersion });
+            }),
+            detach: api(async (target) => call('debugger', 'detach', await debuggee(target))),
+            sendCommand: api(async (target, method, commandParams) =>
+              call('debugger', 'sendCommand', Object.assign(await debuggee(target), { method: method, params: commandParams || {} }))),
+            getTargets: api(async () => {
+              const list = (await call('debugger', 'getTargets', {})) || [];
+              let tabs = [];
+              try { tabs = (await root.tabs.query({})) || []; } catch (e) {}
+              return list.map((t) => {
+                const tab = tabs.find((x) => x.index === t.tabIndex);
+                const info = Object.assign({}, t, { tabId: tab ? tab.id : undefined });
+                delete info.tabIndex;
+                return info;
+              });
+            }),
+            onEvent: event('debugger.onEvent'),
+            onDetach: event('debugger.onDetach'),
+            DetachReason: { CANCELED_BY_USER: 'canceled_by_user', TARGET_CLOSED: 'target_closed' },
+            TargetInfoType: { PAGE: 'page', BACKGROUND_PAGE: 'background_page', WORKER: 'worker', OTHER: 'other' },
+          });
+
           // Firefox browser.find.
           const withTab = async (options) => {
             const o = Object.assign({}, options);
@@ -1456,11 +1848,22 @@ enum ExtensionCompat {
             onRemoved: event('bookmarks.onRemoved'),
             onChanged: event('bookmarks.onChanged'),
             onMoved: event('bookmarks.onMoved'),
-            onChildrenReordered: stub(label + '.bookmarks.onChildrenReordered', true),
-            onImportBegan: stub(label + '.bookmarks.onImportBegan', true),
-            onImportEnded: stub(label + '.bookmarks.onImportEnded', true),
+            onChildrenReordered: event('bookmarks.onChildrenReordered'),
+            onImportBegan: event('bookmarks.onImportBegan'),
+            onImportEnded: event('bookmarks.onImportEnded'),
             MAX_WRITE_OPERATIONS_PER_HOUR: 1000000,
             MAX_SUSTAINED_WRITE_OPERATIONS_PER_MINUTE: 1000000,
+          });
+
+          // chrome.readingList (ExtensionReadingList).
+          implement('readingList', {
+            addEntry: api((entry) => call('readingList', 'addEntry', entry || {})),
+            removeEntry: api((info) => call('readingList', 'removeEntry', info || {})),
+            updateEntry: api((info) => call('readingList', 'updateEntry', info || {})),
+            query: api((info) => call('readingList', 'query', info || {})),
+            onEntryAdded: event('readingList.onEntryAdded'),
+            onEntryRemoved: event('readingList.onEntryRemoved'),
+            onEntryUpdated: event('readingList.onEntryUpdated'),
           });
 
           // chrome.declarativeContent: Tuff keeps the rules and checks each page against them
@@ -1470,8 +1873,24 @@ enum ExtensionCompat {
             Object.assign(this, options || {});
             this.instanceType = 'declarativeContent.' + name;
           };
-          // Icons are left out: Tuff doesn't apply SetIcon, and ImageData doesn't travel well.
-          const plainRules = (rules) => JSON.parse(JSON.stringify(rules || [], (key, value) => key === 'imageData' ? undefined : value));
+          // SetIcon's ImageData travels as plain pixels (base64) and is made into ImageData again here.
+          const isImageData = (value) => typeof ImageData !== 'undefined' && value instanceof ImageData;
+          const plainRules = (rules) => JSON.parse(JSON.stringify(rules || [], (key, value) => isImageData(value)
+            ? { __tuffImage: true, width: value.width, height: value.height, data: toBase64(value.data.buffer) } : value));
+          const toImageData = (p) => {
+            const text = atob(p.data);
+            const bytes = new Uint8ClampedArray(text.length);
+            for (let i = 0; i < text.length; i++) bytes[i] = text.charCodeAt(i);
+            return new ImageData(bytes, p.width, p.height);
+          };
+          const revive = (value) => {
+            if (!value || typeof value !== 'object') return value;
+            if (value.__tuffImage) { try { return toImageData(value); } catch (e) { return undefined; } }
+            if (Array.isArray(value)) return value.map(revive);
+            const copy = {};
+            for (const key of Object.keys(value)) copy[key] = revive(value[key]);
+            return copy;
+          };
           implement('declarativeContent', {
             PageStateMatcher: declarative('PageStateMatcher'),
             ShowAction: declarative('ShowAction'),
@@ -1479,21 +1898,45 @@ enum ExtensionCompat {
             SetIcon: declarative('SetIcon'),
             RequestContentScript: declarative('RequestContentScript'),
             onPageChanged: {
-              addRules: api((rules) => call('declarativeContent', 'addRules', { rules: plainRules(rules) })),
+              addRules: api(async (rules) => revive(await call('declarativeContent', 'addRules', { rules: plainRules(rules) }))),
               removeRules: api((ids) => call('declarativeContent', 'removeRules', { ids: Array.isArray(ids) ? ids : undefined })),
-              getRules: api((ids) => call('declarativeContent', 'getRules', { ids: Array.isArray(ids) ? ids : undefined })),
+              getRules: api(async (ids) => revive(await call('declarativeContent', 'getRules', { ids: Array.isArray(ids) ? ids : undefined }))),
               addListener: () => undefined, removeListener: () => undefined, hasListener: () => false, hasListeners: () => false,
             },
           });
-          if (declared.includes('declarativeContent')) {
+          if (declared.includes('declarativeContent') && isBackground) {
+            const quietly = (result) => { if (result && result.catch) result.catch(() => {}); };
+            // RequestContentScript: the files, once the page has loaded.
+            const runScripts = async (tabId, script) => {
+              const css = Array.isArray(script.css) ? script.css : [], js = Array.isArray(script.js) ? script.js : [];
+              let scripting, tabs;
+              try { scripting = root.scripting; tabs = root.tabs; } catch (e) {}
+              if (scripting && typeof scripting.executeScript === 'function') {
+                const target = { tabId: tabId, allFrames: !!script.allFrames };
+                if (css.length) await scripting.insertCSS({ target: target, files: css });
+                if (js.length) await scripting.executeScript({ target: target, files: js });
+              } else if (tabs && typeof tabs.executeScript === 'function') {
+                const options = { allFrames: !!script.allFrames, matchAboutBlank: !!script.matchAboutBlank };
+                for (const file of css) await tabs.insertCSS(tabId, Object.assign({ file: file }, options));
+                for (const file of js) await tabs.executeScript(tabId, Object.assign({ file: file }, options));
+              }
+            };
             event('declarativeContent.__apply').addListener((details) => {
               let action;
               try { action = root.action || root.pageAction || root.browserAction; } catch (e) {}
-              if (!action || !details || typeof details.tabId !== 'number' || details.tabId < 0) return;
-              try {
-                const result = details.show ? action.enable(details.tabId) : action.disable(details.tabId);
-                if (result && result.catch) result.catch(() => {});
-              } catch (e) {}
+              if (!details || typeof details.tabId !== 'number' || details.tabId < 0) return;
+              const tabId = details.tabId;
+              if (action && typeof details.show === 'boolean') {
+                try { quietly(details.show ? action.enable(tabId) : action.disable(tabId)); } catch (e) {}
+              }
+              // No icon: back to the extension's own (WebKit drops a tab's icon when given none).
+              if (action && 'icon' in details) {
+                const imageData = details.icon ? revive(details.icon) : null;
+                try { quietly(action.setIcon(imageData ? { tabId: tabId, imageData: imageData } : { tabId: tabId, path: null })); } catch (e) {}
+              }
+              for (const script of Array.isArray(details.scripts) ? details.scripts : []) {
+                runScripts(tabId, script).catch(() => {});
+              }
             });
           }
 
@@ -1516,16 +1959,31 @@ enum ExtensionCompat {
             await call('tabs', 'highlight', { tabs: info && info.tabs });
             return root.windows.getLastFocused({ populate: true });
           }));
-          fill('tabs', 'getZoomSettings', api(() => call('tabs', 'zoomSettings', {})));
-          fill('tabs', 'setZoomSettings', api((tabId, settings) => {
-            const s = (tabId && typeof tabId === 'object') ? tabId : (settings || {});
-            if ((s.mode && s.mode !== 'automatic') || (s.scope && s.scope !== 'per-origin')) {
-              throw new Error('Tuff only supports automatic, per-site zoom.');
-            }
-            return undefined;
+          fill('tabs', 'getZoomSettings', api(async (tabId) => {
+            const tabIndex = typeof tabId === 'number' ? await indexOf(tabId) : undefined;
+            return call('tabs', 'zoomSettings', tabIndex === undefined ? {} : { tabIndex });
+          }));
+          fill('tabs', 'setZoomSettings', api(async (tabId, settings) => {
+            const hasID = typeof tabId === 'number';
+            const s = hasID ? (settings || {}) : (tabId && typeof tabId === 'object' ? tabId : {});
+            const tabIndex = hasID ? await indexOf(tabId) : undefined;
+            return call('tabs', 'setZoomSettings', {
+              tabIndex,
+              mode: s.mode,
+              scope: s.scope,
+            });
           }));
           fill('tabs', 'print', api(() => call('tabs', 'print', {})));
           fill('tabs', 'warmup', api(() => undefined));
+          // Firefox: a picture of any tab (captureVisibleTab only does the selected one), and
+          // saving the page as a PDF. Print preview is part of the Mac's print panel.
+          fill('tabs', 'captureTab', api(async (tabId, options) => {
+            if (tabId && typeof tabId === 'object') { options = tabId; tabId = undefined; }
+            const tabIndex = typeof tabId === 'number' ? await indexOf(tabId) : undefined;
+            return call('tabs', 'captureTab', { tabIndex: tabIndex, options: options || {} });
+          }));
+          fill('tabs', 'saveAsPDF', api((pageSettings) => call('tabs', 'saveAsPDF', pageSettings || {})));
+          fill('tabs', 'printPreview', api(() => call('tabs', 'print', {})));
           // Firefox's page action shows and hides; WebKit's enables and disables.
           let pageAction;
           try { pageAction = root.pageAction; } catch (e) {}
@@ -1552,7 +2010,8 @@ enum ExtensionCompat {
             fill(name, 'setBadgeTextColor', api(async (details) =>
               call('action', 'setBadgeColor', { kind: 'text', color: details && details.color, tabIndex: await badgeTab(details) })));
             fill(name, 'getBadgeTextColor', api(async (details) => call('action', 'getBadgeTextColor', { tabIndex: await badgeTab(details) })));
-            fill(name, 'getUserSettings', api(() => ({ isOnToolbar: true })));
+            fill(name, 'getUserSettings', api(() => call('action', 'getUserSettings', {})));
+            fill(name, 'onUserSettingsChanged', event('action.onUserSettingsChanged'));
             // Chrome's isEnabled takes a tab id; WebKit wants Firefox's `{ tabId }`.
             const isEnabled = action.isEnabled;
             if (typeof isEnabled === 'function' && !isEnabled.__tuff) {
@@ -1562,13 +2021,317 @@ enum ExtensionCompat {
             }
             pins.push(action);
           }
+          // WebKit doesn't fire runtime.onInstalled when an extension is first added, so Tuff sends
+          // it as well. Each listener hears it once in a worker's life, from whichever comes first.
+          let installed;
+          try { installed = root.runtime.onInstalled; } catch (e) {}
+          if (installed && typeof installed.addListener === 'function' && !installed.__tuff) {
+            const ours = event('runtime.onInstalled');
+            const once = new Map();
+            const addListener = installed.addListener, removeListener = installed.removeListener, hasListener = installed.hasListener;
+            add(installed, 'addListener', (fn, ...rest) => {
+              if (typeof fn !== 'function' || once.has(fn)) return addListener(fn, ...rest);
+              let heard = false;
+              const wrapper = (details) => {
+                if (heard) return undefined;
+                heard = true;
+                return fn(details);
+              };
+              once.set(fn, wrapper);
+              addListener(wrapper, ...rest);
+              ours.addListener(wrapper);
+            });
+            add(installed, 'removeListener', (fn) => {
+              const wrapper = once.get(fn);
+              if (!wrapper) return removeListener(fn);
+              once.delete(fn);
+              ours.removeListener(wrapper);
+              return removeListener(wrapper);
+            });
+            add(installed, 'hasListener', (fn) => once.has(fn) || hasListener(fn));
+            add(installed, '__tuff', true);
+            pins.push(installed);
+          }
           fill('runtime', 'requestUpdateCheck', api(() => call('runtime', 'requestUpdateCheck', {})));
+          // An extension that listens is told of its update, which then waits for runtime.reload()
+          // or Tuff's next launch, as in Chrome. WebKit's reload can't be wrapped, but it ends with
+          // onInstalled, so the background asks for the waiting update then.
+          const updateAvailable = event('runtime.onUpdateAvailable');
+          let reloadHooked = false;
+          fill('runtime', 'onUpdateAvailable', Object.assign({}, updateAvailable, {
+            addListener: (fn, filter) => {
+              updateAvailable.addListener(fn, filter);
+              if (reloadHooked || !isBackground || !installed) return;
+              reloadHooked = true;
+              root.runtime.onInstalled.addListener(() => { call('runtime', 'installWaitingUpdate', {}).catch(() => {}); });
+            },
+          }));
+          fill('runtime', 'onBrowserUpdateAvailable', event('runtime.onBrowserUpdateAvailable'));
+          // The extension's open pages (offscreen document, tabs, side panel) and background.
+          fill('runtime', 'getContexts', api(async (filter) => {
+            const f = filter || {};
+            const found = (await call('runtime', 'getContexts', {})) || [];
+            let tabs = [];
+            if (found.some((c) => c.tabIndex >= 0)) { try { tabs = (await root.tabs.query({})) || []; } catch (e) {} }
+            const windowId = await focusedWindowId();
+            const list = found.map((c) => {
+              const tab = c.tabIndex >= 0 ? tabs.find((t) => t.index === c.tabIndex) : null;
+              const context = Object.assign({}, c, {
+                tabId: tab ? tab.id : -1,
+                windowId: tab || c.contextType === 'SIDE_PANEL' || c.contextType === 'POPUP' ? windowId : -1,
+              });
+              delete context.tabIndex;
+              return context;
+            });
+            const keep = (key, value) => !Array.isArray(f[key]) || f[key].includes(value);
+            return list.filter((c) => keep('contextTypes', c.contextType) && keep('contextIds', c.contextId)
+              && keep('tabIds', c.tabId) && keep('windowIds', c.windowId) && keep('documentIds', c.documentId)
+              && keep('frameIds', c.frameId) && keep('documentUrls', c.documentUrl) && keep('documentOrigins', c.documentOrigin)
+              && (typeof f.incognito !== 'boolean' || f.incognito === c.incognito));
+          }));
+          if (absent(root.runtime, 'ContextType')) {
+            add(root.runtime, 'ContextType', {
+              TAB: 'TAB', POPUP: 'POPUP', BACKGROUND: 'BACKGROUND', OFFSCREEN_DOCUMENT: 'OFFSCREEN_DOCUMENT',
+              SIDE_PANEL: 'SIDE_PANEL', DEVELOPER_TOOLS: 'DEVELOPER_TOOLS',
+            });
+          }
+          // runtime.getPackageDirectoryEntry: read-only DirectoryEntry/FileEntry tree over the extension bundle.
+          const pkgFilesystem = { name: 'crxfs', root: null };
+          const makePackageEntry = (meta) => {
+            const fullPath = meta.fullPath || '/';
+            const name = meta.name || '';
+            const base = {
+              isFile: !!meta.isFile,
+              isDirectory: !!meta.isDirectory,
+              name,
+              fullPath,
+              filesystem: pkgFilesystem,
+              toURL: () => {
+                try { return root.runtime.getURL(fullPath.replace(/^\\/+/, '')); } catch (e) { return fullPath; }
+              },
+              getMetadata: (success, error) => {
+                call('runtime', 'packageStat', { path: fullPath }).then((m) => {
+                  if (typeof success === 'function') success({ size: m.size || 0, modificationTime: new Date(m.modificationTime || 0) });
+                }, (err) => { if (typeof error === 'function') error(err); });
+              },
+              getParent: (success, error) => {
+                const parentPath = fullPath === '/' ? '/' : (fullPath.replace(/\\/[^/]+$/, '') || '/');
+                call('runtime', 'packageStat', { path: parentPath }).then((m) => {
+                  if (typeof success === 'function') success(makePackageEntry(m));
+                }, (err) => { if (typeof error === 'function') error(err); });
+              },
+            };
+            if (meta.isFile) {
+              base.file = (success, error) => {
+                const url = base.toURL();
+                fetch(url).then((res) => res.blob()).then((blob) => {
+                  const file = typeof File === 'function'
+                    ? new File([blob], name, { type: blob.type, lastModified: meta.modificationTime || Date.now() })
+                    : blob;
+                  if (typeof success === 'function') success(file);
+                }, (err) => { if (typeof error === 'function') error(err); });
+              };
+            } else {
+              const resolveChild = (rel) => {
+                const p = String(rel || '');
+                if (p.startsWith('/')) return p;
+                return (fullPath === '/' ? '' : fullPath) + '/' + p;
+              };
+              const lookup = (expectDir) => (path, options, success, error) => {
+                if (typeof options === 'function') { error = success; success = options; options = {}; }
+                if (options && options.create) {
+                  if (typeof error === 'function') error(new DOMException('Extension package is read-only.', 'NoModificationAllowedError'));
+                  return;
+                }
+                call('runtime', 'packageStat', { path: resolveChild(path) }).then((m) => {
+                  if (!!m.isDirectory !== expectDir) {
+                    if (typeof error === 'function') error(new DOMException('Entry type mismatch.', 'TypeMismatchError'));
+                    return;
+                  }
+                  if (typeof success === 'function') success(makePackageEntry(m));
+                }, (err) => { if (typeof error === 'function') error(err); });
+              };
+              base.getFile = lookup(false);
+              base.getDirectory = lookup(true);
+              base.createReader = () => {
+                let done = false;
+                return {
+                  readEntries: (success, error) => {
+                    if (done) { if (typeof success === 'function') success([]); return; }
+                    done = true;
+                    call('runtime', 'packageList', { path: fullPath }).then((list) => {
+                      if (typeof success === 'function') success((list || []).map(makePackageEntry));
+                    }, (err) => { if (typeof error === 'function') error(err); });
+                  },
+                };
+              };
+            }
+            return base;
+          };
+          pkgFilesystem.root = makePackageEntry({ name: '', fullPath: '/', isDirectory: true, isFile: false });
+          fill('runtime', 'getPackageDirectoryEntry', api(() => pkgFilesystem.root));
+
+          // cookies.getPartitionKey
+          fill('cookies', 'getPartitionKey', api(async (details) => {
+            const d = details && typeof details === 'object' ? Object.assign({}, details) : {};
+            if (typeof d.tabId === 'number') d.tabIndex = await indexOf(d.tabId);
+            return call('cookies', 'getPartitionKey', d);
+          }));
+
+          // chrome.storage.managed / browser.storage.managed (ExtensionManagedStorage)
+          let storage;
+          try { storage = root.storage; } catch (e) {}
+          if (storage && typeof storage === 'object' && absent(storage, 'managed')) {
+            const managed = {
+              get: api((keys) => call('storage.managed', 'get', { keys: keys === undefined ? null : keys })),
+              getKeys: api(() => call('storage.managed', 'getKeys', {})),
+              getBytesInUse: api((keys) => call('storage.managed', 'getBytesInUse', { keys: keys === undefined ? null : keys })),
+              onChanged: event('storage.managed.onChanged'),
+            };
+            add(storage, 'managed', managed);
+            pins.push(storage);
+          }
+
+          // declarativeNetRequest.getAvailableStaticRuleCount / testMatchOutcome / updateStaticRules / getDisabledRuleIds
+          let dnr;
+          try { dnr = root.declarativeNetRequest; } catch (e) {}
+          if (dnr && typeof dnr === 'object') {
+            const enabledRulesets = async () => {
+              if (typeof dnr.getEnabledRulesets !== 'function') return undefined;
+              try { return await dnr.getEnabledRulesets(); } catch (e) { return undefined; }
+            };
+            fill('declarativeNetRequest', 'getAvailableStaticRuleCount', api(async () =>
+              call('declarativeNetRequest', 'getAvailableStaticRuleCount', { enabledRulesetIds: await enabledRulesets() })));
+            fill('declarativeNetRequest', 'testMatchOutcome', api(async (request) => {
+              let dynamicRules = [], sessionRules = [];
+              try { if (typeof dnr.getDynamicRules === 'function') dynamicRules = (await dnr.getDynamicRules()) || []; } catch (e) {}
+              try { if (typeof dnr.getSessionRules === 'function') sessionRules = (await dnr.getSessionRules()) || []; } catch (e) {}
+              return call('declarativeNetRequest', 'testMatchOutcome', {
+                request: request || {},
+                enabledRulesetIds: await enabledRulesets(),
+                dynamicRules,
+                sessionRules,
+              });
+            }));
+            fill('declarativeNetRequest', 'updateStaticRules', api(async (options) => {
+              const o = options && typeof options === 'object' ? options : {};
+              return call('declarativeNetRequest', 'updateStaticRules', {
+                rulesetId: o.rulesetId,
+                disableRuleIds: Array.isArray(o.disableRuleIds) ? o.disableRuleIds : [],
+                enableRuleIds: Array.isArray(o.enableRuleIds) ? o.enableRuleIds : [],
+              });
+            }));
+            fill('declarativeNetRequest', 'getDisabledRuleIds', api(async (options) => {
+              const o = options && typeof options === 'object' ? options : {};
+              return call('declarativeNetRequest', 'getDisabledRuleIds', { rulesetId: o.rulesetId });
+            }));
+          }
+
+          // chrome.webAuthenticationProxy (ExtensionWebAuthn)
+          implement('webAuthenticationProxy', {
+            attach: api(() => call('webAuthenticationProxy', 'attach', {})),
+            detach: api(() => call('webAuthenticationProxy', 'detach', {})),
+            completeCreateRequest: api((details) => call('webAuthenticationProxy', 'completeCreateRequest', details || {})),
+            completeGetRequest: api((details) => call('webAuthenticationProxy', 'completeGetRequest', details || {})),
+            completeIsUvpaaRequest: api((details) => call('webAuthenticationProxy', 'completeIsUvpaaRequest', details || {})),
+            onCreateRequest: event('webAuthenticationProxy.onCreateRequest'),
+            onGetRequest: event('webAuthenticationProxy.onGetRequest'),
+            onIsUvpaaRequest: event('webAuthenticationProxy.onIsUvpaaRequest'),
+            onRemoteSessionStateChange: event('webAuthenticationProxy.onRemoteSessionStateChange'),
+            onRequestCanceled: event('webAuthenticationProxy.onRequestCanceled'),
+          });
+
+          // Firefox menus.onShown / menus.onHidden / menus.overrideContext + tab/bookmark menu item relay
+          fill('menus', 'onShown', event('menus.onShown'));
+          fill('menus', 'onHidden', event('menus.onHidden'));
+          fill('menus', 'overrideContext', api(async (options) => {
+            const o = options && typeof options === 'object' ? Object.assign({}, options) : {};
+            if (typeof o.tabId === 'number') {
+              o.tabIndex = await indexOf(o.tabId);
+            }
+            return call('menus', 'overrideContext', o);
+          }));
+          for (const menuNs of ['menus', 'contextMenus']) {
+            let m;
+            try { m = root[menuNs]; } catch (e) { continue; }
+            if (!m || typeof m !== 'object') continue;
+            if (typeof m.create === 'function' && !m.create.__tuffOverrideTrack) {
+              const prevCreate = m.create;
+              const tracked = (props, ...rest) => {
+                const ctxs = props && Array.isArray(props.contexts) ? props.contexts : [];
+                if (ctxs.includes('tab') || ctxs.includes('bookmark') || ctxs.includes('all')) {
+                  call('menus', 'registerItem', {
+                    id: props.id, title: props.title || '', contexts: ctxs,
+                    enabled: props.enabled !== false, type: props.type || 'normal',
+                  }).catch(() => {});
+                }
+                try { return prevCreate(props, ...rest); } catch (err) {
+                  // WebKit rejects Firefox-only contexts like 'bookmark' or 'tab'; keep our native item.
+                  if (ctxs.includes('bookmark') || ctxs.includes('tab')) return props && props.id;
+                  throw err;
+                }
+              };
+              tracked.__tuff = true;
+              tracked.__tuffOverrideTrack = true;
+              add(m, 'create', tracked);
+            }
+            if (typeof m.remove === 'function' && !m.remove.__tuffOverrideTrack) {
+              const prevRemove = m.remove;
+              const trackedRemove = (id, ...rest) => {
+                call('menus', 'removeItem', { id: String(id) }).catch(() => {});
+                return prevRemove(id, ...rest);
+              };
+              trackedRemove.__tuffOverrideTrack = true;
+              add(m, 'remove', trackedRemove);
+            }
+            if (typeof m.removeAll === 'function' && !m.removeAll.__tuffOverrideTrack) {
+              const prevRemoveAll = m.removeAll;
+              const trackedRemoveAll = (...rest) => {
+                call('menus', 'removeItem', {}).catch(() => {});
+                return prevRemoveAll(...rest);
+              };
+              trackedRemoveAll.__tuffOverrideTrack = true;
+              add(m, 'removeAll', trackedRemoveAll);
+            }
+            if (m.onClicked && typeof m.onClicked.addListener === 'function' && !m.onClicked.__tuffCustomWired) {
+              const origAdd = m.onClicked.addListener;
+              const origRem = m.onClicked.removeListener;
+              const customEv = event('menus.onCustomClicked');
+              add(m.onClicked, 'addListener', (fn, ...rest) => {
+                if (typeof fn === 'function') customEv.addListener(fn);
+                return origAdd(fn, ...rest);
+              });
+              add(m.onClicked, 'removeListener', (fn, ...rest) => {
+                if (typeof fn === 'function') customEv.removeListener(fn);
+                return origRem(fn, ...rest);
+              });
+              m.onClicked.__tuffCustomWired = true;
+            }
+            pins.push(m);
+          }
           // Only for Firefox extensions: Chrome ones often take its presence to mean Firefox.
           let manifest = {};
           try { manifest = root.runtime.getManifest() || {}; } catch (e) {}
           if ((manifest.browser_specific_settings && manifest.browser_specific_settings.gecko) || (manifest.applications && manifest.applications.gecko)) {
             fill('runtime', 'getBrowserInfo', api(() => call('runtime', 'getBrowserInfo', {})));
             fill('commands', 'openShortcutSettings', api(() => call('commands', 'openShortcutSettings', {})));
+            // An extension changing its own shortcuts. WebKit reports the new keys itself; new
+            // descriptions are Tuff's to fill in.
+            fill('commands', 'update', api((detail) => call('commands', 'update', { detail: detail || {} })));
+            fill('commands', 'reset', api((name) => call('commands', 'reset', { name: name })));
+            let commands;
+            try { commands = root.commands; } catch (e) {}
+            const getAll = commands && commands.getAll;
+            if (typeof getAll === 'function' && !getAll.__tuff) {
+              const withDescriptions = api(async () => {
+                const list = (await getAll()) || [];
+                const descriptions = (await call('commands', 'descriptions', {})) || {};
+                return list.map((c) => descriptions[c.name] === undefined ? c : Object.assign({}, c, { description: descriptions[c.name] }));
+              });
+              withDescriptions.__tuff = true;
+              add(commands, 'getAll', withDescriptions);
+              pins.push(commands);
+            }
           }
 
           // Scripts registered at run time with inline code (WebKit only registers files). Tuff
@@ -1590,12 +2353,173 @@ enum ExtensionCompat {
             update: api((scripts) => call('userScripts', 'update', { scripts: scripts || [] })),
             unregister: api((filter) => call('userScripts', 'unregister', { ids: filter && filter.ids })),
             getScripts: api(async (filter) => (await call('userScripts', 'getScripts', { ids: filter && filter.ids })) || []),
-            configureWorld: api(() => undefined),
-            resetWorldConfiguration: api(() => undefined),
-            getWorldConfigurations: api(() => []),
-            execute: api(() => { throw new Error('userScripts.execute is not supported in Tuff.'); }),
+            configureWorld: api((properties) => call('userScripts', 'configureWorld', { properties: properties || {} })),
+            resetWorldConfiguration: api((worldId) => call('userScripts', 'resetWorldConfiguration', { worldId: worldId })),
+            getWorldConfigurations: api(async () => (await call('userScripts', 'getWorldConfigurations', {})) || []),
+            execute: api(async (injection) => {
+              const details = Object.assign({}, injection);
+              if (details.target && typeof details.target === 'object') {
+                const target = Object.assign({}, details.target);
+                if (typeof target.tabId === 'number') target.tabIndex = await indexOf(target.tabId);
+                details.target = target;
+              }
+              return (await call('userScripts', 'execute', details)) || [];
+            }),
             onBeforeScript: event('userScripts.onBeforeScript'),
+            ExecutionWorld: { MAIN: 'MAIN', USER_SCRIPT: 'USER_SCRIPT' },
           });
+
+          // runtime.onUserScriptMessage / runtime.onUserScriptConnect: messaging from user scripts
+          // configured with `userScripts.configureWorld({ messaging: true })`.
+          const usMessageListeners = new Set();
+          const usMessageSource = event('runtime.__userScriptMessage');
+          const onUserScriptMessageRaw = (message, sender, requestId) => {
+            let responded = false;
+            const sendResponse = (response) => {
+              if (responded) return;
+              responded = true;
+              call('userScripts', 'replyMessage', { requestId, response: response === undefined ? null : response }).catch(() => {});
+            };
+            let asyncPending = false;
+            for (const fn of [...usMessageListeners]) {
+              try {
+                const result = fn(message, sender, sendResponse);
+                if (result === true) {
+                  asyncPending = true;
+                } else if (result && typeof result.then === 'function') {
+                  asyncPending = true;
+                  result.then(sendResponse, (err) => {
+                    if (responded) return;
+                    responded = true;
+                    call('userScripts', 'replyMessage', { requestId, error: String((err && err.message) || err) }).catch(() => {});
+                  });
+                }
+              } catch (e) {}
+              if (responded) break;
+            }
+            if (!responded && !asyncPending) sendResponse(undefined);
+          };
+          fill('runtime', 'onUserScriptMessage', {
+            addListener: (fn) => {
+              if (typeof fn !== 'function') return;
+              const first = usMessageListeners.size === 0;
+              usMessageListeners.add(fn);
+              if (first) usMessageSource.addListener(onUserScriptMessageRaw);
+            },
+            removeListener: (fn) => {
+              usMessageListeners.delete(fn);
+              if (usMessageListeners.size === 0) usMessageSource.removeListener(onUserScriptMessageRaw);
+            },
+            hasListener: (fn) => usMessageListeners.has(fn),
+            hasListeners: () => usMessageListeners.size > 0,
+          });
+
+          const usConnectListeners = new Set();
+          const usPorts = new Map();
+          const usConnectSource = event('runtime.__userScriptConnect');
+          const usPortMessageSource = event('runtime.__userScriptPortMessage');
+          const usPortDisconnectSource = event('runtime.__userScriptPortDisconnect');
+          const makeLocalEvent = () => {
+            const set = new Set();
+            return {
+              addListener: (fn) => { if (typeof fn === 'function') set.add(fn); },
+              removeListener: (fn) => { set.delete(fn); },
+              hasListener: (fn) => set.has(fn),
+              hasListeners: () => set.size > 0,
+              _fire: (...args) => { for (const fn of [...set]) { try { fn(...args); } catch (e) {} } },
+            };
+          };
+          const onUserScriptConnectRaw = (portId, name, sender) => {
+            const onMessage = makeLocalEvent();
+            const onDisconnect = makeLocalEvent();
+            const port = {
+              name: name || '',
+              sender: sender || {},
+              onMessage,
+              onDisconnect,
+              _disconnected: false,
+              postMessage: (msg) => {
+                if (port._disconnected) throw new Error('Attempting to use a disconnected port object');
+                call('userScripts', 'portMessage', { portId, message: msg === undefined ? null : msg }).catch(() => {});
+              },
+              disconnect: () => {
+                if (port._disconnected) return;
+                port._disconnected = true;
+                usPorts.delete(portId);
+                call('userScripts', 'portDisconnect', { portId }).catch(() => {});
+              },
+            };
+            usPorts.set(portId, port);
+            for (const fn of [...usConnectListeners]) { try { fn(port); } catch (e) {} }
+          };
+          const onUserScriptPortMessageRaw = (portId, msg) => {
+            const port = usPorts.get(portId);
+            if (port && !port._disconnected) port.onMessage._fire(msg, port);
+          };
+          const onUserScriptPortDisconnectRaw = (portId) => {
+            const port = usPorts.get(portId);
+            if (!port) return;
+            port._disconnected = true;
+            usPorts.delete(portId);
+            port.onDisconnect._fire(port);
+          };
+          fill('runtime', 'onUserScriptConnect', {
+            addListener: (fn) => {
+              if (typeof fn !== 'function') return;
+              const first = usConnectListeners.size === 0;
+              usConnectListeners.add(fn);
+              if (first) {
+                usConnectSource.addListener(onUserScriptConnectRaw);
+                usPortMessageSource.addListener(onUserScriptPortMessageRaw);
+                usPortDisconnectSource.addListener(onUserScriptPortDisconnectRaw);
+              }
+            },
+            removeListener: (fn) => {
+              usConnectListeners.delete(fn);
+              if (usConnectListeners.size === 0) {
+                usConnectSource.removeListener(onUserScriptConnectRaw);
+                usPortMessageSource.removeListener(onUserScriptPortMessageRaw);
+                usPortDisconnectSource.removeListener(onUserScriptPortDisconnectRaw);
+              }
+            },
+            hasListener: (fn) => usConnectListeners.has(fn),
+            hasListeners: () => usConnectListeners.size > 0,
+          });
+        }
+      }
+
+      // Firefox menus.getTargetElement(targetElementId): synchronous lookup of the right-clicked
+      // element in content scripts and extension pages, keyed by the same coordinate ID as ExtensionMenus.
+      if (typeof document !== 'undefined' && typeof WeakRef === 'function') {
+        const menuTargets = new Map();
+        const menuOrder = [];
+        document.addEventListener('contextmenu', (e) => {
+          const el = e.target instanceof Element ? e.target : (e.target && e.target.parentElement) || null;
+          if (!el) return;
+          const x = Math.max(0, Math.round(e.clientX || 0)) & 0x7FFF;
+          const y = Math.max(0, Math.round(e.clientY || 0)) & 0x7FFF;
+          const id = ((x << 15) | y) || 1;
+          menuTargets.set(id, new WeakRef(el));
+          menuOrder.push(id);
+          if (menuOrder.length > 32) menuTargets.delete(menuOrder.shift());
+        }, { capture: true, passive: true });
+        const getTargetElement = (targetElementId) => {
+          const ref = menuTargets.get(targetElementId);
+          return (ref && ref.deref()) || null;
+        };
+        for (const { root } of roots) {
+          for (const nsName of ['menus', 'contextMenus']) {
+            let ns;
+            try { ns = root[nsName]; } catch (e) {}
+            if (!ns && nsName === 'menus') {
+              ns = {};
+              add(root, 'menus', ns);
+            }
+            if (ns && typeof ns === 'object' && absent(ns, 'getTargetElement')) {
+              add(ns, 'getTargetElement', getTargetElement);
+              pins.push(ns);
+            }
+          }
         }
       }
 

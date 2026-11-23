@@ -19,7 +19,6 @@ final class ExtensionTabGroups {
     private var browser: BrowserState { .shared }
     private var ids: [UUID: Int] = [:]
     private var nextID = 1
-    private var colorsByFolder: [UUID: String] = [:]
     /// Folders an extension made with `tabs.group`; like Chrome's groups they go away when their
     /// last tab is ungrouped. The user's own folders are never removed that way.
     private var madeByExtension: Set<UUID> = []
@@ -55,7 +54,7 @@ final class ExtensionTabGroups {
             "id": id(for: folder),
             "title": folder.name,
             "collapsed": !folder.isOpen,
-            "color": colorsByFolder[folder.id] ?? "grey",
+            "color": folder.color ?? "grey",
             "windowId": -1,
         ]
     }
@@ -70,7 +69,7 @@ final class ExtensionTabGroups {
         allFolders.filter { folder in
             if let collapsed = args["collapsed"] as? Bool, collapsed == folder.isOpen { return false }
             if let title = args["title"] as? String, !Self.titleMatches(folder.name, pattern: title) { return false }
-            if let color = args["color"] as? String, color != (colorsByFolder[folder.id] ?? "grey") { return false }
+            if let color = args["color"] as? String, color != (folder.color ?? "grey") { return false }
             return true
         }.map(info)
     }
@@ -87,8 +86,9 @@ final class ExtensionTabGroups {
         var colorChanged = false
         if let color = properties["color"] as? String {
             guard Self.colors.contains(color) else { throw Failure("Invalid color: \(color).") }
-            colorChanged = colorsByFolder[folder.id] != color
-            colorsByFolder[folder.id] = color
+            colorChanged = (folder.color ?? "grey") != color
+            folder.color = color
+            if colorChanged { browser.scheduleSave() }
         }
         // Renaming and collapsing report onUpdated themselves (BrowserState tells this class).
         let title = (properties["title"] as? String).flatMap { $0 == folder.name ? nil : $0 }
@@ -187,7 +187,6 @@ final class ExtensionTabGroups {
     func folderRemoved(_ folder: Folder) {
         let gone = info(folder)
         ids.removeValue(forKey: folder.id)
-        colorsByFolder.removeValue(forKey: folder.id)
         madeByExtension.remove(folder.id)
         ExtensionEventPush.shared.emit("tabGroups.onRemoved", args: [gone], extra: ["groupWindow": true])
     }
@@ -307,6 +306,36 @@ final class ExtensionContainers {
             profile.icon = symbol
         }
         if let color = details["color"] as? String, Self.colorCodes[color] != nil { colors[profile.id] = color }
+    }
+
+    /// Firefox's `contextualIdentities.move(cookieStoreIds, position)`: reorders the matching
+    /// profiles to `position` (-1 moves them to the end), keeping their relative order.
+    func move(_ args: [String: Any]) throws {
+        guard let position = args["position"] as? Int else { throw Failure("position is required.") }
+        let rawIDs: [String]
+        if let list = args["cookieStoreIds"] as? [String] {
+            rawIDs = list
+        } else if let single = args["cookieStoreIds"] as? String {
+            rawIDs = [single]
+        } else {
+            throw Failure("cookieStoreIds is required.")
+        }
+        guard !rawIDs.isEmpty else { return }
+        let targets = try rawIDs.map { try require($0) }
+        Self.reorder(&browser.profiles, moving: targets, to: position)
+        browser.scheduleSave()
+    }
+
+    static func reorder(_ profiles: inout [Profile], moving targets: [Profile], to position: Int) {
+        let movingIDs = Set(targets.map(\.id))
+        let moved = targets.reduce(into: [Profile]()) { list, profile in
+            if !list.contains(where: { $0.id == profile.id }) { list.append(profile) }
+        }
+        let remaining = profiles.filter { !movingIDs.contains($0.id) }
+        let index = position < 0 ? remaining.count : max(0, min(position, remaining.count))
+        var result = remaining
+        result.insert(contentsOf: moved, at: index)
+        profiles = result
     }
 
     /// Removing a container deletes a profile and its website data, so the user is asked first.

@@ -235,6 +235,8 @@ struct PrivacySettings: Codable, Equatable {
     var fraudWarnings = true
     var autoplay: AutoplayPolicy = .allow
     var rememberMediaPermissions = true
+    /// Refuse location requests without asking. A site you've set to Allow still gets it.
+    var blockLocationRequests = false
     /// Tuff's built-in ad and tracker blocker (`ContentBlocker`).
     var blockAds = true
     /// Sites (and their subdomains) the blocker leaves alone.
@@ -260,6 +262,7 @@ extension PrivacySettings {
         fraudWarnings = try c.decodeIfPresent(Bool.self, forKey: .fraudWarnings) ?? d.fraudWarnings
         autoplay = try c.decodeIfPresent(AutoplayPolicy.self, forKey: .autoplay) ?? d.autoplay
         rememberMediaPermissions = try c.decodeIfPresent(Bool.self, forKey: .rememberMediaPermissions) ?? d.rememberMediaPermissions
+        blockLocationRequests = try c.decodeIfPresent(Bool.self, forKey: .blockLocationRequests) ?? d.blockLocationRequests
         blockAds = try c.decodeIfPresent(Bool.self, forKey: .blockAds) ?? d.blockAds
         adBlockAllowlist = try c.decodeIfPresent([String].self, forKey: .adBlockAllowlist) ?? d.adBlockAllowlist
         shareUsageStats = try c.decodeIfPresent(Bool.self, forKey: .shareUsageStats) ?? d.shareUsageStats

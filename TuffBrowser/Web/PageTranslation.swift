@@ -10,7 +10,7 @@ import WebKit
 /// Google Translate (`GoogleTranslate`), which sends the page's text to Google. Which one is
 /// asked on a card, unless Settings → Privacy says (`TranslationFallback`).
 ///
-/// A script in its own content world collects the page's text (each text node on its own,
+/// A script in Tuff's content world collects the page's text (each text node on its own,
 /// skipping code, form fields and anything marked `translate="no"`), Tuff translates it in
 /// batches and puts it back, keeping the originals for Show Original. Text the page adds later
 /// (infinite scroll, a single-page app moving on) is translated as it appears, and further
@@ -70,7 +70,7 @@ enum TranslationFallback: String, Codable, CaseIterable {
 }
 
 enum PageTranslator {
-    static let world = WKContentWorld.world(name: "TuffTranslate")
+    static let world = WebEngine.scriptWorld
     static let handlerName = "tuffTranslate"
     private static let handler = MessageHandler()
     /// Text nodes put back into the page at a time: small on this Mac, so the top of the page

@@ -110,6 +110,13 @@ extension Tab: WKWebExtensionTab {
 
     func takeSnapshot(using configuration: WKSnapshotConfiguration, for context: WKWebExtensionContext, completionHandler: @escaping (NSImage?, (any Error)?) -> Void) {
         guard let webView else { completionHandler(nil, nil); return }
+        // WebKit asks for `tabs.captureVisibleTab` with a zero rect, which snapshots nothing (an
+        // empty "data:," image); the whole page is meant, which is what a null rect gives.
+        var configuration = configuration
+        if configuration.rect == .zero {
+            configuration = configuration.copy() as! WKSnapshotConfiguration
+            configuration.rect = .null
+        }
         webView.takeSnapshot(with: configuration) { image, error in
             completionHandler(image, error)
         }
@@ -236,7 +243,12 @@ enum ExtensionStoreBridge {
     private static let handler = StoreMessageHandler()
 
     static func install(into controller: WKUserContentController) {
-        controller.addUserScript(WKUserScript(source: script, injectionTime: .atDocumentEnd, forMainFrameOnly: true, in: world))
+        // Only on the two stores: anywhere else the script would just make a world of its own
+        // in the page to find out it has nothing to do.
+        controller.addUserScript(ExtensionContentScripts.makeScript(
+            source: script, time: .atDocumentEnd, mainFrameOnly: true,
+            include: ["https://chromewebstore.google.com/*", "https://addons.mozilla.org/*"], exclude: [], world: world
+        ))
         controller.addScriptMessageHandler(handler, contentWorld: world, name: handlerName)
     }
 

@@ -6,7 +6,9 @@ import Foundation
 /// everything else. Bookmark ids are Tuff's UUIDs.
 ///
 /// Events come from comparing the tree before and after every change (`BookmarkStore.didChange`),
-/// so changes made in Tuff, by sync or by another extension all reach listeners. Tuff keeps no
+/// so changes made in Tuff, by sync or by another extension all reach listeners. When sync brings
+/// in several at once, they come between `onImportBegan` and `onImportEnded`, as an import's do in
+/// Chrome, so extensions can wait for the end instead of handling each one. Tuff keeps no
 /// dates, so nodes have no `dateAdded`, and `getRecent` goes by position (newest are added last).
 final class ExtensionBookmarks {
     static let shared = ExtensionBookmarks()
@@ -15,6 +17,7 @@ final class ExtensionBookmarks {
     static let barID = "1"
     private static let events: Set<String> = [
         "bookmarks.onCreated", "bookmarks.onRemoved", "bookmarks.onChanged", "bookmarks.onMoved",
+        "bookmarks.onChildrenReordered", "bookmarks.onImportBegan", "bookmarks.onImportEnded",
     ]
 
     struct Failure: LocalizedError {
@@ -29,8 +32,8 @@ final class ExtensionBookmarks {
 
     private init() {
         snapshots = BookmarkStore.shared.lists
-        observer = NotificationCenter.default.addObserver(forName: BookmarkStore.didChange, object: nil, queue: nil) { [weak self] _ in
-            self?.storeChanged()
+        observer = NotificationCenter.default.addObserver(forName: BookmarkStore.didChange, object: nil, queue: nil) { [weak self] note in
+            self?.storeChanged(bulk: note.userInfo?[BookmarkStore.bulkKey] as? Bool ?? false)
         }
     }
 
@@ -74,8 +77,16 @@ final class ExtensionBookmarks {
     func getRecent(_ count: Int) throws -> [[String: Any]] {
         guard count >= 1 else { throw Failure("numberOfItems cannot be less than 1.") }
         let tree = Self.flatten(store.items(for: try profile()))
-        let pages = tree.order.reversed().compactMap { tree.entries[$0] }.filter { !$0.bookmark.isFolder }
-        return pages.prefix(count).map { node($0.bookmark, parent: $0.parent, index: $0.index, deep: false) }
+        let pages = tree.order.enumerated().compactMap { position, id -> (position: Int, entry: Entry)? in
+            guard let entry = tree.entries[id], !entry.bookmark.isFolder, !entry.bookmark.isSeparator else { return nil }
+            return (position, entry)
+        }.sorted { a, b in
+            let aTime = a.entry.bookmark.dateAdded?.timeIntervalSince1970 ?? -1
+            let bTime = b.entry.bookmark.dateAdded?.timeIntervalSince1970 ?? -1
+            if aTime != bTime { return aTime > bTime }
+            return a.position > b.position
+        }
+        return pages.prefix(count).map { node($0.entry.bookmark, parent: $0.entry.parent, index: $0.entry.index, deep: false) }
     }
 
     /// A string matches pages and folders with every word in their title or address; an object
@@ -96,6 +107,7 @@ final class ExtensionBookmarks {
         var results: [[String: Any]] = []
         func visit(_ items: [Bookmark], parent: String) {
             for (index, item) in items.enumerated() {
+                if item.isSeparator { continue }
                 let haystack = item.title.lowercased() + " " + (item.url?.absoluteString.lowercased() ?? "")
                 let matches = words.allSatisfy(haystack.contains)
                     && (url == nil || item.url?.absoluteString == url)
@@ -114,15 +126,18 @@ final class ExtensionBookmarks {
 
     func create(_ details: [String: Any]) throws -> [String: Any] {
         let profile = try profile()
-        if (details["type"] as? String) == "separator" { throw Failure("Tuff’s bookmarks have no separators.") }
         let parent = try folder(details["parentId"] as? String ?? Self.barID, profile: profile)
         let index = details["index"] as? Int
-        let title = details["title"] as? String ?? ""
         let created: Bookmark
-        if let address = details["url"] as? String {
+        if (details["type"] as? String) == "separator" {
+            if details["url"] != nil { throw Failure("Separators cannot have a URL.") }
+            created = store.addSeparator(profile: profile, into: parent, at: index)
+        } else if let address = details["url"] as? String {
+            let title = details["title"] as? String ?? ""
             guard let url = URL(string: address), url.scheme != nil else { throw Failure("Invalid URL.") }
             created = store.add(url: url, title: title, profile: profile, into: parent, at: index)
         } else {
+            let title = details["title"] as? String ?? ""
             created = store.addFolder(named: title, profile: profile, into: parent, at: index)
         }
         return try located(created.id.uuidString, profile: profile)
@@ -131,6 +146,10 @@ final class ExtensionBookmarks {
     func update(_ id: String, changes: [String: Any]) throws -> [String: Any] {
         let profile = try profile()
         guard let found = Self.locate(id, in: store.items(for: profile)) else { throw Failure("Can’t find bookmark for id.") }
+        if found.bookmark.isSeparator {
+            if changes["url"] != nil { throw Failure("Can’t set URL of a bookmark separator.") }
+            return try located(id, profile: profile)
+        }
         var url: URL?
         if let address = changes["url"] as? String {
             guard !found.bookmark.isFolder else { throw Failure("Can’t set URL of a bookmark folder.") }
@@ -182,14 +201,26 @@ final class ExtensionBookmarks {
     // MARK: Nodes
 
     private func node(_ bookmark: Bookmark, parent: String, index: Int, deep: Bool) -> [String: Any] {
+        let type = bookmark.isSeparator ? "separator" : (bookmark.isFolder ? "folder" : "bookmark")
         var node: [String: Any] = [
             "id": bookmark.id.uuidString, "parentId": parent, "index": index, "title": bookmark.title,
-            "type": bookmark.isFolder ? "folder" : "bookmark", "syncing": false,
+            "type": type, "syncing": false,
         ]
+        if let added = bookmark.dateAdded {
+            node["dateAdded"] = Int((added.timeIntervalSince1970 * 1000).rounded())
+        }
+        if bookmark.isSeparator {
+            return node
+        }
         if let url = bookmark.url {
             node["url"] = url.absoluteString
-        } else if deep {
-            node["children"] = nodes(bookmark.children, parent: bookmark.id.uuidString, deep: true)
+        } else {
+            if let modified = bookmark.dateGroupModified ?? bookmark.dateAdded {
+                node["dateGroupModified"] = Int((modified.timeIntervalSince1970 * 1000).rounded())
+            }
+            if deep {
+                node["children"] = nodes(bookmark.children, parent: bookmark.id.uuidString, deep: true)
+            }
         }
         return node
     }
@@ -203,6 +234,9 @@ final class ExtensionBookmarks {
             "id": Self.barID, "parentId": Self.rootID, "index": 0, "title": "Bookmarks bar",
             "type": "folder", "folderType": "bookmarks-bar", "syncing": false,
         ]
+        if let latest = list.compactMap({ $0.dateGroupModified ?? $0.dateAdded }).max() {
+            node["dateGroupModified"] = Int((latest.timeIntervalSince1970 * 1000).rounded())
+        }
         if deep { node["children"] = nodes(list, parent: Self.barID, deep: true) }
         return node
     }
@@ -244,12 +278,16 @@ final class ExtensionBookmarks {
         return (entries, order)
     }
 
-    private func storeChanged() {
+    private func storeChanged(bulk: Bool) {
         let lists = store.lists
         defer { snapshots = lists }
         guard let profile = BrowserState.shared.bookmarksProfileID, ExtensionEventPush.shared.isListening(to: Self.events) else { return }
         let old = Self.flatten(snapshots[profile] ?? []), new = Self.flatten(lists[profile] ?? [])
         let push = ExtensionEventPush.shared
+        // One change on its own isn't worth an import; a sync that brought in several is.
+        let importing = bulk && Self.changeCount(old: old, new: new) > 1
+        if importing { push.emit("bookmarks.onImportBegan", args: []) }
+        defer { if importing { push.emit("bookmarks.onImportEnded", args: []) } }
 
         // Removed: only the outermost of what went (a folder's contents go with it).
         for id in old.order where new.entries[id] == nil {
@@ -270,7 +308,11 @@ final class ExtensionBookmarks {
             if let url = after.url { info["url"] = url.absoluteString }
             push.emit("bookmarks.onChanged", args: [id, info])
         }
-        for id in movedIDs(old: old, new: new) {
+        let (reorderedFolders, moved) = Self.reordersAndMoves(old: old, new: new, bulk: bulk)
+        for (parentID, childIDs) in reorderedFolders {
+            push.emit("bookmarks.onChildrenReordered", args: [parentID, ["childIds": childIDs]])
+        }
+        for id in moved {
             guard let before = old.entries[id], let after = new.entries[id] else { continue }
             push.emit("bookmarks.onMoved", args: [id, [
                 "parentId": after.parent, "index": after.index, "oldParentId": before.parent, "oldIndex": before.index,
@@ -278,22 +320,55 @@ final class ExtensionBookmarks {
         }
     }
 
-    /// Bookmarks that changed folder, or were reordered within one. Within a folder, the ones
-    /// that kept their order relative to each other (the longest such run) stayed put; the rest
-    /// moved. That way one bookmark dragged along isn't reported with everything it passed.
-    private func movedIDs(old: (entries: [String: Entry], order: [String]), new: (entries: [String: Entry], order: [String])) -> [String] {
+    /// Whether more than one bookmark was added, removed, changed or moved to another folder (counts to 2 at most).
+    private static func changeCount(old: (entries: [String: Entry], order: [String]), new: (entries: [String: Entry], order: [String])) -> Int {
+        var count = old.order.filter { new.entries[$0] == nil }.count
+        for id in new.order {
+            guard let before = old.entries[id] else { count += 1; continue }
+            let after = new.entries[id]!
+            // (Not the index: removing one bookmark shifts its neighbours'.)
+            if before.parent != after.parent || before.bookmark.title != after.bookmark.title || before.bookmark.url != after.bookmark.url { count += 1 }
+            if count > 1 { break }
+        }
+        return count
+    }
+
+    /// Splits within-folder reorders from individual moves. During a bulk update (e.g. Sync), if
+    /// more than one child in the same folder changed relative order, report one
+    /// `onChildrenReordered` for that folder instead of individual `onMoved` events.
+    static func reorderedFolders(before oldList: [Bookmark], after newList: [Bookmark], bulk: Bool) -> [(parentID: String, childIDs: [String])] {
+        reordersAndMoves(old: flatten(oldList), new: flatten(newList), bulk: bulk).reorderedFolders
+    }
+
+    private static func reordersAndMoves(
+        old: (entries: [String: Entry], order: [String]),
+        new: (entries: [String: Entry], order: [String]),
+        bulk: Bool
+    ) -> (reorderedFolders: [(parentID: String, childIDs: [String])], moved: [String]) {
         var moved = Set<String>()
         var stayed: [String: [String]] = [:]  // parent -> kept ids, in the new order
+        var allChildren: [String: [String]] = [:]  // parent -> all children in the new order
+        var parentOrder: [String] = []
         for id in new.order {
-            guard let before = old.entries[id], let after = new.entries[id] else { continue }
+            guard let after = new.entries[id] else { continue }
+            if allChildren[after.parent] == nil { parentOrder.append(after.parent) }
+            allChildren[after.parent, default: []].append(id)
+            guard let before = old.entries[id] else { continue }
             if before.parent != after.parent { moved.insert(id) } else { stayed[after.parent, default: []].append(id) }
         }
-        for ids in stayed.values {
+        var reorderedFolders: [(parentID: String, childIDs: [String])] = []
+        for parent in parentOrder {
+            guard let ids = stayed[parent], ids.count > 1 else { continue }
             let oldIndexes = ids.map { old.entries[$0]!.index }
-            let kept = Self.longestIncreasingRun(oldIndexes)
-            for (position, id) in ids.enumerated() where !kept.contains(position) { moved.insert(id) }
+            let kept = longestIncreasingRun(oldIndexes)
+            let displaced = ids.enumerated().filter { !kept.contains($0.offset) }.map(\.element)
+            if bulk && displaced.count > 1 {
+                reorderedFolders.append((parent, allChildren[parent] ?? ids))
+            } else {
+                for id in displaced { moved.insert(id) }
+            }
         }
-        return new.order.filter(moved.contains)
+        return (reorderedFolders, new.order.filter(moved.contains))
     }
 
     /// Positions of one longest strictly increasing subsequence of `values`.

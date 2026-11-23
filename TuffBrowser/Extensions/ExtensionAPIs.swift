@@ -19,11 +19,14 @@ enum ExtensionAPIPermissions {
         "management": "management", "sessions": "sessions", "notifications": "notifications",
         "offscreen": "offscreen", "identity": "identity", "downloads": "downloads",
         "system.cpu": "system.cpu", "system.memory": "system.memory", "system.storage": "system.storage",
-        "power": "power", "idle": "idle", "tts": "tts", "search": "search",
+        "power": "power", "idle": "idle", "tts": "tts", "ttsEngine": "ttsEngine", "search": "search",
         "userScripts": "userScripts", "tabGroups": "tabGroups", "contextualIdentities": "contextualIdentities",
         "contentSettings": "contentSettings", "clipboard": "clipboardWrite", "find": "find",
-        "omnibox": "omnibox", "theme": "theme", "bookmarks": "bookmarks", "declarativeContent": "declarativeContent",
-        "system.display": "system.display",
+        "omnibox": "omnibox", "theme": "theme", "bookmarks": "bookmarks", "readingList": "readingList",
+        "declarativeContent": "declarativeContent", "captivePortal": "captivePortal",
+        "system.display": "system.display", "dns": "dns", "pageCapture": "pageCapture", "debugger": "debugger",
+        "webAuthenticationProxy": "webAuthenticationProxy",
+        "pkcs11": "pkcs11", "proxy": "proxy", "storage.managed": "storage",
     ]
 
     static func setting(_ path: String) -> String? {
@@ -36,14 +39,24 @@ enum ExtensionAPIPermissions {
 
     static func event(_ name: String) -> String? {
         if name.hasPrefix("settings.onChange.") { return setting(String(name.dropFirst("settings.onChange.".count))) }
-        let namespace = name.split(separator: ".").first.map(String.init) ?? ""
+        if name == "storage.managed.onChanged" { return "storage" }
+        let parts = name.split(separator: ".")
+        // system.cpu, system.storage…: the namespace is the first two parts.
+        let namespace = parts.prefix(parts.first == "system" ? 2 : 1).joined(separator: ".")
         return namespaces[namespace]
     }
 
     static func required(namespace: String, method: String, args: [String: Any] = [:]) -> String? {
         if namespace == "__events" { return (args["event"] as? String).map(event) ?? nil }
         if namespace == "settings" { return (args["path"] as? String).flatMap(setting) }
-        if namespace == "tabs" { return ["group", "ungroup"].contains(method) ? "tabGroups" : nil }
+        if namespace == "tabs" {
+            if ["group", "ungroup"].contains(method) { return "tabGroups" }
+            if ["hide", "show"].contains(method) { return "tabHide" }
+            return nil
+        }
+        if namespace == "cookies" { return "cookies" }
+        if namespace == "userScripts", ["replyMessage", "portMessage", "portDisconnect"].contains(method) { return nil }
+        if namespace == "menus" { return nil }
         return namespaces[namespace]
     }
 }
@@ -133,7 +146,13 @@ final class ExtensionAPIBridge {
 
         // chrome.browsingData
         case ("browsingData", "remove"):
-            removeBrowsingData(types: args["dataToRemove"] as? [String: Any] ?? [:], since: args["since"] as? Double ?? 0, finish: finish)
+            removeBrowsingData(
+                types: args["dataToRemove"] as? [String: Any] ?? [:],
+                since: args["since"] as? Double ?? 0,
+                origins: args["origins"] as? [String],
+                excludeOrigins: args["excludeOrigins"] as? [String],
+                finish: finish
+            )
         case ("browsingData", "removeCache"):
             removeBrowsingData(types: ["cache": true], since: args["since"] as? Double ?? 0, finish: finish)
         case ("browsingData", "removeCookies"):
@@ -206,6 +225,17 @@ final class ExtensionAPIBridge {
                     fail(APIError("The extension wasn’t removed."))
                 }
             }
+        case ("management", "install"):
+            let themeURL = try Self.url(args["url"])
+            let hash = args["hash"] as? String
+            Task { @MainActor in
+                do {
+                    let id = try await self.extensions.installTheme(url: themeURL, hash: hash)
+                    finish(["id": id])
+                } catch {
+                    fail(error)
+                }
+            }
 
         // chrome.sessions
         case ("sessions", "getRecentlyClosed"):
@@ -223,6 +253,26 @@ final class ExtensionAPIBridge {
             finish(restored)
         case ("sessions", "getDevices"):
             finish(MainActor.assumeIsolated { Self.syncedDevices(maxResults: args["maxResults"] as? Int ?? 25) })
+        case ("sessions", "forgetClosedTab"):
+            guard browser.forgetClosedTab(id: try Self.string(args["sessionId"])) else {
+                throw APIError("Could not find closed tab using sessionId \(args["sessionId"] ?? "").")
+            }
+            finish(nil)
+        case ("sessions", "forgetClosedWindow"):
+            // Tuff has the one window, so there are never closed windows to forget.
+            throw APIError("Could not find closed window using sessionId \(args["sessionId"] ?? "").")
+        // Firefox's tab and window values (ExtensionSessionValues). No tab means the window.
+        case ("sessions", "getValue"):
+            let tab = args["tabIndex"] != nil ? try ExtensionFind.tab(args["tabIndex"]) : nil
+            finish(ExtensionSessionValues.shared.get(try Self.string(args["key"]), tab: tab, extensionID: context.uniqueIdentifier))
+        case ("sessions", "setValue"):
+            let tab = args["tabIndex"] != nil ? try ExtensionFind.tab(args["tabIndex"]) : nil
+            ExtensionSessionValues.shared.set(try Self.string(args["key"]), value: args["value"] ?? NSNull(), tab: tab, extensionID: context.uniqueIdentifier)
+            finish(nil)
+        case ("sessions", "removeValue"):
+            let tab = args["tabIndex"] != nil ? try ExtensionFind.tab(args["tabIndex"]) : nil
+            ExtensionSessionValues.shared.remove(try Self.string(args["key"]), tab: tab, extensionID: context.uniqueIdentifier)
+            finish(nil)
 
         // chrome.notifications
         case ("notifications", "create"):
@@ -292,6 +342,16 @@ final class ExtensionAPIBridge {
         case ("downloads", "showDefaultFolder"):
             NSWorkspace.shared.open(DownloadManager.downloadsFolder())
             finish(nil)
+        case ("downloads", "drag"):
+            ExtensionDownloads.shared.drag(id: try Self.int(args["id"]), finish: finish, fail: fail)
+        case ("downloads", "suggestFilename"):
+            ExtensionDownloads.shared.suggestFilename(
+                requestID: try Self.int(args["requestId"]),
+                extensionID: context.uniqueIdentifier,
+                filename: args["filename"] as? String,
+                conflictAction: args["conflictAction"] as? String
+            )
+            finish(nil)
 
         // chrome.system / power / idle
         case ("system.cpu", "getInfo"):
@@ -300,6 +360,14 @@ final class ExtensionAPIBridge {
             finish(ExtensionSystem.shared.memoryInfo())
         case ("system.storage", "getInfo"):
             finish(ExtensionSystem.shared.storageInfo())
+        case ("system.storage", "getAvailableCapacity"):
+            finish(try ExtensionSystem.shared.availableCapacity(id: try Self.string(args["id"])))
+        case ("system.storage", "ejectDevice"):
+            ExtensionSystem.shared.ejectDevice(id: try Self.string(args["id"]), finish: finish)
+        case ("dns", "resolve"):
+            let hostname = try Self.string(args["hostname"])
+            guard !hostname.isEmpty else { throw APIError("A hostname is required.") }
+            ExtensionSystem.shared.resolve(hostname, flags: args["flags"] as? [String] ?? [], finish: finish, fail: fail)
         case ("power", "requestKeepAwake"):
             ExtensionSystem.shared.requestKeepAwake(level: args["level"] as? String ?? "system", extensionID: context.uniqueIdentifier)
             finish(nil)
@@ -312,7 +380,7 @@ final class ExtensionAPIBridge {
             ExtensionSystem.shared.setDetectionInterval(args["intervalInSeconds"] as? Int ?? 60)
             finish(nil)
 
-        // chrome.tts
+        // chrome.tts / chrome.ttsEngine
         case ("tts", "speak"):
             ExtensionTTS.shared.speak(options: args, extensionID: context.uniqueIdentifier, finish: finish, fail: fail)
         case ("tts", "stop"):
@@ -325,6 +393,22 @@ final class ExtensionAPIBridge {
             ExtensionTTS.shared.isSpeaking(finish: finish)
         case ("tts", "getVoices"):
             ExtensionTTS.shared.getVoices(finish: finish)
+        case ("ttsEngine", "updateVoices"):
+            ExtensionTTS.shared.updateVoices(args["voices"] as? [[String: Any]] ?? [], extensionID: context.uniqueIdentifier)
+            finish(nil)
+        case ("ttsEngine", "sendTtsEvent"):
+            try ExtensionTTS.shared.sendTtsEvent(
+                requestID: try Self.int(args["requestId"]),
+                event: args["event"] as? [String: Any] ?? [:],
+                from: context.uniqueIdentifier
+            )
+            finish(nil)
+
+        // Firefox browser.captivePortal
+        case ("captivePortal", "getState"):
+            ExtensionCaptivePortal.shared.getState(finish: finish)
+        case ("captivePortal", "getLastChecked"):
+            finish(ExtensionCaptivePortal.shared.getLastChecked())
 
         // chrome.search / Firefox browser.search
         case ("search", "query"):
@@ -376,6 +460,40 @@ final class ExtensionAPIBridge {
             finish(nil)
         case ("userScripts", "getScripts"):
             finish(ExtensionContentScripts.shared.userScripts(ids: args["ids"] as? [String], extensionID: context.uniqueIdentifier))
+        case ("userScripts", "configureWorld"):
+            try ExtensionContentScripts.shared.configureWorld(args["properties"] as? [String: Any] ?? args, extensionID: context.uniqueIdentifier)
+            finish(nil)
+        case ("userScripts", "resetWorldConfiguration"):
+            try ExtensionContentScripts.shared.resetWorldConfiguration(worldID: args["worldId"], extensionID: context.uniqueIdentifier)
+            finish(nil)
+        case ("userScripts", "getWorldConfigurations"):
+            finish(ExtensionContentScripts.shared.getWorldConfigurations(extensionID: context.uniqueIdentifier))
+        case ("userScripts", "execute"):
+            ExtensionContentScripts.shared.execute(
+                args, context: context, extensionID: context.uniqueIdentifier,
+                resources: extensions.resourcesDirectory(forID: context.uniqueIdentifier),
+                finish: finish, fail: fail
+            )
+        case ("userScripts", "replyMessage"):
+            ExtensionContentScripts.shared.replyToUserScriptMessage(
+                requestID: try Self.int(args["requestId"]),
+                response: args["response"],
+                error: args["error"] as? String
+            )
+            finish(nil)
+        case ("userScripts", "portMessage"):
+            ExtensionContentScripts.shared.sendToUserScriptPort(
+                portID: try Self.string(args["portId"]),
+                message: args["message"],
+                extensionID: context.uniqueIdentifier
+            )
+            finish(nil)
+        case ("userScripts", "portDisconnect"):
+            ExtensionContentScripts.shared.disconnectUserScriptPort(
+                portID: try Self.string(args["portId"]),
+                extensionID: context.uniqueIdentifier
+            )
+            finish(nil)
 
         // chrome.tabGroups and tabs.group / ungroup, on folders (ExtensionGroups). Tabs come as
         // indexes in the window; the shim converts ids.
@@ -393,11 +511,25 @@ final class ExtensionAPIBridge {
             try ExtensionTabGroups.shared.ungroup(args)
             finish(nil)
         case ("tabs", "extras"):
-            // Fields WebKit's tab objects lack, per index: groupId, cookieStoreId.
+            // Fields WebKit's tab objects lack, per index: groupId, cookieStoreId, hidden.
             finish([
                 "groupIds": ExtensionTabGroups.shared.groupIDs(),
                 "cookieStoreIds": ExtensionContainers.shared.cookieStoreIDs(),
+                "hidden": ExtensionTabs.shared.hiddenFlags(),
             ])
+        case ("tabs", "hide"):
+            finish(ExtensionTabs.shared.hide(indexes: args["tabs"] as? [Int] ?? [], extensionID: context.uniqueIdentifier))
+        case ("tabs", "show"):
+            ExtensionTabs.shared.show(indexes: args["tabs"] as? [Int] ?? [])
+            finish(nil)
+        case ("tabs", "moveInSuccession"):
+            try ExtensionTabs.shared.moveInSuccession(
+                tabIndexes: args["tabs"] as? [Int] ?? [],
+                targetIndex: args["targetIndex"] as? Int,
+                append: args["append"] as? Bool ?? false,
+                insert: args["insert"] as? Bool ?? false
+            )
+            finish(nil)
 
         // Firefox contextualIdentities, on profiles.
         case ("contextualIdentities", "query"):
@@ -411,6 +543,9 @@ final class ExtensionAPIBridge {
         case ("contextualIdentities", "remove"):
             ExtensionContainers.shared.remove(
                 args, extensionName: context.webExtension.displayName ?? "An extension", finish: finish, fail: fail)
+        case ("contextualIdentities", "move"):
+            try ExtensionContainers.shared.move(args)
+            finish(nil)
         case ("contextualIdentities", "openTab"):
             finish(try ExtensionContainers.shared.openTab(args))
 
@@ -489,6 +624,19 @@ final class ExtensionAPIBridge {
             try ExtensionBookmarks.shared.remove(try Self.string(args["id"]), recursive: method == "removeTree")
             finish(nil)
 
+        // chrome.readingList (ExtensionReadingList)
+        case ("readingList", "addEntry"):
+            try ExtensionReadingList.shared.addEntry(args)
+            finish(nil)
+        case ("readingList", "removeEntry"):
+            try ExtensionReadingList.shared.removeEntry(args)
+            finish(nil)
+        case ("readingList", "updateEntry"):
+            try ExtensionReadingList.shared.updateEntry(args)
+            finish(nil)
+        case ("readingList", "query"):
+            finish(try ExtensionReadingList.shared.query(args))
+
         // chrome.declarativeContent (ExtensionDeclarativeContent)
         case ("declarativeContent", "addRules"):
             finish(try ExtensionDeclarativeContent.shared.addRules(args["rules"] as? [[String: Any]] ?? [], extensionID: context.uniqueIdentifier))
@@ -498,7 +646,7 @@ final class ExtensionAPIBridge {
         case ("declarativeContent", "getRules"):
             finish(ExtensionDeclarativeContent.shared.getRules(args["ids"] as? [String], extensionID: context.uniqueIdentifier))
 
-        // Badge colours (Tuff draws the badge; see ExtensionBadgeColors).
+        // Badge colours & user settings (Tuff draws the badge and pins buttons).
         case ("action", "setBadgeColor"):
             let tab = args["tabIndex"] != nil ? try ExtensionFind.tab(args["tabIndex"]) : nil
             try ExtensionBadgeColors.shared.set(try Self.string(args["kind"]), value: args["color"], tab: tab, extensionID: context.uniqueIdentifier)
@@ -506,12 +654,167 @@ final class ExtensionAPIBridge {
         case ("action", "getBadgeTextColor"):
             let tab = args["tabIndex"] != nil ? try ExtensionFind.tab(args["tabIndex"]) : nil
             finish(ExtensionBadgeColors.shared.textColor(for: context.uniqueIdentifier, tab: tab))
+        case ("action", "getUserSettings"):
+            let pinned = extensions.records.first(where: { $0.id == context.uniqueIdentifier })?.isPinned ?? false
+            finish(["isOnToolbar": pinned])
+
+        // chrome.cookies gaps
+        case ("cookies", "getPartitionKey"):
+            let tab = args["tabIndex"] != nil ? try ExtensionFind.tab(args["tabIndex"]) : browser.selectedTab
+            finish(ExtensionCookies.partitionKey(for: tab?.url, frameID: args["frameId"] as? Int))
+
+        // chrome.declarativeNetRequest gaps (ExtensionDNR)
+        case ("declarativeNetRequest", "getAvailableStaticRuleCount"):
+            let perms = context.currentPermissions
+            guard perms.contains(.declarativeNetRequest) || perms.contains(.declarativeNetRequestWithHostAccess) else {
+                throw APIError("This extension does not have the declarativeNetRequest permission.")
+            }
+            finish(ExtensionDNR.availableStaticRuleCount(
+                manifest: context.webExtension.manifest,
+                resources: extensions.resourcesDirectory(forID: context.uniqueIdentifier),
+                enabledRulesetIDs: args["enabledRulesetIds"] as? [String],
+                disabledByRuleset: ExtensionDNR.shared.disabledMap(for: context.uniqueIdentifier)
+            ))
+        case ("declarativeNetRequest", "testMatchOutcome"):
+            let perms = context.currentPermissions
+            guard perms.contains(.declarativeNetRequest) || perms.contains(.declarativeNetRequestWithHostAccess) || perms.contains(.declarativeNetRequestFeedback) else {
+                throw APIError("This extension does not have the declarativeNetRequest permission.")
+            }
+            finish(try ExtensionDNR.testMatchOutcome(
+                request: args["request"] as? [String: Any] ?? [:],
+                manifest: context.webExtension.manifest,
+                resources: extensions.resourcesDirectory(forID: context.uniqueIdentifier),
+                enabledRulesetIDs: args["enabledRulesetIds"] as? [String],
+                dynamicRules: args["dynamicRules"] as? [[String: Any]] ?? [],
+                sessionRules: args["sessionRules"] as? [[String: Any]] ?? [],
+                disabledByRuleset: ExtensionDNR.shared.disabledMap(for: context.uniqueIdentifier)
+            ))
+        case ("declarativeNetRequest", "updateStaticRules"):
+            let perms = context.currentPermissions
+            guard perms.contains(.declarativeNetRequest) || perms.contains(.declarativeNetRequestWithHostAccess) else {
+                throw APIError("This extension does not have the declarativeNetRequest permission.")
+            }
+            try ExtensionDNR.shared.updateStaticRules(
+                rulesetID: try Self.string(args["rulesetId"]),
+                disableRuleIDs: args["disableRuleIds"] as? [Int] ?? [],
+                enableRuleIDs: args["enableRuleIds"] as? [Int] ?? [],
+                extensionID: context.uniqueIdentifier,
+                manifest: context.webExtension.manifest,
+                resources: extensions.resourcesDirectory(forID: context.uniqueIdentifier)
+            )
+            finish(nil)
+        case ("declarativeNetRequest", "getDisabledRuleIds"):
+            let perms = context.currentPermissions
+            guard perms.contains(.declarativeNetRequest) || perms.contains(.declarativeNetRequestWithHostAccess) else {
+                throw APIError("This extension does not have the declarativeNetRequest permission.")
+            }
+            finish(try ExtensionDNR.shared.disabledRuleIDs(
+                rulesetID: try Self.string(args["rulesetId"]),
+                extensionID: context.uniqueIdentifier,
+                manifest: context.webExtension.manifest
+            ))
+
+        // Firefox menus.overrideContext & custom tab/bookmark menu items
+        case ("menus", "overrideContext"):
+            try ExtensionMenus.shared.overrideContext(args, extensionID: context.uniqueIdentifier)
+            finish(nil)
+        case ("menus", "registerItem"):
+            ExtensionMenus.shared.registerItem(args, extensionID: context.uniqueIdentifier)
+            finish(nil)
+        case ("menus", "removeItem"):
+            ExtensionMenus.shared.removeItem(id: args["id"] as? String, extensionID: context.uniqueIdentifier)
+            finish(nil)
+
+        // chrome.storage.managed / browser.storage.managed
+        case ("storage.managed", "get"):
+            finish(ExtensionManagedStorage.shared.get(
+                keys: args["keys"],
+                extensionID: context.uniqueIdentifier,
+                manifest: context.webExtension.manifest
+            ))
+        case ("storage.managed", "getKeys"):
+            finish(ExtensionManagedStorage.shared.getKeys(
+                extensionID: context.uniqueIdentifier,
+                manifest: context.webExtension.manifest
+            ))
+        case ("storage.managed", "getBytesInUse"):
+            finish(ExtensionManagedStorage.shared.getBytesInUse(
+                keys: args["keys"],
+                extensionID: context.uniqueIdentifier,
+                manifest: context.webExtension.manifest
+            ))
+
+        // Firefox browser.pkcs11
+        case ("pkcs11", "installModule"):
+            try ExtensionPKCS11.shared.installModule(
+                name: try Self.string(args["name"]),
+                flags: args["flags"] as? Int ?? 0,
+                extensionID: context.uniqueIdentifier,
+                manifest: context.webExtension.manifest
+            )
+            finish(nil)
+        case ("pkcs11", "uninstallModule"):
+            try ExtensionPKCS11.shared.uninstallModule(
+                name: try Self.string(args["name"]),
+                extensionID: context.uniqueIdentifier,
+                manifest: context.webExtension.manifest
+            )
+            finish(nil)
+        case ("pkcs11", "isModuleInstalled"):
+            finish(try ExtensionPKCS11.shared.isModuleInstalled(
+                name: try Self.string(args["name"]),
+                extensionID: context.uniqueIdentifier,
+                manifest: context.webExtension.manifest
+            ))
+        case ("pkcs11", "getModuleSlots"):
+            finish(try ExtensionPKCS11.shared.getModuleSlots(
+                name: try Self.string(args["name"]),
+                extensionID: context.uniqueIdentifier,
+                manifest: context.webExtension.manifest
+            ))
+
+        // Firefox proxy.onRequest
+        case ("proxy", "registerOnRequest"):
+            ExtensionProxyRelay.shared.registerOnRequest(
+                extensionID: context.uniqueIdentifier,
+                urls: args["urls"] as? [String] ?? []
+            )
+            finish(nil)
+        case ("proxy", "unregisterOnRequest"):
+            ExtensionProxyRelay.shared.unregisterOnRequest(extensionID: context.uniqueIdentifier)
+            finish(nil)
+        case ("proxy", "replyOnRequest"):
+            ExtensionProxyRelay.shared.replyOnRequest(
+                requestID: try Self.int(args["requestId"]),
+                result: args["result"],
+                error: args["error"] as? String
+            )
+            finish(nil)
+
+        // chrome.webAuthenticationProxy (ExtensionWebAuthn)
+        case ("webAuthenticationProxy", "attach"):
+            try ExtensionWebAuthn.shared.attach(extensionID: context.uniqueIdentifier)
+            finish(nil)
+        case ("webAuthenticationProxy", "detach"):
+            try ExtensionWebAuthn.shared.detach(extensionID: context.uniqueIdentifier)
+            finish(nil)
+        case ("webAuthenticationProxy", "completeCreateRequest"):
+            try ExtensionWebAuthn.shared.completeCreateRequest(args, extensionID: context.uniqueIdentifier)
+            finish(nil)
+        case ("webAuthenticationProxy", "completeGetRequest"):
+            try ExtensionWebAuthn.shared.completeGetRequest(args, extensionID: context.uniqueIdentifier)
+            finish(nil)
+        case ("webAuthenticationProxy", "completeIsUvpaaRequest"):
+            try ExtensionWebAuthn.shared.completeIsUvpaaRequest(args, extensionID: context.uniqueIdentifier)
+            finish(nil)
 
         // Gaps in namespaces WebKit has.
         case ("i18n", "detectLanguage"):
             finish(Self.detectLanguage(args["text"] as? String ?? ""))
         case ("system.display", "getInfo"):
             finish(ExtensionSystem.shared.displayInfo())
+        case ("system.display", "getDisplayLayout"):
+            finish(ExtensionSystem.shared.displayLayout())
         case ("tabs", "discard"):
             let tab = try ExtensionFind.tab(args["tabIndex"])
             guard !browser.isOnScreen(tab) else { throw APIError("Cannot discard the active tab.") }
@@ -523,10 +826,23 @@ final class ExtensionAPIBridge {
             browser.select(try ExtensionFind.tab(first))
             finish(nil)
         case ("tabs", "zoomSettings"):
-            finish(["mode": "automatic", "scope": "per-origin", "defaultZoomFactor": SiteZoom.defaultZoom])
+            let tab = args["tabIndex"] != nil ? try ExtensionFind.tab(args["tabIndex"]) : browser.selectedTab
+            finish(tab?.zoomSettingsDictionary ?? ["mode": "automatic", "scope": "per-origin", "defaultZoomFactor": SiteZoom.defaultZoom])
+        case ("tabs", "setZoomSettings"):
+            let tab = try ExtensionFind.tab(args["tabIndex"])
+            try tab.setZoomSettings(mode: args["mode"] as? String, scope: args["scope"] as? String)
+            finish(nil)
         case ("tabs", "print"):
             AppDelegate.shared?.printPage(nil)
             finish(nil)
+        case ("tabs", "captureTab"):
+            ExtensionPageCapture.captureTab(args, context: context, finish: finish, fail: fail)
+        case ("tabs", "saveAsPDF"):
+            ExtensionPageCapture.saveAsPDF(args, finish: finish, fail: fail)
+        case ("pageCapture", "saveAsMHTML"):
+            ExtensionPageCapture.saveAsMHTML(args, finish: finish, fail: fail)
+        case ("runtime", "getContexts"):
+            finish(extensionContexts(context))
         case ("runtime", "getBrowserInfo"):
             let info = Bundle.main.infoDictionary ?? [:]
             finish([
@@ -546,9 +862,35 @@ final class ExtensionAPIBridge {
                     return
                 }
                 finish(["status": "update_available", "version": latest])
-                // Tuff installs updates straight away (Chrome waits for a restart or runtime.reload).
-                self.extensions.updateFromStore(id: record.id)
+                // Straight away, unless the extension listens for onUpdateAvailable.
+                if !self.extensions.offerUpdate(record, version: latest) { self.extensions.updateFromStore(id: record.id) }
             }
+        case ("runtime", "installWaitingUpdate"):
+            finish(extensions.installWaitingUpdate(id: context.uniqueIdentifier))
+        case ("runtime", "packageStat"):
+            finish(try Self.packageStat(path: args["path"] as? String ?? "/", in: extensions.resourcesDirectory(forID: context.uniqueIdentifier)))
+        case ("runtime", "packageList"):
+            finish(try Self.packageList(path: args["path"] as? String ?? "/", in: extensions.resourcesDirectory(forID: context.uniqueIdentifier)))
+        // chrome.debugger (ExtensionDebugger)
+        case ("debugger", "attach"):
+            try ExtensionDebugger.shared.attach(args, context: context)
+            finish(nil)
+        case ("debugger", "detach"):
+            try ExtensionDebugger.shared.detach(args, context: context)
+            finish(nil)
+        case ("debugger", "sendCommand"):
+            try ExtensionDebugger.shared.sendCommand(args, context: context, finish: finish, fail: fail)
+        case ("debugger", "getTargets"):
+            finish(ExtensionDebugger.shared.targets())
+
+        case ("commands", "update"):
+            try ExtensionCommands.shared.update(args["detail"] as? [String: Any] ?? [:], context: context, id: context.uniqueIdentifier)
+            finish(nil)
+        case ("commands", "reset"):
+            try ExtensionCommands.shared.reset(args["name"] as? String ?? "", context: context, id: context.uniqueIdentifier)
+            finish(nil)
+        case ("commands", "descriptions"):
+            finish(ExtensionCommands.shared.descriptions(id: context.uniqueIdentifier))
         case ("commands", "openShortcutSettings"):
             AppDelegate.shared?.showSettings(tab: .extensions)
             finish(nil)
@@ -659,7 +1001,10 @@ final class ExtensionAPIBridge {
         "downloads": true, "formData": true, "passwords": true,
     ]
 
-    private func removeBrowsingData(types: [String: Any], since: Double, finish: @escaping (Any?) -> Void) {
+    private func removeBrowsingData(
+        types: [String: Any], since: Double, origins: [String]? = nil, excludeOrigins: [String]? = nil,
+        finish: @escaping (Any?) -> Void
+    ) {
         var dataTypes = Set<String>()
         if types["cache"] as? Bool == true {
             dataTypes.formUnion([WKWebsiteDataTypeDiskCache, WKWebsiteDataTypeMemoryCache, WKWebsiteDataTypeFetchCache])
@@ -682,17 +1027,162 @@ final class ExtensionAPIBridge {
         }
         // The downloads list (the files stay), as in Chrome.
         if types["downloads"] as? Bool == true { DownloadManager.shared.clearFinished(isPrivate: false, since: since > 0 ? Date(timeIntervalSince1970: since / 1000) : nil) }
-        // Tuff saves no passwords or form entries, so there is nothing to remove for those.
+        if types["passwords"] as? Bool == true {
+            PasswordStore.shared.remove(
+                since: since > 0 ? Date(timeIntervalSince1970: since / 1000) : nil,
+                origins: origins.map(Set.init),
+                excludeOrigins: excludeOrigins.map(Set.init)
+            )
+        }
+        // Tuff saves no form-autofill entries, so there is nothing to remove for formData.
 
         let date = since > 0 ? Date(timeIntervalSince1970: since / 1000) : .distantPast
         let stores = DataStores.all
         guard !dataTypes.isEmpty else { finish(nil); return }
+        // Exclude installed extensions' own origins so removing Fetch caches / service workers
+        // never terminates the calling extension's own service worker.
+        let protectedHosts = Set(extensions.records.map { $0.id.lowercased() })
+        let originHosts = origins.map { Set($0.compactMap { URL(string: $0)?.host?.lowercased() }) }
+        let excludedHosts = excludeOrigins.map { Set($0.compactMap { URL(string: $0)?.host?.lowercased() }) }
         let group = DispatchGroup()
         for store in stores {
             group.enter()
-            store.removeData(ofTypes: dataTypes, modifiedSince: date) { group.leave() }
+            store.fetchDataRecords(ofTypes: dataTypes) { records in
+                let targets = records.filter { record in
+                    let name = record.displayName.lowercased()
+                    if protectedHosts.contains(name) || name.hasSuffix("-extension") { return false }
+                    if let originHosts, !originHosts.contains(where: { $0 == name || $0.hasSuffix("." + name) || name.hasSuffix("." + $0) }) {
+                        return false
+                    }
+                    if let excludedHosts, excludedHosts.contains(where: { $0 == name || $0.hasSuffix("." + name) || name.hasSuffix("." + $0) }) {
+                        return false
+                    }
+                    return true
+                }
+                if targets.isEmpty {
+                    group.leave()
+                } else if originHosts == nil && excludedHosts == nil && protectedHosts.isEmpty {
+                    store.removeData(ofTypes: dataTypes, modifiedSince: date) { group.leave() }
+                } else {
+                    store.removeData(ofTypes: dataTypes, for: targets) { group.leave() }
+                }
+            }
         }
         group.notify(queue: .main) { finish(nil) }
+    }
+
+    // MARK: runtime.getContexts
+
+    /// The extension's open pages and background, in Chrome's `ExtensionContext` shape. Tabs go
+    /// by their index in the window (`tabIndex`, -1 for none); the shim swaps in tab and window ids.
+    /// Popups aren't listed: WebKit shows them, and doesn't say when one is open.
+    private func extensionContexts(_ context: WKWebExtensionContext) -> [[String: Any]] {
+        let id = context.uniqueIdentifier
+        var origin = context.baseURL.absoluteString
+        if origin.hasSuffix("/") { origin.removeLast() }
+        func item(_ type: String, key: String, url: URL?, frameID: Int = 0, tabIndex: Int = -1) -> [String: Any] {
+            var item: [String: Any] = [
+                "contextType": type, "contextId": key, "tabIndex": tabIndex, "frameId": frameID, "incognito": false,
+                "documentOrigin": origin,
+            ]
+            if let url { item["documentUrl"] = url.absoluteString }
+            if frameID >= 0 { item["documentId"] = key }
+            return item
+        }
+        var list: [[String: Any]] = []
+        let manifest = context.webExtension.manifest
+        if context.webExtension.hasBackgroundContent {
+            let background = manifest["background"] as? [String: Any] ?? [:]
+            if let worker = background["service_worker"] as? String {
+                list.append(item("BACKGROUND", key: "\(id):background", url: URL(string: worker, relativeTo: context.baseURL)?.absoluteURL, frameID: -1))
+            } else {
+                let page = background["page"] as? String ?? "_generated_background_page.html"
+                list.append(item("BACKGROUND", key: "\(id):background", url: URL(string: page, relativeTo: context.baseURL)?.absoluteURL))
+            }
+        }
+        for (index, tab) in browser.allTabs.enumerated() where tab.url != nil && extensions.context(forPage: tab.url) === context {
+            list.append(item("TAB", key: tab.id.uuidString, url: tab.url, tabIndex: index))
+        }
+        if let host = SidePanelManager.shared.host, host.extensionID == id {
+            list.append(item("SIDE_PANEL", key: "\(id):side-panel", url: host.requestedURL))
+        }
+        if let popup = extensions.openPopup(for: id) {
+            list.append(item("POPUP", key: "\(id):popup", url: popup.popupWebView?.url))
+        }
+        if let url = ExtensionOffscreen.shared.url(id: id) {
+            list.append(item("OFFSCREEN_DOCUMENT", key: "\(id):offscreen", url: url))
+        }
+        return list
+    }
+
+    // MARK: runtime.getPackageDirectoryEntry
+
+    static func resolvePackageURL(_ rawPath: String, in root: URL?) throws -> (url: URL, fullPath: String) {
+        guard let root else { throw APIError("Extension package directory is unavailable.") }
+        let base = root.standardizedFileURL
+        let trimmed = rawPath.trimmingCharacters(in: .whitespaces)
+        let components = trimmed.split(separator: "/").map(String.init)
+        var resolved: [String] = []
+        for part in components {
+            if part.isEmpty || part == "." { continue }
+            if part == ".." {
+                if !resolved.isEmpty { resolved.removeLast() }
+                continue
+            }
+            resolved.append(part)
+        }
+        let target = resolved.reduce(base) { $0.appendingPathComponent($1) }.standardizedFileURL
+        guard target.path == base.path || target.path.hasPrefix(base.path + "/") else {
+            throw APIError("Path is outside the extension package.")
+        }
+        let fullPath = resolved.isEmpty ? "/" : "/" + resolved.joined(separator: "/")
+        return (target, fullPath)
+    }
+
+    static func packageStat(path: String, in root: URL?) throws -> [String: Any] {
+        let (target, fullPath) = try resolvePackageURL(path, in: root)
+        var isDir: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: target.path, isDirectory: &isDir) else {
+            throw APIError("NotFoundError: Entry not found.")
+        }
+        if target.lastPathComponent.hasPrefix("__tuff_") {
+            throw APIError("NotFoundError: Entry not found.")
+        }
+        let attrs = (try? FileManager.default.attributesOfItem(atPath: target.path)) ?? [:]
+        let size = (attrs[.size] as? NSNumber)?.int64Value ?? 0
+        let mtime = ((attrs[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0) * 1000
+        return [
+            "name": fullPath == "/" ? "" : target.lastPathComponent,
+            "fullPath": fullPath,
+            "isDirectory": isDir.boolValue,
+            "isFile": !isDir.boolValue,
+            "size": size,
+            "modificationTime": mtime,
+        ]
+    }
+
+    static func packageList(path: String, in root: URL?) throws -> [[String: Any]] {
+        let (target, fullPath) = try resolvePackageURL(path, in: root)
+        var isDir: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: target.path, isDirectory: &isDir), isDir.boolValue else {
+            throw APIError("NotFoundError: Directory not found.")
+        }
+        let items = (try? FileManager.default.contentsOfDirectory(at: target, includingPropertiesForKeys: [.isDirectoryKey, .fileSizeKey, .contentModificationDateKey], options: [.skipsHiddenFiles])) ?? []
+        return items.compactMap { item -> [String: Any]? in
+            let name = item.lastPathComponent
+            if name.hasPrefix("__tuff_") { return nil }
+            let values = try? item.resourceValues(forKeys: [.isDirectoryKey, .fileSizeKey, .contentModificationDateKey])
+            let dir = values?.isDirectory ?? false
+            let entryPath = fullPath == "/" ? "/\(name)" : "\(fullPath)/\(name)"
+            return [
+                "name": name,
+                "fullPath": entryPath,
+                "isDirectory": dir,
+                "isFile": !dir,
+                "size": values?.fileSize ?? 0,
+                "modificationTime": (values?.contentModificationDate?.timeIntervalSince1970 ?? 0) * 1000,
+            ]
+        }.sorted { ($0["name"] as? String ?? "") < ($1["name"] as? String ?? "") }
     }
 
     // MARK: management
@@ -704,7 +1194,7 @@ final class ExtensionAPIBridge {
             "name": record.name,
             "version": record.version,
             "enabled": record.enabled,
-            "type": "extension",
+            "type": record.isStaticTheme ? "theme" : "extension",
             "installType": record.source == .unpacked ? "development" : "normal",
             "mayDisable": true,
             "isApp": false,

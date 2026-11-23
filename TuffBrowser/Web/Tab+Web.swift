@@ -19,6 +19,11 @@ extension Tab: WKNavigationDelegate {
         let pageURL = (navigationAction.targetFrame?.isMainFrame ?? true) ? navigationAction.request.url : webView.url
         SiteSettings.apply(to: preferences, for: pageURL, incognito: browser?.isPrivate ?? false)
         if navigationAction.shouldPerformDownload {
+            if navigationAction.navigationType == .other,
+               SiteSettings.shared.automaticDownloadsSetting(for: webView.url ?? pageURL, incognito: browser?.isPrivate ?? false) == "block" {
+                decisionHandler(.cancel, preferences)
+                return
+            }
             decisionHandler(.download, preferences)
             return
         }
@@ -146,7 +151,7 @@ extension Tab: WKNavigationDelegate {
     /// first visit to youtube.com, whose redirect and service worker hit an edge case), which
     /// turned the page into a downloaded `.html` file and left the tab blank. Never download
     /// content a browser obviously renders unless the server asked for it (Content-Disposition).
-    private static func isRenderable(_ mimeType: String?) -> Bool {
+    static func isRenderable(_ mimeType: String?) -> Bool {
         guard let type = mimeType?.lowercased(), !type.isEmpty else { return true }
         if type.hasPrefix("text/") { return true }
         return [
@@ -193,8 +198,7 @@ extension Tab: WKNavigationDelegate {
     /// menu's "Save … As…" items mark theirs to ask where (`TuffWebView.saveContextDownloadAs`).
     @objc(_webView:contextMenuDidCreateDownload:)
     func webView(_ webView: WKWebView, contextMenuDidCreateDownload download: WKDownload) {
-        let asks = contextSaveAsRequested.map { Date().timeIntervalSince($0) < 10 } ?? false
-        contextSaveAsRequested = nil
+        let asks = (webView as? TuffWebView)?.takeContextSaveAsRequest() ?? false
         DownloadManager.shared.track(download, saveLocation: asks ? .ask : .downloadsFolder, isPrivate: browser?.isPrivate ?? false)
     }
 
@@ -234,6 +238,7 @@ extension Tab: WKNavigationDelegate {
             let sameSite = favicon != nil && host != nil && faviconHost == host
             url = u
             applySiteZoom()
+            applySiteSound()
             favicon = InternalPage.icon(for: u) ?? ExtensionManager.shared.icon(forPage: u)
                 ?? (sameSite ? favicon : nil) ?? FaviconStore.shared.cachedIcon(for: u) ?? favicon
             faviconHost = host
@@ -242,6 +247,8 @@ extension Tab: WKNavigationDelegate {
         }
         browser?.tabDidNavigate(self)
         ExtensionDeclarativeContent.shared.evaluate(self)
+        ExtensionDebugger.shared.pageCommitted(self)
+        ExtensionWebAuthn.shared.cancelRequests(for: webView)
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
@@ -268,6 +275,8 @@ extension Tab: WKNavigationDelegate {
             return
         }
         refreshHeaderColor()
+        ExtensionDeclarativeContent.shared.pageLoaded(self)
+        ExtensionDebugger.shared.pageLoaded(self)
         // A sign-in sent from the page before this one.
         if pendingLogin != nil { DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in self?.offerPendingLogin() } }
         translationPageDidFinish()
@@ -534,7 +543,10 @@ extension Tab: WKUIDelegate {
             destructive: true
         )
         Task { @MainActor in
-            let leave = await askForPage(prompt)?.confirmed ?? true
+            let answer = await ExtensionDebugger.shared.pageDialog(
+                in: self, type: "beforeunload", message: message, url: frame.request.url, prompt: prompt
+            ) { await self.askForPage(prompt) }
+            let leave = answer?.confirmed ?? true
             beforeUnloadShowing = false
             if !leave { pendingClose = nil }
             completionHandler(leave)
@@ -595,7 +607,8 @@ extension Tab: WKUIDelegate {
         guard let browser else { return nil }
         if !browser.isOnScreen(self) {
             let shown = await withCheckedContinuation { dialogWaiters.append($0) }
-            guard shown else { return nil }
+            // An extension debugging the tab may have answered while it waited (chrome.debugger).
+            guard shown, !Task.isCancelled else { return nil }
         }
         // The other side of a split: it takes the keyboard, so the card is plainly its own.
         if browser.selectedTab !== self, browser.isOnScreen(self) { browser.select(self) }
@@ -607,8 +620,13 @@ extension Tab: WKUIDelegate {
     /// Shows a page's alert() / confirm() / prompt() card, unless the user has blocked the page's
     /// dialogs. Nil when it wasn't shown or the page went away.
     @MainActor
-    private func askForPageDialog(_ prompt: Prompt) async -> PromptResult? {
-        guard !pageDialogsBlocked, let result = await askForPage(prompt) else { return nil }
+    private func askForPageDialog(_ prompt: Prompt, type: String, message: String, defaultText: String = "", frame: WKFrameInfo) async -> PromptResult? {
+        guard !pageDialogsBlocked else { return nil }
+        // An extension debugging the tab (chrome.debugger) may answer it instead.
+        let answer = await ExtensionDebugger.shared.pageDialog(
+            in: self, type: type, message: message, defaultPrompt: defaultText, url: frame.request.url, prompt: prompt
+        ) { [weak self] in await self?.askForPage(prompt) }
+        guard let result = answer else { return nil }
         pageDialogCount += 1
         if result.checked { pageDialogsBlocked = true }
         return result
@@ -621,7 +639,7 @@ extension Tab: WKUIDelegate {
         guard !pageDialogsBlocked else { completionHandler(); return }
         let prompt = pagePrompt(frame, message)
         Task { @MainActor in
-            _ = await askForPageDialog(prompt)
+            _ = await askForPageDialog(prompt, type: "alert", message: message, frame: frame)
             completionHandler()
         }
     }
@@ -632,7 +650,9 @@ extension Tab: WKUIDelegate {
     ) {
         guard !pageDialogsBlocked else { completionHandler(false); return }
         let prompt = pagePrompt(frame, message, cancel: "Cancel")
-        Task { @MainActor in completionHandler(await askForPageDialog(prompt)?.confirmed ?? false) }
+        Task { @MainActor in
+            completionHandler(await askForPageDialog(prompt, type: "confirm", message: message, frame: frame)?.confirmed ?? false)
+        }
     }
 
     func webView(
@@ -647,7 +667,7 @@ extension Tab: WKUIDelegate {
         guard !pageDialogsBlocked else { completionHandler(nil); return }
         let card = pagePrompt(frame, prompt, cancel: "Cancel", fields: [Prompt.Field(placeholder: "", text: defaultText ?? "")])
         Task { @MainActor in
-            let result = await askForPageDialog(card)
+            let result = await askForPageDialog(card, type: "prompt", message: prompt, defaultText: defaultText ?? "", frame: frame)
             completionHandler(result?.confirmed == true ? result?.fields.first ?? "" : nil)
         }
     }
@@ -717,6 +737,11 @@ extension Tab: WKUIDelegate {
         let incognito = browser?.isPrivate ?? false
         if kind.isRemembered, let remembered = SitePermissions.shared.decision(origin: key, kind: kind, incognito: incognito) {
             decide(remembered)
+            return
+        }
+        // Not recorded, so turning the setting off brings the prompt back.
+        if kind == .location, AppSettings.shared.privacy.blockLocationRequests {
+            decide(false)
             return
         }
         // A newer request replaces one that is still waiting.

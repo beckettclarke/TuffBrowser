@@ -6,7 +6,7 @@ struct SyncPage: View {
     @State private var sync = SyncManager.shared
 
     var body: some View {
-        SettingsPage(title: "Sync", subtitle: "Your bookmarks, history, passwords and tabs on all your devices.") {
+        SettingsPage(title: "Sync", subtitle: "Your bookmarks, history, passwords, tabs and spaces on all your devices.") {
             if let account = sync.account {
                 accountGroup(account)
                 kindsGroup
@@ -114,6 +114,14 @@ struct SyncPage: View {
                     title: kind.title, detail: kind.detail, symbol: kind.symbol,
                     isOn: Binding(get: { sync.isEnabled(kind) }, set: { sync.setEnabled(kind, $0) })
                 )
+                if kind == .spaces, sync.isEnabled(.spaces) {
+                    SwitchRow(
+                        title: "Include open tabs",
+                        detail: "Also sync each space’s open tabs, not just pinned tabs and favorites. In Zen, turn on “Include unpinned tabs” too.",
+                        symbol: "square.on.square",
+                        isOn: Binding(get: { sync.includesOpenTabs }, set: { sync.includesOpenTabs = $0 })
+                    )
+                }
             }
             if profiles.count > 1, let current = sync.profileID ?? profiles.first?.id {
                 SettingsRow(title: "Profile", detail: "Whose bookmarks, history and passwords sync. Changing it merges that profile’s into your account.") {

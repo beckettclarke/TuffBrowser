@@ -54,6 +54,7 @@ struct BookmarksBar: View {
 
     /// An item's width: its icon, and its title up to `maxTitleWidth`.
     static func width(of bookmark: Bookmark) -> CGFloat {
+        if bookmark.isSeparator { return 9 }
         let title = bookmark.isFolder ? bookmark.displayTitle : bookmark.title.trimmed
         guard !title.isEmpty else { return 28 }
         let text = (title as NSString).size(withAttributes: [.font: font]).width.rounded(.up)
@@ -87,6 +88,22 @@ private struct BookmarkBarItem: View {
     @State private var targeted = false
 
     var body: some View {
+        if bookmark.isSeparator {
+            Rectangle()
+                .fill(.primary.opacity(0.18))
+                .frame(width: 1, height: 14)
+                .frame(width: width, height: BookmarksBar.itemHeight)
+                .contentShape(Rectangle())
+                .contextMenu {
+                    Button("Delete Separator") { Task { @MainActor in await state.delete(bookmark) } }
+                }
+        } else {
+            itemBody
+        }
+    }
+
+    @ViewBuilder
+    private var itemBody: some View {
         let title = bookmark.isFolder ? bookmark.displayTitle : bookmark.title.trimmed
         let shape = RoundedRectangle(cornerRadius: 7, style: .continuous)
         HStack(spacing: 6) {
@@ -192,7 +209,9 @@ private struct BookmarkListMenu: View {
                 StripMenuDivider()
             }
             ForEach(list) { item in
-                if item.isFolder {
+                if item.isSeparator {
+                    StripMenuDivider()
+                } else if item.isFolder {
                     StripMenuRow(title: item.displayTitle, symbol: "folder", disclosure: true) {
                         path.append(item)
                     }

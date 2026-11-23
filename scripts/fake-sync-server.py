@@ -7,8 +7,9 @@ end to end without a Mozilla account (debug builds only).
 
 Debug builds with TUFF_SYNC_SERVER skip the OAuth server and ask this one for tokens; `sync fake`
 signs in with FAKE_SYNC_KEY below. Hawk signatures are checked. GET /debug/dump prints every
-record, decrypted with openssl, to check what Tuff uploads; POST /debug/put/<collection> with a
-JSON array of cleartext records stores them as another device would.
+record, decrypted with openssl, to check what Tuff uploads; POST /debug/init sets the account up as
+another browser would have, and POST /debug/put/<collection> with a JSON array of cleartext records
+stores them as another device would.
 """
 import base64, hashlib, hmac, json, subprocess, sys, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -159,6 +160,17 @@ class Handler(BaseHTTPRequestHandler):
             return self.reply(200, ts, {"X-Last-Modified": "%.2f" % ts})
 
     def do_POST(self):
+        if self.path == "/debug/init":
+            # An account another browser set up: meta/global and crypto/keys, before Tuff signs in.
+            import os
+            key = b64url(FAKE_SYNC_KEY)
+            bulk = [base64.b64encode(os.urandom(32)).decode(), base64.b64encode(os.urandom(32)).decode()]
+            engines = {name: {"version": version, "syncID": name[:12].ljust(12, "x")} for name, version in
+                       [("bookmarks", 2), ("history", 1), ("passwords", 1), ("tabs", 1), ("clients", 1), ("spaces", 3)]}
+            with lock:
+                self.store("crypto", [{"id": "keys", "payload": encrypt({"id": "keys", "default": bulk, "collections": {}}, (key[:32], key[32:]))}], now())
+                self.store("meta", [{"id": "global", "payload": json.dumps({"syncID": "fakeglobal01", "storageVersion": 5, "engines": engines, "declined": []})}], now())
+            return self.reply(200, {})
         if self.path.startswith("/debug/put/"):
             # Another device's cleartext records, encrypted here (to test reading Firefox's).
             name = self.path.split("/")[3]

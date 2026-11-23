@@ -42,6 +42,30 @@
   `timeload <url>`, `snapscreen <path>` in `TUFF_DEBUG_SCRIPT` (see `Support/PerfProbe.swift`).
   Page benchmarks need the screen unlocked: a locked Mac reports every page as hidden.
 
+## Page cost: what Tuff adds to every page
+
+Every frame of every page pays for what Tuff injects, on top of what WebKit costs in Safari.
+
+- Tuff's own page scripts share one content
+  world (`WebEngine.scriptWorld`; each extra world is a whole JS global per frame). A script for one or
+  two sites gets URL patterns (`ExtensionContentScripts.makeScript`), not a check inside it. No
+  document-wide MutationObserver in pages (`LiveFavicon` watches only `<head>`).
+- **Content blocker:** generic element hiding stays in a list of its own with no trigger conditions, so
+  WebKit compiles it once per process into one shared style sheet (`$generichide` is an
+  `ignore-previous-rules` after it). Generic selectors that test `[style]` above the subject are left
+  out: one on a page makes every `element.style.x = …` sync the attribute and run invalidation. The uBO
+  Lite scripts keep their big data arrays as `JSON.parse` strings (`compactingDataLiterals`).
+- **Site-bound hiding rules fire on document loads only** (`"resource-type": ["document"]`,
+  `FilterListParser.domainTrigger`). As `url-filter: .*` rules on every load, each image / script /
+  fetch ran through all ~11,000 of them: Speedometer NewsSite 3.5× slower, on a site none were for.
+- **Nothing in Tuff's page scripts runs on every click, key press or scroll** unless the page needs it.
+  `PasswordAutofill` adds those listeners only after a sign-in field shows up; searching the document on
+  each click made Speedometer's TodoMVC delete / add steps 2–4× slower.
+- Measuring page cost without the app: a bare `WKWebView` host running
+  `browserbench.org/Speedometer3.1/?startAutomatically&suites=…` and reading `benchmarkClient._metrics`,
+  with Tuff's rule lists / scripts added one at a time. It needs
+  `ProcessInfo.beginActivity(.userInitiated, .latencyCritical)`, or App Nap halves every score.
+
 ## Build and test
 
 - `make build` regenerates the Xcode project from `project.yml` (XcodeGen) and builds Debug. `make build`,
@@ -89,8 +113,8 @@ Examples:
 - Passwords (`Passwords/`): `PasswordStore` keeps each profile's logins AES-GCM encrypted in
   `passwords.sealed`, key in `passwords.key`. Deliberately not the keychain: Tuff is signed ad hoc, so
   the keychain treats every update as a new app and asks for the login password. The same reason
-  `Web/WebCryptoKey.swift` hands WebKit its WebCrypto key from a file. `PasswordAutofill` runs in its
-  own content world; trust the frame's `securityOrigin`, never what the page posts.
+  `Web/WebCryptoKey.swift` hands WebKit its WebCrypto key from a file. `PasswordAutofill` runs in Tuff's
+  content world (`WebEngine.scriptWorld`, out of the page's reach); trust the frame's `securityOrigin`, never what the page posts.
 - Translate (`Web/PageTranslation.swift`): Apple's Translation framework through `.translationTask`
   (`TranslationHost` in `WebCard`), or Google's keyless endpoint when the user picks it. Never send a
   page to Google without the user's choice (Settings or the card); Incognito always asks.
@@ -98,7 +122,7 @@ Examples:
 ## Sync
 
 - `Sync/`: Firefox Sync with a Mozilla account, so Tuff syncs with Firefox, Zen and other Tuffs
-  (bookmarks, history, passwords, open tabs; not extensions). Settings → Sync (`SyncSettings.swift`).
+  (bookmarks, history, passwords, open tabs, Zen's spaces, Send Tab; not extensions). Settings → Sync (`SyncSettings.swift`).
 - Sign-in is Mozilla's own page in a tab, as the Firefox for iOS OAuth client (Mozilla registers no
   clients for other browsers): `Tab+Web` hands the redirect to `SyncManager.handleRedirect`, and the
   sync key arrives as a JWE for a one-off key pair (`ScopedKeysRequest`). Account and sync state are
@@ -107,9 +131,20 @@ Examples:
   bar, its Menu / Other / Mobile folders are folders at the end of the bar (as the Firefox import makes
   them), and separators / queries are kept on the server untouched. Other kinds keep the server's last
   record and upload only changes. Unknown record fields are always preserved.
+- Spaces (`SyncSpaces.swift`, tested in `SidebarSyncTests`) is Zen's sidebar sync, the "spaces" collection
+  (Zen's `src/zen/sync/ZenSpacesSync*.sys.mjs`): space / folder / tab / container / split / layout records.
+  Zen workspaces are spaces, Essentials are favourites, containers are profiles by name (the synced profile
+  has none). Like Zen, incoming changes win; local changes are found by diffing Tuff's projected records
+  against their digests from the last sync (`Memory.local`), so lossy fields don't bounce back. Splits,
+  live folders and unpinned tabs (unless "Include open tabs") are passed along untouched. Never runs
+  before the session is restored (an empty sidebar would delete everything).
+- Send Tab (`SendTab.swift`): the open-uri device command, Web Push encrypted (RFC 8291, tested against its
+  example). Tuff polls `/account/device/commands` every two minutes; "Send to Device" is in the tab menu.
 - Chrome sync isn't possible: Google only lets Chrome use it. The page points to Import instead.
 - Testing without an account: `scripts/fake-sync-server.py 8765`, then a debug build with
-  `TUFF_SYNC_SERVER=http://127.0.0.1:8765` and `sync fake; sync now; sync dump` in `TUFF_DEBUG_SCRIPT`.
+  `TUFF_SYNC_SERVER=http://127.0.0.1:8765` and `sync fake; sync now; sync dump` in `TUFF_DEBUG_SCRIPT`
+  (`sync sidebar` prints the spaces). `POST /debug/init` then `/debug/put/spaces` seeds it like a Zen account.
+  Send Tab needs a real account.
 
 ## Downloads and torrents
 
@@ -127,3 +162,18 @@ Examples:
 - The engine builds on its own for quick experiments, without the app:
   `swiftc -O -swift-version 5 -target arm64-apple-macos15.4 TuffBrowser/Downloads/Engine/*.swift main.swift`.
   `TorrentTests` covers encoding, v2 merkle checks, the creator, MSE and the IP filter.
+
+## Backup & Restore
+
+- `Backup/Backup.swift` + Settings → Backup & Restore (`Settings/BackupSettings.swift`): one `.tuffbackup`
+  file (a zip made by `ditto`, optionally AES-GCM sealed under a PBKDF2 password key, `BackupCrypto`)
+  holding the items the user switched on (`BackupItem`). Each item lists the Application Support files it
+  owns in `BackupItem.paths`: **a new data file in `Paths.appSupport` needs adding there** or it won't be
+  backed up. Cookies are read through `WKHTTPCookieStore` (`cookies.json`); site storage, extension page
+  storage and the Sync sign-in are deliberately not included.
+- Restore is staged in `PendingRestore/` and applied at the next launch (`AppDelegate.applicationWillFinishLaunching`,
+  before anything reads the files; settings and cookies apply once the app is up), then Tuff relaunches
+  itself. Replaced files are kept in `Before Restore/`. Never swap files under the running app: it writes
+  its in-memory copies back at quit.
+- Testing: `backup <path> [password]` and `restore <path> [password]` in `TUFF_DEBUG_SCRIPT` (restore stages
+  and quits; start the build again on the same `TUFF_DATA_DIR` to see it applied). `BackupTests` covers the rest.

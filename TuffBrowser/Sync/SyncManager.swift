@@ -4,7 +4,7 @@ import Observation
 
 /// What can be synced, by Firefox Sync's collection names.
 enum SyncKind: String, CaseIterable, Identifiable, Codable {
-    case bookmarks, history, passwords, tabs
+    case bookmarks, history, passwords, tabs, spaces
 
     var id: String { rawValue }
 
@@ -14,6 +14,7 @@ enum SyncKind: String, CaseIterable, Identifiable, Codable {
         case .history: "History"
         case .passwords: "Passwords"
         case .tabs: "Open tabs"
+        case .spaces: "Spaces"
         }
     }
 
@@ -23,6 +24,7 @@ enum SyncKind: String, CaseIterable, Identifiable, Codable {
         case .history: "Pages you visit. Clearing all history here doesn’t clear it on other devices."
         case .passwords: "Saved sign-ins, end-to-end encrypted with your account’s key."
         case .tabs: "See the tabs open on your other devices in the History menu, and let them see yours."
+        case .spaces: "Your spaces, pinned tabs, folders and favorites, kept the same as Zen’s sidebar. Zen’s containers match profiles by name."
         }
     }
 
@@ -32,11 +34,18 @@ enum SyncKind: String, CaseIterable, Identifiable, Codable {
         case .history: "clock.fill"
         case .passwords: "key.fill"
         case .tabs: "macwindow.on.rectangle"
+        case .spaces: "sidebar.left"
         }
     }
 
     /// The record format version Tuff writes (meta/global's engine versions).
-    var version: Int { self == .bookmarks ? 2 : 1 }
+    var version: Int {
+        switch self {
+        case .bookmarks: 2
+        case .spaces: 3
+        default: 1
+        }
+    }
 }
 
 /// Another device on the account and the tabs it has open.
@@ -52,6 +61,23 @@ struct SyncDevice: Identifiable, Equatable {
     /// "desktop", "mobile", "tablet"…
     var type: String
     var tabs: [OpenTab] = []
+
+    var symbol: String {
+        switch type {
+        case "mobile", "phone": "iphone"
+        case "tablet": "ipad"
+        default: "laptopcomputer"
+        }
+    }
+}
+
+/// Another device on the account that takes sent tabs (Send Tab).
+struct SendTarget: Identifiable, Equatable {
+    let id: String
+    var name: String
+    var type: String
+    /// Its key, as the device list has it (`SendTab.receiver`).
+    var commandData: String
 
     var symbol: String {
         switch type {
@@ -98,14 +124,20 @@ struct SyncState: Codable {
     var tabsHash: String?
     var clientHash: String?
     var clientUploaded: Date?
+
+    /// Sidebar sync (`SidebarSync`); optional so state saved before it existed still reads.
+    var sidebar: SidebarSync.Memory?
+    /// Sidebar sync includes open tabs, not only pinned ones (Zen's "Include unpinned tabs").
+    var sidebarTabs: Bool?
 }
 
-/// Firefox Sync: Tuff's bookmarks, history, passwords and open tabs, end-to-end encrypted on
-/// Mozilla's servers, shared with Firefox, Zen and every other browser signed in to the same
-/// Mozilla account (and other Macs running Tuff).
+/// Firefox Sync: Tuff's bookmarks, history, passwords, open tabs and (with Zen) spaces,
+/// end-to-end encrypted on Mozilla's servers, shared with Firefox, Zen and every other browser
+/// signed in to the same Mozilla account (and other Macs running Tuff).
 ///
 /// Syncs a little after launch, every ten minutes, when Tuff comes forward after a while, and
-/// shortly after bookmarks or passwords change. One profile syncs (Settings → Sync).
+/// shortly after bookmarks, passwords or the sidebar change. One profile's bookmarks, history and
+/// passwords sync (Settings → Sync); spaces sync for every profile.
 @MainActor
 @Observable
 final class SyncManager {
@@ -128,6 +160,8 @@ final class SyncManager {
     private(set) var devices: [SyncDevice] = []
     /// Bumped when the switches or profile change, so views re-read them.
     private(set) var revision = 0
+    /// Devices a tab can be sent to (Send to Device).
+    private(set) var sendTargets: [SendTarget] = []
 
     @ObservationIgnored private var state = SyncState()
     @ObservationIgnored private var signIn: MozillaAccount.SignIn?
@@ -140,6 +174,11 @@ final class SyncManager {
     /// Set while sync itself changes the stores, so those changes don't start another sync.
     @ObservationIgnored private var applying = false
     @ObservationIgnored private let changes = Debouncer(delay: 15)
+    @ObservationIgnored private var sidebarCache: [String: SidebarSync.Record]?
+    /// Device IDs → names, for "Opened a tab from …".
+    @ObservationIgnored private var deviceNames: [String: String] = [:]
+    @ObservationIgnored private var commandTimer: Timer?
+    @ObservationIgnored private var receiving = false
     @ObservationIgnored private let vault = SealedFolder(folder: Paths.appSupport.appendingPathComponent("Sync", isDirectory: true))
 
     private static let accountFile = "account.sealed"
@@ -172,14 +211,21 @@ final class SyncManager {
             let profile = note.userInfo?["profileID"] as? UUID
             MainActor.assumeIsolated { SyncManager.shared.historyRemoved(urls, profile: profile) }
         }
+        center.addObserver(forName: BrowserState.didSave, object: BrowserState.shared, queue: .main) { _ in
+            MainActor.assumeIsolated { SyncManager.shared.sidebarSaved() }
+        }
         center.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) { _ in
             MainActor.assumeIsolated {
                 let manager = SyncManager.shared
-                if (manager.lastSynced ?? .distantPast).timeIntervalSinceNow < -5 * 60 { manager.syncNow() }
+                if (manager.lastSynced ?? .distantPast).timeIntervalSinceNow < -5 * 60 { manager.syncNow() } else { manager.receiveTabs() }
             }
         }
         timer = Timer.scheduledTimer(withTimeInterval: 10 * 60, repeats: true) { _ in
             MainActor.assumeIsolated { SyncManager.shared.syncNow() }
+        }
+        // Mozilla would push sent tabs to Firefox; Tuff asks for them every couple of minutes.
+        commandTimer = Timer.scheduledTimer(withTimeInterval: 2 * 60, repeats: true) { _ in
+            MainActor.assumeIsolated { SyncManager.shared.receiveTabs() }
         }
         guard account != nil else { return }
         DispatchQueue.main.asyncAfter(deadline: .now() + 4) { SyncManager.shared.syncNow() }
@@ -188,6 +234,27 @@ final class SyncManager {
     private func localChanged() {
         guard account != nil, !applying else { return }
         changes.schedule { SyncManager.shared.syncNow() }
+    }
+
+    /// The session was saved: syncs soon if the sidebar is different from the last sync.
+    private func sidebarSaved() {
+        guard account != nil, !applying, isEnabled(.spaces), !skipped.contains(.spaces), var memory = state.sidebar,
+              !memory.mirror.isEmpty, let profile = state.profileID else { return }
+        let browser = BrowserState.shared
+        let options = SidebarSync.Options(syncProfile: profile, includeTabs: includesOpenTabs)
+        let local = SidebarSync.project(browser.sidebarSnapshot(), remote: sidebarRemote(memory), memory: &memory, options: options)
+        let digests = local.compactMapValues { SidebarSync.digest($0) }
+        if digests != memory.local { localChanged() }
+    }
+
+    /// The server's sidebar records as last seen, decoded once per sync.
+    private func sidebarRemote(_ memory: SidebarSync.Memory) -> [String: SidebarSync.Record] {
+        if let cached = sidebarCache, cached.count == memory.mirror.count { return cached }
+        let decoded = memory.mirror.compactMapValues { text in
+            (try? JSONSerialization.jsonObject(with: Data(text.utf8))) as? SidebarSync.Record
+        }
+        sidebarCache = decoded
+        return decoded
     }
 
     private func historyRemoved(_ urls: [URL], profile: UUID?) {
@@ -216,6 +283,21 @@ final class SyncManager {
         revision += 1
         saveState()
         if on { syncNow() }
+    }
+
+    /// Sidebar sync carries each space's open tabs too, not only pinned tabs and favourites.
+    var includesOpenTabs: Bool {
+        get { state.sidebarTabs ?? false }
+        set {
+            guard newValue != includesOpenTabs else { return }
+            state.sidebarTabs = newValue
+            // Records that were only passed along are Tuff's to show now (or the other way
+            // round): go through everything again, as on a first sync.
+            reset(.spaces)
+            revision += 1
+            saveState()
+            syncNow()
+        }
     }
 
     /// The profile whose bookmarks, history and passwords sync.
@@ -282,6 +364,7 @@ final class SyncManager {
             let enabled = state.enabled
             state = SyncState()
             state.enabled = enabled
+            sidebarCache = nil
             lastSynced = nil
         }
         if state.profileID == nil { state.profileID = BrowserState.shared.profiles.first?.id }
@@ -306,8 +389,10 @@ final class SyncManager {
         storage = nil
         signIn = nil
         state = SyncState()
+        sidebarCache = nil
         lastSynced = nil
         devices = []
+        sendTargets = []
         status = .idle
         needsSignIn = false
         vault.remove(Self.accountFile)
@@ -367,6 +452,7 @@ final class SyncManager {
         let keys = try await prepare(storage, account: account)
         let session = Session(storage: storage, keys: keys, info: info)
 
+        await refreshSendTab()
         let clients = try await syncClients(session)
         guard let profile = state.profileID ?? BrowserState.shared.profiles.first?.id else { return }
         if state.profileID == nil { state.profileID = profile }
@@ -376,6 +462,7 @@ final class SyncManager {
             case .history: try await syncHistory(session, profile: profile)
             case .passwords: try await syncPasswords(session, profile: profile)
             case .tabs: try await syncTabs(session, profile: profile, clients: clients)
+            case .spaces: try await syncSpaces(session, profile: profile)
             }
             saveState()
         }
@@ -528,6 +615,10 @@ final class SyncManager {
             state.historySynced = [:]
             state.historyRemoved = []
         case .tabs: state.tabsHash = nil
+        case .spaces:
+            // Pairings stay, so a restart doesn't double the sidebar.
+            state.sidebar = SidebarSync.Memory(ids: state.sidebar?.ids ?? [:])
+            sidebarCache = nil
         }
     }
 
@@ -537,6 +628,97 @@ final class SyncManager {
     private static func since(_ values: Double...) -> Double? {
         let value = values.max() ?? 0
         return value > 0 ? value : nil
+    }
+
+    // MARK: Send Tab
+
+    private var usesRealAccount: Bool {
+        #if DEBUG
+        return MozillaAccount.debugServer == nil
+        #else
+        return true
+        #endif
+    }
+
+    private var syncKey: SyncKeyBundle? {
+        account.flatMap { Data(base64URL: $0.syncKey) }.flatMap(SyncKeyBundle.init(syncKey:))
+    }
+
+    private func saveAccount() {
+        guard let account, let data = try? JSONEncoder().encode(account) else { return }
+        vault.write(data, to: Self.accountFile)
+    }
+
+    /// Lists this browser's Send Tab key with the account (once), learns which devices take
+    /// tabs, and opens any sent here. Best effort: syncing goes on without it.
+    private func refreshSendTab() async {
+        guard usesRealAccount, var current = account, let syncKey else { return }
+        do {
+            if current.sendTab == nil || current.sendTabListed != true {
+                let keys = current.sendTab ?? .make()
+                let device = try await MozillaAccount.listSendTab(current, commandData: try keys.commandData(syncKey: syncKey, keyID: current.keyID))
+                guard account?.refreshToken == current.refreshToken else { return }
+                current.sendTab = keys
+                current.sendTabListed = true
+                current.deviceID = device
+                account?.sendTab = keys
+                account?.sendTabListed = true
+                account?.deviceID = device
+                saveAccount()
+            }
+            var targets: [SendTarget] = []
+            for device in try await MozillaAccount.devices(refreshToken: current.refreshToken) {
+                guard let id = device["id"] as? String else { continue }
+                let name = device["name"] as? String ?? "Unnamed device"
+                deviceNames[id] = name
+                guard device["isCurrentDevice"] as? Bool != true, id != current.deviceID,
+                      let data = (device["availableCommands"] as? [String: Any])?[SendTab.command] as? String,
+                      (try? SendTab.receiver(data, syncKey: syncKey, keyID: current.keyID)) != nil else { continue }
+                targets.append(SendTarget(id: id, name: name, type: device["type"] as? String ?? "desktop", commandData: data))
+            }
+            sendTargets = targets.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+        } catch {
+            NSLog("Tuff: Send Tab: \(error.localizedDescription)")
+        }
+        receiveTabs()
+    }
+
+    /// Opens tabs other devices sent here since last time.
+    func receiveTabs() {
+        guard usesRealAccount, !receiving, !needsSignIn, let current = account, let keys = current.sendTab, current.sendTabListed == true else { return }
+        receiving = true
+        Task { @MainActor in
+            defer { receiving = false }
+            guard let (messages, index) = try? await MozillaAccount.commands(refreshToken: current.refreshToken, after: current.commandIndex),
+                  account?.refreshToken == current.refreshToken else { return }
+            let ordered = messages.sorted { ($0["index"] as? NSNumber)?.intValue ?? 0 < ($1["index"] as? NSNumber)?.intValue ?? 0 }
+            for message in ordered {
+                guard let data = message["data"] as? [String: Any], data["command"] as? String == SendTab.command,
+                      let payload = data["payload"] as? [String: Any], let page = try? SendTab.page(from: payload, keys: keys),
+                      ["http", "https"].contains(page.url.scheme?.lowercased() ?? "") else { continue }
+                BrowserState.shared.newTab(url: page.url, select: false)
+                let from = (data["sender"] as? String).flatMap { deviceNames[$0] }
+                BrowserState.shared.show(Toast(symbol: "arrow.down.forward.and.arrow.up.backward", text: from.map { "Opened a tab from \($0)" } ?? "Opened a tab sent from another device"))
+            }
+            if index != current.commandIndex {
+                account?.commandIndex = index
+                saveAccount()
+            }
+        }
+    }
+
+    /// Sends a page to another device's browser.
+    func send(_ url: URL, title: String, to target: SendTarget) {
+        guard let current = account, let syncKey else { return }
+        Task { @MainActor in
+            do {
+                let payload = try SendTab.payload(url: url, title: title, to: target.commandData, syncKey: syncKey, keyID: current.keyID)
+                try await MozillaAccount.invoke(refreshToken: current.refreshToken, target: target.id, payload: payload)
+                BrowserState.shared.show(Toast(symbol: "paperplane.fill", text: "Sent to \(target.name)"))
+            } catch {
+                BrowserState.shared.show(Toast(symbol: "exclamationmark.triangle.fill", text: "Couldn’t send to \(target.name)"))
+            }
+        }
     }
 
     // MARK: Clients
@@ -771,6 +953,64 @@ final class SyncManager {
             state.historyRemoved.removeAll { removed.contains($0) }
         }
         state.engines[SyncKind.history.rawValue] = SyncState.Engine(syncID: progress.syncID, lastSync: lastSync)
+    }
+
+    // MARK: Spaces
+
+    /// Zen's sidebar sync (`SidebarSync`): spaces, pinned tabs, folders and favourites.
+    private func syncSpaces(_ session: Session, profile: UUID) async throws {
+        let browser = BrowserState.shared
+        // Before the session is read the sidebar looks empty, which would delete everything.
+        guard browser.restored, !browser.spaces.isEmpty else { return }
+        let progress = engine(.spaces)
+        var memory = state.sidebar ?? SidebarSync.Memory()
+        let (records, modified) = try await session.storage.records(SidebarSync.collection, newer: progress.lastSync)
+
+        let base = progress.lastSync == 0 ? [:] : sidebarRemote(memory)
+        var incoming: [String: SidebarSync.Record?] = [:]
+        for record in records {
+            guard let object = session.decrypt(record, SidebarSync.collection) else { continue }
+            incoming[record.id] = object["deleted"] as? Bool == true ? .some(nil) : .some(object)
+        }
+        var remote = base
+        for (id, record) in incoming { remote[id] = record }
+
+        let options = SidebarSync.Options(syncProfile: profile, includeTabs: includesOpenTabs)
+        let current = browser.sidebarSnapshot()
+        if base.isEmpty { SidebarSync.match(current, remote: remote, memory: &memory, options: options) }
+        let local = SidebarSync.project(current, remote: remote, memory: &memory, options: options, icon: browser.syncIcon)
+        let merge = SidebarSync.merge(base: base, incoming: incoming, local: local, lastLocal: base.isEmpty ? [:] : memory.local, includeTabs: options.includeTabs)
+
+        if !merge.remoteChanged.isEmpty, let plan = SidebarSync.plan(merge.merged, current: current, memory: &memory, changed: merge.remoteChanged, options: options) {
+            var icons: [UUID: String] = [:]
+            for (uuid, rid) in memory.ids {
+                if let icon = SidebarSync.data(merge.merged[rid])?["icon"] as? String, icon.hasPrefix("data:") { icons[uuid] = icon }
+            }
+            applying = true
+            browser.applySidebar(plan, includeTabs: options.includeTabs, icons: icons)
+            applying = false
+        }
+
+        var uploads: [SyncUpload] = []
+        for (id, record) in merge.uploads.sorted(by: { $0.key < $1.key }) {
+            let cleartext: [String: Any] = record ?? ["id": id, "deleted": true]
+            uploads.append(SyncUpload(id: id, payload: try session.encrypt(cleartext, SidebarSync.collection)))
+        }
+        var lastSync = max(modified, session.info[SidebarSync.collection] ?? 0, progress.lastSync)
+        if !uploads.isEmpty {
+            lastSync = try await session.storage.upload(SidebarSync.collection, uploads, ifUnmodifiedSince: Self.since(lastSync))
+        }
+
+        // What the server has now, and Tuff's own records as they are after applying it.
+        memory.mirror = merge.merged.compactMapValues { record in
+            (try? JSONSerialization.data(withJSONObject: record)).map { String(decoding: $0, as: UTF8.self) }
+        }
+        sidebarCache = merge.merged
+        let after = browser.sidebarSnapshot()
+        SidebarSync.remember(after, in: &memory)
+        memory.local = SidebarSync.project(after, remote: merge.merged, memory: &memory, options: options).compactMapValues { SidebarSync.digest($0) }
+        state.sidebar = memory
+        state.engines[SyncKind.spaces.rawValue] = SyncState.Engine(syncID: progress.syncID, lastSync: lastSync)
     }
 
     // MARK: Passwords
